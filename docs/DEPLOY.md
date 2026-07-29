@@ -189,21 +189,76 @@ chmod 755 logs snapshots models config
 | `snapshots/<频道ID>/` | 截图与 `latest.jpg` |
 | `data/monitor.db` | SQLite 告警历史 / 状态采样（与 jsonl 双写） |
 
-### Web 大屏与 TTS（借鉴 igmp_monitor，轻量实现）
+### Web 大屏、SQLite 历史与 TTS（怎么用）
 
-启动 Web 后浏览器打开 `http://IP:8080`：
+借鉴 igmp_monitor 的大屏 / 历史 / 语音告警思路，用 **SQLite + 现有静态页** 实现，**不强制** InfluxDB / Redis / Vue。
 
-| 功能 | 说明 |
+#### 1）启动（两条进程）
+
+```bash
+cd /opt/ai_monitor_code   # 按实际路径
+
+# A. 监测（会把告警双写到 data/monitor.db）
+python3 manager.py -c config/channels.yaml -w . -n 4
+# 或 systemd: sudo systemctl start ai-monitor
+
+# B. Web 面板（另开终端）
+pip3 install fastapi uvicorn pyyaml   # 首次
+python3 -m uvicorn web.app:app --host 0.0.0.0 --port 8080
+# 或 systemd: sudo systemctl start ai-monitor-web
+```
+
+浏览器打开：`http://<服务器IP>:8080`（仅建议内网）。
+
+> 只开 Web、不开 Manager：能改配置、看历史库，但**没有新告警/心跳**，大屏会偏灰/离线。
+
+#### 2）界面怎么用
+
+| 操作 | 说明 |
 |------|------|
-| **大屏** | 默认视图：四色交通灯网格（绿/红/黄/灰） |
-| **管理** | 原频道表、配置开关、截图 |
-| **TTS** | 顶栏勾选「TTS」；新告警中文播报（Web Speech API） |
-| **抑制** | 同频道同类型 5 分钟内不重复播；≥5 路同时异常聚合播报 |
-| **历史** | 24h 告警 TOP（需 Worker 写入 SQLite 后有数据） |
+| 顶栏 **大屏** | 默认视图：频道四色卡片网格 |
+| 顶栏 **管理** | 频道表、AI/规则开关、导入导出、截图 |
+| **声音** | 新告警蜂鸣（浏览器） |
+| **TTS** | 勾选后，新告警用中文语音播报（Web Speech API） |
+| **桌面通知** | 系统通知（需浏览器授权） |
+| **测 TTS** | 播一句测试语音（首次可能要用户点一下页面才允许发音） |
+| **清抑制** | 清空「5 分钟同类型不重复播」的抑制状态 |
+| **自动刷新** | 默认约 5 秒拉一次状态/事件 |
 
-接口：`/api/dashboard`、`/api/alerts/history`、`/api/storage`。
+#### 3）四色含义
 
-> 未引入 InfluxDB/Redis/Vue：用 SQLite + 现有 FastAPI 静态页实现同类体验，部署仍保持简单。若日后要时序曲线，可再挂 Influx。
+| 颜色 | 含义 |
+|------|------|
+| 绿 | 正常（running 且无进行中告警） |
+| 红 | 异常（有 active 告警等） |
+| 黄 | 离线 / 心跳超时 / 重连中 |
+| 灰 | 禁用或未知 |
+
+#### 4）TTS 规则（与 igmp 同类）
+
+- 同 **频道 + 告警类型** 在 **5 分钟** 内只播一次（抑制）。  
+- 短时间 **≥5 路** 同时告警：合并播「N 路节目同时异常…」。  
+- 结束类事件（`*_end`）不播。  
+- **必须保持监测页签打开**；关浏览器则无 TTS（纯前端实现）。
+
+#### 5）SQLite 存储
+
+| 路径 | 说明 |
+|------|------|
+| `data/monitor.db` | 告警历史、状态采样（Worker 与 jsonl **双写**） |
+| `logs/events.jsonl` | 原有事件文件，仍保留 |
+
+- 大屏 **「24h 告警 TOP」**：有新事件写入 DB 后才有数。  
+- 查看库概况：浏览器访问 `/api/storage` 或页脚旁健康信息中的 SQLite 提示。  
+- 历史接口：`/api/alerts/history?limit=100`、`/api/dashboard`。
+
+#### 6）防火墙（可选）
+
+```bash
+# sudo firewall-cmd --permanent --add-port=8080/tcp && sudo firewall-cmd --reload
+```
+
+> 未引入 Influx/Redis/Vue：部署保持简单。若要时序曲线、WebSocket 推送，可后续再扩展。
 
 ---
 

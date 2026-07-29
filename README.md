@@ -105,23 +105,28 @@ ai:
 pip3 install fastapi uvicorn
 ```
 
-启动面板（与监测进程独立，只读展示）：
+启动面板（与监测进程独立；配置可写，大屏/TTS 需浏览器打开）：
 
 ```bash
-cd /path/to/ai_monitor
+cd /path/to/ai_monitor_code
+# 1）先起监测（告警会写入 data/monitor.db）
+python3 manager.py -c config/channels.yaml -w . -n 4
+
+# 2）再起 Web
+pip3 install fastapi uvicorn pyyaml   # 首次
 python3 -m uvicorn web.app:app --host 0.0.0.0 --port 8080
 ```
 
 浏览器访问：`http://服务器IP:8080`
 
 面板功能：
-- 节目数量 / 异常频道统计
-- 各频道状态与最近异常类型
-- 实时事件列表（读 `logs/events.jsonl`）
-- 异常截图浏览
-- AI 开关状态显示
+- **大屏**：四色交通灯网格（绿正常 / 红异常 / 黄离线重连 / 灰禁用）
+- **管理**：频道增删改、AI/规则开关、导入导出
+- 事件列表、异常截图、24h 告警 TOP（SQLite）
+- **TTS 语音告警**（勾选 TTS；5 分钟同类型抑制；多路聚合播报）
+- 声音蜂鸣、桌面通知
 
-> 不启动 Web 服务不影响监测本身。
+> 不启动 Web 不影响监测本身。大屏/TTS 详细说明见 [docs/DEPLOY.md](docs/DEPLOY.md) 中「Web 大屏、SQLite 历史与 TTS」。
 
 ## 配置频道
 
