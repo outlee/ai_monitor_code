@@ -27,21 +27,33 @@
 ## 目录结构
 
 ```
-ai_monitor/
+ai_monitor_code/
 ├── config/
-│   └── channels.yaml       # 频道 + AI 开关
+│   └── channels.yaml         # 频道 + AI 开关 + 阈值
 ├── workers/
-│   ├── monitor_worker.py   # 监测 Worker
-│   └── ai_detector.py      # AI 模块（可选）
+│   ├── monitor_worker.py     # 监测 Worker（规则 + 抽帧）
+│   └── ai_detector.py        # AI 推理（ONNX / 启发式）
 ├── web/
-│   ├── app.py              # FastAPI 前端服务
-│   └── static/             # 页面 / CSS / JS
-├── models/                 # 放置 .onnx 模型（可选）
+│   ├── app.py                # FastAPI 面板
+│   └── static/
+├── models/                   # 监测机放置 .onnx（可选）
+│   └── README.md
+├── training/                 # 【仅 GPU/云训练用，监测机不必跑】
+│   ├── train.py              # 二分类训练
+│   ├── export_onnx.py        # 导出 ONNX
+│   ├── scan_threshold.py     # 扫 ai.threshold
+│   ├── make_demo_dataset.py  # 假数据冒烟
+│   ├── requirements.txt
+│   └── README.md
+├── docs/
+│   ├── DEPLOY.md             # 服务器部署（含 AI 推理侧）
+│   ├── TRAINING.md           # 训练规范与导入
+│   └── TRAINING_AUTODL.md    # AutoDL 从 0 手把手
 ├── manager.py
-├── test_ai_offline.py      # 离线验证 AI
-├── logs/
-├── snapshots/
-├── requirements.txt
+├── test_ai_offline.py
+├── requirements.txt          # 监测机基础依赖
+├── logs/                     # 运行生成
+├── snapshots/                # 运行生成
 └── README.md
 ```
 
@@ -246,11 +258,64 @@ defaults:
 |------|------|
 | `ai.enabled: false`（默认） | 不加载任何 AI 代码路径，零影响 |
 | `enabled: true` + 未装库 | 自动降级，只打日志，规则检测正常 |
-| `enabled: true` + heuristic | OpenCV 统计检测绿屏/块状 |
-| `enabled: true` + onnx 模型 | 真正深度学习推理 |
+| `enabled: true` + heuristic | OpenCV 统计检测绿屏/块状（**无需训练**） |
+| `enabled: true` + onnx 模型 | 深度学习推理（模型在 **GPU/云训练** 后导入） |
+
+### 训练 vs 监测（分工）
+
+| 环境 | 做什么 | 目录/文档 |
+|------|--------|-----------|
+| **AutoDL / 有 GPU 的机器** | 用**图片**训练 → 导出 `.onnx` | `training/` · [TRAINING_AUTODL.md](docs/TRAINING_AUTODL.md) |
+| **监测机（CentOS）** | 只装 onnxruntime，加载模型推理 | `models/` · [DEPLOY.md](docs/DEPLOY.md) |
+
+训练**不直接读视频**；录像需先抽帧成 jpg/png。详见 [TRAINING.md](docs/TRAINING.md)。
+
+### 训练数据目录里 `train` / `val` 是什么
+
+训练脚本要求的数据布局（在 AutoDL 上自建，**不是**仓库自带目录）：
+
+```text
+dataset/                 # 你自己准备，常放 /root/autodl-tmp/dataset
+├── train/               # 训练集：拿来更新模型权重（可做数据增强）
+│   ├── normal/          # 正常画面 → 标签 0
+│   └── anomaly/         # 马赛克/花屏/绿屏 → 标签 1
+└── val/                 # 验证集：训练过程中评估，不参与反传
+    ├── normal/
+    └── anomaly/
+```
+
+| 目录 | 英文 | 作用 |
+|------|------|------|
+| **`train/`** | training set | **训练用**。模型看这些图算损失、改参数。占数据大头（常见约 80%）。 |
+| **`val/`** | validation set | **验证用**。每个 epoch 结束后在这套图上算准确率/F1，用来选 **best.pt**、调阈值；**不拿来反传**，避免「背答案」。 |
+
+要点：
+
+1. **`val` 不是测试上线**：只是训练阶段的「模拟考试」，防止只在训练集上过拟合。  
+2. **`train` 与 `val` 不要混同一镜头**：同一段故障录像抽的帧应只进一边，否则验证虚高。  
+3. 比例经验：`train : val ≈ 8 : 1` 或 `9 : 1`；有条件可再留 `test/` 做最终报告（当前脚本默认只用 train+val）。  
+4. 文件夹名必须是 **`normal`** / **`anomaly`**（英文），由路径决定标签。
+
+```bash
+# 在 GPU/AutoDL 上示例
+cd training
+python train.py --data /root/autodl-tmp/dataset --out /root/autodl-tmp/runs/exp1 --epochs 30
+python export_onnx.py --ckpt .../best.pt --out .../mosaic_detector.onnx
+# 再把 onnx 拷到监测机 models/ ，配置 ai.enabled=true
+```
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| [docs/DEPLOY.md](docs/DEPLOY.md) | 监测服务器部署（含 AI 依赖、systemd） |
+| [docs/TRAINING.md](docs/TRAINING.md) | 训练规范、样本、ONNX 约定、导入 |
+| [docs/TRAINING_AUTODL.md](docs/TRAINING_AUTODL.md) | AutoDL 从 0 租机到导出 |
+| [training/README.md](training/README.md) | 训练脚本命令速查 |
+| [models/README.md](models/README.md) | 模型文件约定 |
 
 ## 注意事项
 
 - 确保服务器能加入组播（网卡、防火墙、IGMP）
-- 先规则检测试点，再开 AI
-- 正式阈值请用原始组播 TS 样本标定
+- 先规则检测试点，再开 AI；**训练在 GPU/云，不要在监测机上装 PyTorch 硬训**
+- 正式阈值请用原始组播故障样本标定（`scan_threshold.py` + 现场微调）
