@@ -4,7 +4,8 @@
 可选 **AI 马赛克/花屏检测**（默认关闭，不部署也不影响使用）。  
 适配 **CentOS + 纯 CPU** 环境，可扩展到多路。
 
-> **服务器部署（含 AI 模块）请见：[docs/DEPLOY.md](docs/DEPLOY.md)**
+> **服务器部署（含 AI 模块）请见：[docs/DEPLOY.md](docs/DEPLOY.md)**  
+> **AI 训练与导入监测机请见：[docs/TRAINING.md](docs/TRAINING.md)**（训练在 GPU/云，本机只推理）
 
 ## 功能
 

@@ -724,7 +724,8 @@ sudo systemctl enable --now ai-monitor-web
 | `README.md` | 功能总览与开发向说明 |
 | `models/README.md` | ONNX 输入输出约定 |
 | `config/channels.yaml` | 当前运行配置 |
-| `docs/DEPLOY.md` | 本文（服务器部署 + AI） |
+| `docs/DEPLOY.md` | 本文（服务器部署 + AI 推理侧） |
+| `docs/TRAINING.md` | **AI 训练（GPU/云）与导入监测机** |
 
 ---
 

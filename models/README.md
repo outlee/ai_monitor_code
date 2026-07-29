@@ -19,3 +19,5 @@ models/mosaic_detector.onnx
 | 输出 | `1×2`（[正常概率, 异常概率]）或 `1×1`（异常分数） |
 
 训练可在其他有 GPU 的机器完成，只把 `.onnx` 拷到本目录。
+
+**完整流程（采样本、标注、训练、导出、导入、标定）见：[docs/TRAINING.md](../docs/TRAINING.md)**
