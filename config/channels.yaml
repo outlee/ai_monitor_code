@@ -1,0 +1,48 @@
+defaults:
+  black_duration: 2.0
+  freeze_duration: 3.0
+  silence_duration: 3.0
+  silence_threshold: -40
+  save_snapshot: true
+  snapshot_dir: ./snapshots
+  log_dir: ./logs
+  # P0/P1 运维参数
+  reconnect_delay: 5.0          # 断流后首次重连等待（秒）
+  reconnect_max_delay: 60.0     # 重连退避上限（秒）
+  input_timeout_sec: 15.0       # UDP/RTP 无数据超时（秒），超时后 FFmpeg 退出并重连
+  heartbeat_interval: 5.0       # 心跳写入间隔（秒）
+  status_stale_sec: 30.0        # 超过此时长无心跳视为 stale
+  events_max_bytes: 52428800    # events.jsonl 轮转阈值（50MB）
+  events_keep_files: 5          # 保留 events.jsonl.1 .. .N
+  snapshot_max_per_channel: 100 # 每频道最多保留截图数
+  # P2 性能参数
+  detect_width: 480             # 规则检测最大宽度，0=全分辨率；建议 320~640
+  frame_interval_sec: 2.0       # 旁路 latest.jpg 刷新间隔；0=关闭旁路
+  latest_max_age_sec: 5.0       # 截图/AI 使用 latest 的最大允许年龄（秒）
+  snapshot_prefer_latest: true  # 告警截图优先复制 latest，避免再开 FFmpeg
+  ai_async: true                # AI 独立线程，不阻塞规则检测日志解析
+ai:
+  enabled: false
+  mode: auto
+  model_path: models/mosaic_detector.onnx
+  interval_sec: 2.0
+  threshold: 0.55
+  green_ratio_th: 0.35
+  block_score_th: 0.12
+channels:
+- id: test01
+  name: 本地测试流
+  url: udp://127.0.0.1:1234
+  enabled: true
+  # program: 不填 = SPTS/默认节目
+# MPTS 示例（同一组播、不同 program，各一条配置）：
+# - id: ch_svc1
+#   name: 节目A
+#   url: udp://@239.1.1.1:5000
+#   program: 1
+#   enabled: true
+# - id: ch_svc2
+#   name: 节目B
+#   url: udp://@239.1.1.1:5000
+#   program: 2
+#   enabled: true

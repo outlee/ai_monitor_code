@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 节目监测</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">●</span>
+      <div>
+        <h1>AI 节目监测</h1>
+        <p class="sub">UDP 组播 · 规则检测 · 可选 AI · 无登录</p>
+      </div>
+    </div>
+    <div class="top-meta">
+      <span id="clock">--</span>
+      <button id="btn-refresh" class="btn" title="立即刷新">刷新</button>
+      <label class="auto-refresh" title="面板打开时本地提醒">
+        <input type="checkbox" id="sw-sound" checked />
+        声音
+      </label>
+      <label class="auto-refresh" title="需浏览器允许通知权限">
+        <input type="checkbox" id="sw-desktop" checked />
+        桌面通知
+      </label>
+      <label class="auto-refresh">
+        <input type="checkbox" id="auto-refresh" checked />
+        自动刷新
+      </label>
+    </div>
+  </header>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <section class="cards" id="summary-cards">
+    <div class="card">
+      <div class="card-label">节目总数</div>
+      <div class="card-value" id="stat-total">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">已启用</div>
+      <div class="card-value" id="stat-enabled">-</div>
+    </div>
+    <div class="card alarm">
+      <div class="card-label">异常频道</div>
+      <div class="card-value" id="stat-alarm">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">AI 模块</div>
+      <div class="card-value small" id="stat-ai">-</div>
+    </div>
+  </section>
+
+  <!-- 功能开关 -->
+  <section class="panel controls-panel">
+    <div class="panel-head">
+      <h2>功能开关</h2>
+      <span class="hint">写入配置文件 · Manager/Worker 热重载约数秒生效</span>
+    </div>
+    <div class="controls-grid">
+      <div class="ctrl-block">
+        <h3>AI 检测阈值</h3>
+        <label class="switch-row">
+          <span>启用 AI 模块</span>
+          <input type="checkbox" id="sw-ai-enabled" />
+        </label>
+        <label class="field-row">
+          <span>检测模式</span>
+          <select id="sel-ai-mode">
+            <option value="auto">auto（优先模型）</option>
+            <option value="heuristic">heuristic（启发式）</option>
+            <option value="onnx">onnx（仅模型）</option>
+            <option value="off">off</option>
+          </select>
+        </label>
+        <label class="field-row">
+          <span>抽帧间隔 (秒)</span>
+          <input type="number" id="inp-ai-interval" min="0.5" max="60" step="0.5" />
+        </label>
+        <label class="field-row">
+          <span>ONNX 异常阈值</span>
+          <input type="number" id="inp-ai-threshold" min="0" max="1" step="0.05" title="分数≥此值判异常，默认 0.55" />
+        </label>
+        <label class="field-row">
+          <span>绿屏占比阈值</span>
+          <input type="number" id="inp-green-th" min="0" max="1" step="0.05" title="启发式：绿色像素占比，默认 0.35" />
+        </label>
+        <label class="field-row">
+          <span>块状分数阈值</span>
+          <input type="number" id="inp-block-th" min="0" max="1" step="0.01" title="启发式：块状差异分数，默认 0.12" />
+        </label>
+        <button class="btn btn-primary" id="btn-save-ai">保存 AI 设置</button>
+      </div>
+
+      <div class="ctrl-block">
+        <h3>规则检测阈值</h3>
+        <label class="switch-row">
+          <span>异常时自动截图</span>
+          <input type="checkbox" id="sw-save-snapshot" />
+        </label>
+        <label class="field-row">
+          <span>黑场时长 (秒)</span>
+          <input type="number" id="inp-black" min="0.5" max="60" step="0.5" title="持续黑场达到此时长才告警" />
+        </label>
+        <label class="field-row">
+          <span>静帧时长 (秒)</span>
+          <input type="number" id="inp-freeze" min="0.5" max="60" step="0.5" />
+        </label>
+        <label class="field-row">
+          <span>静音时长 (秒)</span>
+          <input type="number" id="inp-silence" min="0.5" max="60" step="0.5" />
+        </label>
+        <label class="field-row">
+          <span>静音阈值 (dB)</span>
+          <input type="number" id="inp-silence-db" min="-80" max="0" step="1" title="音量低于此 dB 视为静音，默认 -40" />
+        </label>
+        <button class="btn btn-primary" id="btn-save-defaults">保存规则参数</button>
+      </div>
+
+      <div class="ctrl-block note-block">
+        <h3>说明</h3>
+        <ul class="note-list">
+          <li>开关无需登录，请仅在内网使用</li>
+          <li>修改后写入 <code>config/channels.yaml</code></li>
+          <li>Manager/Worker 默认热重载，约 3 秒内自动应用（--no-reload 可关）</li>
+          <li>本地提醒：顶部「声音」「桌面通知」（需保持面板打开）</li>
+          <li>下方表格可单独启用 / 禁用每个频道</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <main class="layout">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>频道管理</h2>
+        <div class="head-actions">
+          <button class="btn" id="btn-add-ch">新增</button>
+          <button class="btn" id="btn-export-json">导出 JSON</button>
+          <button class="btn" id="btn-export-yaml">导出 YAML</button>
+          <button class="btn" id="btn-import">导入</button>
+          <input type="file" id="file-import" accept=".json,.yaml,.yml,application/json,text/yaml" hidden />
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>监测</th>
+              <th>状态</th>
+              <th>ID</th>
+              <th>名称</th>
+              <th>Program</th>
+              <th>最近异常</th>
+              <th>事件数</th>
+              <th>地址</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="channel-tbody">
+            <tr><td colspan="9" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>最近事件</h2>
+        <span class="hint">logs/events.jsonl</span>
+      </div>
+      <div class="event-list" id="event-list">
+        <div class="empty">加载中…</div>
+      </div>
+    </section>
+  </main>
+
+  <section class="panel snapshots-panel">
+    <div class="panel-head">
+      <h2>异常截图</h2>
+      <span class="hint">snapshots/</span>
+    </div>
+    <div class="snap-grid" id="snap-grid">
+      <div class="empty">暂无截图</div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span>内网面板 · 无登录鉴权 · 配置可写</span>
+    <span id="health">-</span>
+  </footer>
+
+  <div id="lightbox" class="lightbox hidden">
+    <button class="lb-close" id="lb-close">×</button>
+    <img id="lb-img" alt="snapshot" />
+    <div id="lb-cap"></div>
+  </div>
+
+  <!-- 频道编辑弹窗 -->
+  <div id="ch-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="ch-modal-title">编辑频道</h3>
+        <button class="lb-close" id="ch-modal-close" type="button">×</button>
+      </div>
+      <form id="ch-form" class="modal-body">
+        <label class="field-row">
+          <span>频道 ID</span>
+          <input type="text" id="ch-id" required maxlength="64" placeholder="如 ch001" />
+        </label>
+        <label class="field-row">
+          <span>名称</span>
+          <input type="text" id="ch-name" required maxlength="128" placeholder="显示名称" />
+        </label>
+        <label class="field-row">
+          <span>流地址</span>
+          <input type="text" id="ch-url" required placeholder="udp://@239.1.1.1:5000" />
+        </label>
+        <label class="field-row">
+          <span>Program</span>
+          <input type="number" id="ch-program" min="0" max="65535" step="1" placeholder="可选，MPTS 填节目号" />
+        </label>
+        <p class="hint" style="margin:-4px 0 8px">一地址一节目可留空；同一组播多节目时填 MPEG-TS program/service id，并各建一条频道</p>
+        <label class="switch-row">
+          <span>启用监测</span>
+          <input type="checkbox" id="ch-enabled" checked />
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="ch-modal-cancel">取消</button>
+          <button type="submit" class="btn btn-primary" id="ch-modal-save">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 导入弹窗 -->
+  <div id="import-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>导入频道</h3>
+        <button class="lb-close" id="import-modal-close" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="hint" style="margin-bottom:10px">支持 JSON / YAML。可粘贴内容或选择文件。</p>
+        <label class="field-row">
+          <span>模式</span>
+          <select id="import-mode">
+            <option value="merge">合并（同 ID 覆盖，新 ID 追加）</option>
+            <option value="replace">替换（清空后导入）</option>
+          </select>
+        </label>
+        <textarea id="import-text" rows="10" placeholder='{"channels":[{"id":"ch001","name":"示例","url":"udp://@239.1.1.1:5000","enabled":true}]}'></textarea>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="import-pick-file">选择文件</button>
+          <button type="button" class="btn" id="import-modal-cancel">取消</button>
+          <button type="button" class="btn btn-primary" id="import-submit">开始导入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

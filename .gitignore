@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# 运行时数据（勿提交）
+logs/
+snapshots/
+!snapshots/.gitkeep
+!logs/.gitkeep
+
+# 本地/测试
+*.log
+.events.lock
+/tmp/
+mosaic_sample.mp4
+*_sample.mp4
+
+# 可选大模型（仓库只保留 README）
+models/*.onnx
+models/*.pt
+models/*.pth
+models/*.bin
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 测试临时配置
+/tmp/
