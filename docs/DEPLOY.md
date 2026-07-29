@@ -799,7 +799,7 @@ sudo systemctl enable --now ai-monitor-web
 | `docs/DEPLOY.md` | 本文（服务器部署 + AI 推理侧） |
 | `docs/TRAINING.md` | AI 训练规范与导入监测机 |
 | `docs/TRAINING_AUTODL.md` | **AutoDL 从 0 训练手把手教程** |
-| `docs/LOCAL_DEPLOY_TRAIN.md` | **本地部署+训练**（参考台式配置） |
+| `docs/LOCAL_DEPLOY_TRAIN.md` | **本地训练机**（仅训练，参考台式 3050 配置） |
 | `training/` | 训练 / 导出 ONNX 脚本 |
 
 ---
