@@ -23,6 +23,8 @@
 - **P2 性能**：检测前降采样、`latest.jpg` 旁路帧（截图/AI 共用）、AI 独立线程
 - **配置热重载**：改 `channels.yaml` 后 Manager/Worker 自动应用（可 `--no-reload`）
 - **Web 监控面板**（可选）：频道状态、事件、截图
+- **大屏交通灯** + **TTS 语音告警**（5 分钟抑制 / 多路聚合）
+- **SQLite 告警历史**（与 jsonl 双写，`data/monitor.db`）
 
 ## 目录结构
 
@@ -49,9 +51,11 @@ ai_monitor_code/
 │   ├── DEPLOY.md             # 服务器部署（含 AI 推理侧）
 │   ├── TRAINING.md           # 训练规范与导入
 │   └── TRAINING_AUTODL.md    # AutoDL 从 0 手把手
+├── event_db.py               # SQLite 告警/状态历史
 ├── manager.py
 ├── test_ai_offline.py
 ├── requirements.txt          # 监测机基础依赖
+├── data/                     # monitor.db（运行生成，gitignore）
 ├── logs/                     # 运行生成
 ├── snapshots/                # 运行生成
 └── README.md

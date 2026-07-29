@@ -19,6 +19,7 @@ AI 节目监测 - Web 前端服务
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from datetime import datetime
@@ -32,6 +33,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 CONFIG_PATH = ROOT / "config" / "channels.yaml"
 LOG_DIR = ROOT / "logs"
 STATUS_DIR = LOG_DIR / "status"
@@ -41,7 +45,18 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _config_lock = threading.Lock()
 
-app = FastAPI(title="AI 节目监测", version="0.4.0")
+try:
+    import event_db
+except Exception:
+    event_db = None  # type: ignore
+
+app = FastAPI(title="AI 节目监测", version="0.5.0")
+
+if event_db is not None:
+    try:
+        event_db.configure(ROOT)
+    except Exception:
+        pass
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -382,13 +397,115 @@ def api_health():
     status_count = 0
     if STATUS_DIR.is_dir():
         status_count = len(list(STATUS_DIR.glob("*.json")))
-    return {
+    info = {
         "ok": True,
         "root": str(ROOT),
         "config_exists": CONFIG_PATH.is_file(),
         "events_exists": EVENTS_FILE.is_file(),
         "status_files": status_count,
+        "sqlite": None,
     }
+    if event_db is not None:
+        try:
+            info["sqlite"] = event_db.storage_info()
+        except Exception as e:
+            info["sqlite"] = {"error": str(e)}
+    return info
+
+
+@app.get("/api/dashboard")
+def api_dashboard():
+    """大屏数据：频道交通灯 + 24h 统计。"""
+    cfg = _load_config()
+    channels = cfg.get("channels") or []
+    defaults = cfg.get("defaults") or {}
+    stale_sec = float(defaults.get("status_stale_sec", 30.0))
+    events = _read_events(limit=100)
+    stats = _channel_stats(channels, events, stale_sec=stale_sec)
+
+    # 四色灯：ok / alarm / offline|stale|reconnecting / disabled
+    def lamp(st: str) -> str:
+        if st == "ok":
+            return "green"
+        if st == "alarm":
+            return "red"
+        if st in ("offline", "stale", "reconnecting"):
+            return "yellow"
+        if st == "disabled":
+            return "gray"
+        return "gray"
+
+    cards = []
+    for s in stats:
+        cards.append(
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "status": s["status"],
+                "lamp": lamp(s["status"]),
+                "last_type": s.get("last_type"),
+                "active_alarms": s.get("active_alarms") or [],
+                "program": s.get("program"),
+                "enabled": s.get("enabled", True),
+            }
+        )
+
+    hist = None
+    if event_db is not None:
+        try:
+            hist = event_db.alert_stats_24h()
+        except Exception:
+            hist = None
+
+    return {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cards": cards,
+        "summary": {
+            "total": len(cards),
+            "green": sum(1 for c in cards if c["lamp"] == "green"),
+            "red": sum(1 for c in cards if c["lamp"] == "red"),
+            "yellow": sum(1 for c in cards if c["lamp"] == "yellow"),
+            "gray": sum(1 for c in cards if c["lamp"] == "gray"),
+        },
+        "stats_24h": hist,
+        "recent_events": events[:30],
+    }
+
+
+@app.get("/api/alerts/history")
+def api_alerts_history(
+    limit: int = Query(100, ge=1, le=2000),
+    channel_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    hours: Optional[float] = Query(None, ge=0.1, le=720),
+):
+    """SQLite 告警历史；库不可用时回落 events.jsonl。"""
+    since_ts = None
+    if hours is not None:
+        since_ts = time.time() - float(hours) * 3600
+    if event_db is not None:
+        try:
+            rows = event_db.query_alerts(
+                limit=limit,
+                channel_id=channel_id,
+                event_type=event_type,
+                since_ts=since_ts,
+            )
+            return {"source": "sqlite", "alerts": rows}
+        except Exception as e:
+            pass
+    # fallback
+    evs = _read_events(limit=limit, channel_id=channel_id)
+    if event_type:
+        evs = [e for e in evs if e.get("type") == event_type]
+    return {"source": "jsonl", "alerts": evs}
+
+
+@app.get("/api/storage")
+def api_storage():
+    if event_db is None:
+        return {"ok": False, "message": "event_db 不可用"}
+    return {"ok": True, **event_db.storage_info()}
 
 
 # ---------- 写配置 API（无鉴权）----------

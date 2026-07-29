@@ -18,14 +18,24 @@
     <div class="top-meta">
       <span id="clock">--</span>
       <button id="btn-refresh" class="btn" title="立即刷新">刷新</button>
-      <label class="auto-refresh" title="面板打开时本地提醒">
+      <div class="view-toggle">
+        <button type="button" class="btn view-btn active" data-view="dash" id="btn-view-dash">大屏</button>
+        <button type="button" class="btn view-btn" data-view="manage" id="btn-view-manage">管理</button>
+      </div>
+      <label class="auto-refresh" title="蜂鸣">
         <input type="checkbox" id="sw-sound" checked />
         声音
+      </label>
+      <label class="auto-refresh" title="浏览器语音播报（Web Speech）">
+        <input type="checkbox" id="sw-tts" checked />
+        TTS
       </label>
       <label class="auto-refresh" title="需浏览器允许通知权限">
         <input type="checkbox" id="sw-desktop" checked />
         桌面通知
       </label>
+      <button type="button" class="btn" id="btn-tts-test" title="测试语音">测TTS</button>
+      <button type="button" class="btn" id="btn-tts-clear" title="清除抑制窗口">清抑制</button>
       <label class="auto-refresh">
         <input type="checkbox" id="auto-refresh" checked />
         自动刷新
@@ -52,9 +62,50 @@
       <div class="card-label">AI 模块</div>
       <div class="card-value small" id="stat-ai">-</div>
     </div>
+    <div class="card">
+      <div class="card-label">24h 告警</div>
+      <div class="card-value" id="stat-24h">-</div>
+    </div>
+    <div class="card">
+      <div class="card-label">存储</div>
+      <div class="card-value small" id="stat-storage">-</div>
+    </div>
   </section>
 
-  <!-- 功能开关 -->
+  <!-- 大屏：四色交通灯网格 -->
+  <section class="panel dash-panel" id="view-dash">
+    <div class="panel-head">
+      <h2>频道大屏</h2>
+      <span class="hint">绿=正常 · 红=异常 · 黄=离线/重连 · 灰=禁用 · TTS 5分钟同类型抑制</span>
+    </div>
+    <div class="lamp-legend">
+      <span><i class="dot green"></i>正常 <b id="sum-green">0</b></span>
+      <span><i class="dot red"></i>异常 <b id="sum-red">0</b></span>
+      <span><i class="dot yellow"></i>离线/重连 <b id="sum-yellow">0</b></span>
+      <span><i class="dot gray"></i>禁用 <b id="sum-gray">0</b></span>
+    </div>
+    <div class="channel-grid" id="channel-grid">
+      <div class="empty">加载中…</div>
+    </div>
+    <div class="panel-head" style="margin-top:16px">
+      <h2>24h 告警 TOP</h2>
+      <span class="hint" id="hist-source">SQLite / jsonl</span>
+    </div>
+    <div class="hist-wrap">
+      <div>
+        <h3 class="mini-h">按类型</h3>
+        <ul class="hist-list" id="hist-by-type"><li class="empty">暂无</li></ul>
+      </div>
+      <div>
+        <h3 class="mini-h">按频道</h3>
+        <ul class="hist-list" id="hist-by-ch"><li class="empty">暂无</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <div id="view-manage" class="view-manage hidden">
+
+  <!-- 功能开关（管理视图） -->
   <section class="panel controls-panel">
     <div class="panel-head">
       <h2>功能开关</h2>
@@ -187,9 +238,10 @@
       <div class="empty">暂无截图</div>
     </div>
   </section>
+  </div><!-- /view-manage -->
 
   <footer class="footer">
-    <span>内网面板 · 无登录鉴权 · 配置可写</span>
+    <span>内网面板 · 无登录 · SQLite 历史 · TTS 告警 · 配置可写</span>
     <span id="health">-</span>
   </footer>
 

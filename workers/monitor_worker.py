@@ -43,6 +43,15 @@ except ImportError:
         AIDetector = None  # type: ignore
         create_detector = None  # type: ignore
 
+# SQLite 双写（失败不影响主流程）
+try:
+    _ROOT = Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    import event_db as _event_db  # type: ignore
+except Exception:
+    _event_db = None  # type: ignore
+
 
 # 全局事件文件写锁（多线程；进程间另用 fcntl）
 _event_lock = threading.Lock()
@@ -146,9 +155,20 @@ class StreamMonitor:
         self._status_lock = threading.Lock()
         self._snapshot_inflight = False
         self._snapshot_lock = threading.Lock()
+        self._last_status_db_ts = 0.0
+        self._status_db_interval = float(
+            defaults.get("status_db_interval_sec", 30.0)
+        )
 
         self.logger = logging.getLogger(f"monitor.{self.id}")
         self._setup_logger()
+
+        # SQLite 初始化（每进程一次即可）
+        if _event_db is not None:
+            try:
+                _event_db.configure(self.work_dir)
+            except Exception as e:
+                self.logger.debug(f"event_db 初始化跳过: {e}")
 
         # AI 检测器（可选）
         self.ai: Optional[Any] = None
@@ -365,6 +385,16 @@ class StreamMonitor:
                     json.dump(payload, f, ensure_ascii=False)
                 tmp.replace(path)
             self._last_heartbeat_ts = payload["last_heartbeat_ts"]
+            # 低频写入状态采样，供历史/大屏（默认 30s）
+            if (
+                _event_db is not None
+                and _now_ts() - self._last_status_db_ts >= self._status_db_interval
+            ):
+                try:
+                    _event_db.insert_status_sample(self.id, payload)
+                    self._last_status_db_ts = _now_ts()
+                except Exception:
+                    pass
         except OSError as e:
             self.logger.debug(f"写心跳失败: {e}")
 
@@ -424,6 +454,12 @@ class StreamMonitor:
                                 pass
                     finally:
                         fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            # 双写 SQLite（历史查询 / 大屏统计）
+            if _event_db is not None:
+                try:
+                    _event_db.insert_alert(event)
+                except Exception as e:
+                    self.logger.debug(f"SQLite 写事件跳过: {e}")
         except OSError as e:
             self.logger.error(f"写事件失败: {e}")
 

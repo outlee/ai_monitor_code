@@ -187,6 +187,23 @@ chmod 755 logs snapshots models config
 | `logs/worker-N.log` | 各 Worker 进程 stdout |
 | `logs/status/_manager.json` | Manager 热重载状态 |
 | `snapshots/<频道ID>/` | 截图与 `latest.jpg` |
+| `data/monitor.db` | SQLite 告警历史 / 状态采样（与 jsonl 双写） |
+
+### Web 大屏与 TTS（借鉴 igmp_monitor，轻量实现）
+
+启动 Web 后浏览器打开 `http://IP:8080`：
+
+| 功能 | 说明 |
+|------|------|
+| **大屏** | 默认视图：四色交通灯网格（绿/红/黄/灰） |
+| **管理** | 原频道表、配置开关、截图 |
+| **TTS** | 顶栏勾选「TTS」；新告警中文播报（Web Speech API） |
+| **抑制** | 同频道同类型 5 分钟内不重复播；≥5 路同时异常聚合播报 |
+| **历史** | 24h 告警 TOP（需 Worker 写入 SQLite 后有数据） |
+
+接口：`/api/dashboard`、`/api/alerts/history`、`/api/storage`。
+
+> 未引入 InfluxDB/Redis/Vue：用 SQLite + 现有 FastAPI 静态页实现同类体验，部署仍保持简单。若日后要时序曲线，可再挂 Influx。
 
 ---
 
