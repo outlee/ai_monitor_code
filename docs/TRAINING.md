@@ -12,6 +12,7 @@
 | 文档 | 内容 |
 |------|------|
 | **[TRAINING_AUTODL.md](TRAINING_AUTODL.md)** | **AutoDL 从 0 开机到导出 ONNX（手把手）** |
+| **[LOCAL_DEPLOY_TRAIN.md](LOCAL_DEPLOY_TRAIN.md)** | **本机部署+训练**（参考 i5-12400F / 16G / RTX 3050 6G） |
 | [DEPLOY.md](DEPLOY.md) | 监测服务器部署（含 AI 依赖安装） |
 | [models/README.md](../models/README.md) | 模型目录与输入输出约定摘要 |
 | [../training/](../training/) | 可运行训练 / 导出脚本 |

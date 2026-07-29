@@ -5,8 +5,9 @@
 适配 **CentOS + 纯 CPU** 环境，可扩展到多路。
 
 > **服务器部署（含 AI 模块）请见：[docs/DEPLOY.md](docs/DEPLOY.md)**  
+> **本地部署+训练（参考 i5-12400F / 16G / 3050）请见：[docs/LOCAL_DEPLOY_TRAIN.md](docs/LOCAL_DEPLOY_TRAIN.md)**  
 > **AI 训练与导入请见：[docs/TRAINING.md](docs/TRAINING.md)** · **AutoDL 从 0 教程：[docs/TRAINING_AUTODL.md](docs/TRAINING_AUTODL.md)**  
-> 训练脚本目录：`training/`（GPU/云上使用，监测机只跑 ONNX 推理）
+> 训练脚本目录：`training/`（GPU/云或本机显卡；监测推理只需 ONNX）
 
 ## 功能
 
@@ -318,6 +319,7 @@ python export_onnx.py --ckpt .../best.pt --out .../mosaic_detector.onnx
 | 文档 | 内容 |
 |------|------|
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 监测服务器部署（含 AI 依赖、systemd） |
+| [docs/LOCAL_DEPLOY_TRAIN.md](docs/LOCAL_DEPLOY_TRAIN.md) | **本地部署+训练**（参考 i5-12400F/16G/3050 6G） |
 | [docs/TRAINING.md](docs/TRAINING.md) | 训练规范、样本、ONNX 约定、导入 |
 | [docs/TRAINING_AUTODL.md](docs/TRAINING_AUTODL.md) | AutoDL 从 0 租机到导出 |
 | [training/README.md](training/README.md) | 训练脚本命令速查 |
