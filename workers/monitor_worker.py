@@ -131,6 +131,7 @@ class StreamMonitor:
 
         # 旁路共享帧（主 FFmpeg 持续覆盖写）
         self.latest_frame_path = self.snapshot_dir / "latest.jpg"
+        # 仅串行化本进程内读/拷路径；FFmpeg 写 latest 不持此锁，靠 JPEG 完整性重试防半帧
         self._latest_lock = threading.Lock()
 
         self.process: Optional[subprocess.Popen] = None
@@ -398,31 +399,45 @@ class StreamMonitor:
             self.logger.warning(f"事件日志轮转失败: {e}")
 
     def _save_event(self, event: Dict):
+        """多线程 + 多进程安全追加 events.jsonl。
+
+        - 进程内: threading.Lock
+        - 进程间: fcntl.flock(.events.lock)
+        - 轮转与写入在同一把文件锁内完成，避免交错
+        """
         event_file = self.log_dir / "events.jsonl"
         lock_file = self.log_dir / ".events.lock"
         line = json.dumps(event, ensure_ascii=False) + "\n"
         try:
             with _event_lock:
-                lock_file.parent.mkdir(parents=True, exist_ok=True)
+                self.log_dir.mkdir(parents=True, exist_ok=True)
                 with open(lock_file, "a+", encoding="utf-8") as lf:
                     fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
                     try:
                         self._rotate_events_if_needed(event_file)
                         with open(event_file, "a", encoding="utf-8") as f:
                             f.write(line)
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except OSError:
+                                pass
                     finally:
                         fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         except OSError as e:
             self.logger.error(f"写事件失败: {e}")
 
     def _prune_snapshots(self):
-        """保留每个频道最近 N 张 jpg（不删 latest.jpg）。"""
+        """保留每个频道最近 N 张 jpg（不删 latest / 点文件 / AI 临时读文件）。"""
         try:
             files = sorted(
                 (
                     p
                     for p in self.snapshot_dir.glob("*.jpg")
                     if p.name != "latest.jpg"
+                    and not p.name.startswith(".")
+                    and not p.name.startswith(".ai_read_")
+                    and not p.name.endswith(".part")
                 ),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
@@ -445,23 +460,58 @@ class StreamMonitor:
         except OSError:
             return None
 
-    def _copy_latest_frame(self, dest: Path) -> bool:
-        """从旁路 latest.jpg 复制；成功返回 True。"""
-        age = self._latest_frame_age()
-        if age is None or age > self.latest_max_age_sec:
+    @staticmethod
+    def _is_complete_jpeg(data: bytes) -> bool:
+        """粗检 JPEG 是否完整（SOI…EOI），降低读到半帧的概率。"""
+        if data is None or len(data) < 128:
             return False
+        # SOI
+        if data[0] != 0xFF or data[1] != 0xD8:
+            return False
+        # EOI：找最后一个 FFD9，且须在 SOI 之后（兼容末尾少量 padding）
+        eoi = data.rfind(b"\xff\xd9")
+        if eoi < 2:
+            return False
+        return True
+
+    def _read_latest_jpeg_bytes(self, max_retries: int = 4) -> Optional[bytes]:
+        """在 FFmpeg 可能正在覆盖写 latest.jpg 时，尽量读到完整 JPEG。
+
+        写端无法加锁（FFmpeg -update 1），故读端重试 + 完整性检查。
+        """
+        for attempt in range(max_retries):
+            try:
+                with self._latest_lock:
+                    if not self.latest_frame_path.is_file():
+                        return None
+                    age = _now_ts() - self.latest_frame_path.stat().st_mtime
+                    if age > self.latest_max_age_sec:
+                        return None
+                    data = self.latest_frame_path.read_bytes()
+                if self._is_complete_jpeg(data):
+                    return data
+            except OSError:
+                pass
+            time.sleep(0.03 * (attempt + 1))
+        return None
+
+    def _copy_latest_frame(self, dest: Path) -> bool:
+        """从旁路 latest.jpg 安全复制到 dest（完整 JPEG 才写入）。"""
+        data = self._read_latest_jpeg_bytes()
+        if not data:
+            return False
+        tmp = dest.with_suffix(dest.suffix + ".part")
         try:
             with self._latest_lock:
-                if not self.latest_frame_path.is_file():
-                    return False
-                # 二次检查新鲜度
-                age2 = _now_ts() - self.latest_frame_path.stat().st_mtime
-                if age2 > self.latest_max_age_sec:
-                    return False
-                shutil.copy2(self.latest_frame_path, dest)
+                tmp.write_bytes(data)
+                tmp.replace(dest)
             return dest.is_file() and dest.stat().st_size > 0
         except OSError as e:
             self.logger.debug(f"复制 latest 失败: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
             return False
 
     def _grab_frame_ffmpeg(self, out_path: Path, quality: int = 3) -> bool:
@@ -646,24 +696,28 @@ class StreamMonitor:
     def _analyze_frame_for_ai(self, frame_path: Path) -> None:
         if not self.ai or not self.ai.is_ready:
             return
+        # 若源是 FFmpeg 正在写的 latest.jpg，先拷到私有文件再推理，避免半帧
+        work_path = frame_path
+        tmp_copy: Optional[Path] = None
         try:
-            result = self.ai.analyze_image(str(frame_path))
+            if frame_path.resolve() == self.latest_frame_path.resolve():
+                tmp_copy = self.snapshot_dir / f".ai_read_{os.getpid()}_{threading.get_ident()}.jpg"
+                if not self._copy_latest_frame(tmp_copy):
+                    return
+                work_path = tmp_copy
+            result = self.ai.analyze_image(str(work_path))
             if not result.get("is_anomaly"):
                 return
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             label = result.get("label", "anomaly")
             archive = self.snapshot_dir / f"ai_{label}_{ts}.jpg"
             try:
-                if frame_path.resolve() == self.latest_frame_path.resolve():
-                    shutil.copy2(frame_path, archive)
+                if work_path.is_file():
+                    shutil.copy2(work_path, archive)
                 else:
-                    # 临时文件可 rename
-                    try:
-                        frame_path.replace(archive)
-                    except OSError:
-                        shutil.copy2(frame_path, archive)
+                    archive = work_path
             except OSError:
-                archive = frame_path
+                archive = work_path
             event = {
                 "type": "ai_" + label,
                 "phase": "start",
@@ -681,6 +735,12 @@ class StreamMonitor:
             self._prune_snapshots()
         except Exception as e:
             self.logger.debug(f"AI 分析跳过: {e}")
+        finally:
+            if tmp_copy is not None:
+                try:
+                    tmp_copy.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _ai_loop(self):
         """独立线程：按 interval 读 latest 或回退抽帧，不阻塞规则解析。"""
