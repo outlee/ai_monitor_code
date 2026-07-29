@@ -3,7 +3,7 @@
 本文说明：**如何在有 GPU 的机器 / 云主机上训练马赛克·花屏检测模型**，导出为 **ONNX**，并导入到 **本监测系统（多为 CentOS 纯 CPU）** 使用。
 
 > **分工原则（与系统设计一致）**  
-> - **训练**：在外部 GPU / 云电脑完成（本仓库**不含**训练代码）。  
+> - **训练**：在外部 GPU / 云电脑（如 **AutoDL**）完成。  
 > - **推理**：监测机只做加载 ONNX + 抽帧推理（`workers/ai_detector.py`）。  
 > - **无模型也能先用**：`ai.mode: heuristic` 启发式，无需训练。
 
@@ -11,8 +11,10 @@
 
 | 文档 | 内容 |
 |------|------|
+| **[TRAINING_AUTODL.md](TRAINING_AUTODL.md)** | **AutoDL 从 0 开机到导出 ONNX（手把手）** |
 | [DEPLOY.md](DEPLOY.md) | 监测服务器部署（含 AI 依赖安装） |
 | [models/README.md](../models/README.md) | 模型目录与输入输出约定摘要 |
+| [../training/](../training/) | 可运行训练 / 导出脚本 |
 | [README.md](../README.md) | 系统总览 |
 
 ---
@@ -574,11 +576,12 @@ cp models/mosaic_detector_v3.onnx models/mosaic_detector.onnx
 
 | 包含 | 不包含 |
 |------|--------|
-| ONNX / 启发式 **推理** | 训练脚本、AutoML |
-| 抽帧、告警、Web、部署 | 云 GPU 开通与计费 |
-| 输入输出 **契约**（本文 + models/README） | 标注平台账号 |
+| ONNX / 启发式 **推理** | AutoDL 账号与充值 |
+| `training/` 二分类训练与导出脚本 | 全自动标注平台 |
+| 抽帧、告警、Web、部署 | 云厂商计费纠纷处理 |
+| 输入输出 **契约** + [AutoDL 教程](TRAINING_AUTODL.md) | |
 
-若后续需要，可在仓库增加 `training/` 示例工程（PyTorch 二分类 + export_onnx.py）；**当前版本以本文为训练侧规范，代码仍在外部维护。**
+在 AutoDL 上的逐步操作请直接打开 **[TRAINING_AUTODL.md](TRAINING_AUTODL.md)**。
 
 ---
 
