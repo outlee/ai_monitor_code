@@ -4,6 +4,8 @@
 可选 **AI 马赛克/花屏检测**（默认关闭，不部署也不影响使用）。  
 适配 **CentOS + 纯 CPU** 环境，可扩展到多路。
 
+> **服务器部署（含 AI 模块）请见：[docs/DEPLOY.md](docs/DEPLOY.md)**
+
 ## 功能
 
 - 支持 UDP 组播（`udp://@239.x.x.x:port`）
