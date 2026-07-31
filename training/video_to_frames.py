@@ -182,6 +182,23 @@ def sanitize_prefix(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
 
 
+def make_unique_prefix(base: str, *, unique: bool = True) -> str:
+    """
+    生成不与历史冲突的文件名前缀。
+    形如: fault_ts_20260729_153045_a3f91c
+    避免第二次抽帧把 00000.jpg 起整批覆盖掉。
+    """
+    base = sanitize_prefix(base) or "frame"
+    if not unique:
+        return base
+    import secrets
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rnd = secrets.token_hex(3)  # 6 位十六进制
+    return f"{base}_{stamp}_{rnd}"
+
+
 def run_extract(
     video: Path | str,
     out_dir: Path | str,
@@ -194,17 +211,21 @@ def run_extract(
     max_frames: int | None = None,
     quality: int = 3,
     backend: str = "auto",
+    unique_names: bool = True,
 ) -> tuple[int, str, Path]:
     """
     执行抽帧。返回 (张数, 使用的后端, 输出目录)。
+
+    unique_names=True（默认）：文件名前缀带时间戳+随机串，避免覆盖旧图。
     """
     video = Path(video).expanduser().resolve()
     if not video.is_file():
         raise FileNotFoundError(f"找不到视频: {video}")
 
     out_dir = Path(out_dir).expanduser().resolve()
-    pref = sanitize_prefix(prefix or video.stem.replace(" ", "_"))
-
+    pref = make_unique_prefix(
+        prefix or video.stem.replace(" ", "_"), unique=unique_names
+    )
     be = backend
     if be == "auto":
         be = "ffmpeg" if which_ffmpeg() else "opencv"
@@ -293,6 +314,11 @@ def main():
         default="auto",
         help="抽帧后端，默认 auto（优先 ffmpeg）",
     )
+    parser.add_argument(
+        "--no-unique-names",
+        action="store_true",
+        help="关闭时间戳/随机前缀（可能覆盖同名前缀的旧文件）",
+    )
     args = parser.parse_args()
 
     try:
@@ -307,6 +333,7 @@ def main():
             max_frames=args.max,
             quality=args.quality,
             backend=args.backend,
+            unique_names=not args.no_unique_names,
         )
     except Exception as e:
         print(f"失败: {e}", file=sys.stderr)

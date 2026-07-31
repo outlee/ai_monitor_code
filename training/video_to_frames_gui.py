@@ -44,6 +44,7 @@ class App(tk.Tk):
         self.end = tk.StringVar(value="")
         self.max_frames = tk.StringVar(value="")
         self.prefix = tk.StringVar(value="")
+        self.unique_names = tk.BooleanVar(value=True)
         self.preset = tk.StringVar(value="自定义")
         self.busy = False
 
@@ -122,12 +123,19 @@ class App(tk.Tk):
         ttk.Entry(m, textvariable=self.prefix, width=16).pack(side=tk.LEFT)
         ttk.Label(m, text="（可空=视频名）").pack(side=tk.LEFT)
 
+        row += 1
+        ttk.Checkbutton(
+            frm,
+            text="文件名带时间戳+随机串（推荐，避免覆盖以前抽的图）",
+            variable=self.unique_names,
+        ).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+
         # 说明
         row += 1
         tip = (
             "格式：常见 mp4/ts/mkv/avi/mov 等均可（由本机 ffmpeg 解码能力决定）。\n"
-            "抽帧不会自动判断异常，请抽完后人工筛选再训练。\n"
-            "推荐先安装 ffmpeg 并加入 PATH，速度与兼容性更好。"
+            "默认命名示例：fault_20260729_153045_a3f91c_00001.jpg，多次抽帧不会互相覆盖。\n"
+            "抽帧不会自动判断异常，请抽完后人工筛选再训练。推荐安装 ffmpeg。"
         )
         ttk.Label(frm, text=tip, foreground="#444", justify=tk.LEFT).grid(
             row=row, column=0, columnspan=3, sticky="w", **pad
@@ -277,6 +285,7 @@ class App(tk.Tk):
                     prefix=pref,
                     max_frames=max_f,
                     backend="auto",
+                    unique_names=self.unique_names.get(),
                 )
                 out_path = str(out_p)
             except Exception as e:
