@@ -42,12 +42,16 @@
 训练 **只用图片**（jpg/png 等），不要直接把整段 mp4/ts 丢进训练脚本。  
 视频请先抽帧，再人工分成「正常 / 异常」。
 
-**抽帧工具（推荐）：** `training/video_to_frames.py`  
+**抽帧工具（推荐）：**  
 
-- 把异常录像抽成 jpg，输出目录可直接设为 `dataset/train/anomaly`  
-- 可调每秒几帧、起止时间、最多张数、均匀抽固定张数  
-- 优先用系统 ffmpeg；没有则用 OpenCV  
-- 用法见 `training/README.md`；抽完后务必人工删掉误抽的正常画面  
+| 方式 | 说明 |
+|------|------|
+| **可视化** | `training/video_to_frames_gui.py`，或 Windows 双击 `training/打开抽帧工具.bat` |
+| 命令行 | `training/video_to_frames.py` |
+
+- 输出可指到 `dataset/train/anomaly` 等；界面有快捷按钮  
+- **格式**：常见 mp4/ts/mkv/avi/mov 等均可（靠本机 ffmpeg）；输出 jpg  
+- 抽完后务必人工删掉误抽的正常画面；详见 `training/README.md`  
 
 **目录必须长这样：**
 

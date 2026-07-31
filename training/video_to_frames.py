@@ -178,6 +178,72 @@ def extract_opencv(
     return n
 
 
+def sanitize_prefix(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def run_extract(
+    video: Path | str,
+    out_dir: Path | str,
+    *,
+    fps: float = 1.0,
+    count: int | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    prefix: str | None = None,
+    max_frames: int | None = None,
+    quality: int = 3,
+    backend: str = "auto",
+) -> tuple[int, str, Path]:
+    """
+    执行抽帧。返回 (张数, 使用的后端, 输出目录)。
+    """
+    video = Path(video).expanduser().resolve()
+    if not video.is_file():
+        raise FileNotFoundError(f"找不到视频: {video}")
+
+    out_dir = Path(out_dir).expanduser().resolve()
+    pref = sanitize_prefix(prefix or video.stem.replace(" ", "_"))
+
+    be = backend
+    if be == "auto":
+        be = "ffmpeg" if which_ffmpeg() else "opencv"
+
+    if be == "ffmpeg":
+        if not which_ffmpeg():
+            raise RuntimeError("系统未找到 ffmpeg，请安装或改用 opencv 后端")
+        use_count = count
+        if max_frames and use_count:
+            use_count = min(use_count, max_frames)
+        n = extract_ffmpeg(
+            video,
+            out_dir,
+            fps=None if use_count else fps,
+            count=use_count,
+            start=start,
+            end=end,
+            prefix=pref,
+            quality=max(2, min(quality, 31)),
+        )
+        if max_frames and n > max_frames:
+            files = sorted(out_dir.glob(f"{pref}_*.jpg"))
+            for f in files[max_frames:]:
+                f.unlink(missing_ok=True)
+            n = max_frames
+    else:
+        n = extract_opencv(
+            video,
+            out_dir,
+            fps=fps,
+            count=count,
+            start=start,
+            end=end,
+            prefix=pref,
+            max_frames=max_frames,
+        )
+    return n, be, out_dir
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="视频抽帧 → 训练用图片（可直接输出到 anomaly/normal 目录）"
@@ -229,66 +295,24 @@ def main():
     )
     args = parser.parse_args()
 
-    video = Path(args.input).expanduser().resolve()
-    if not video.is_file():
-        print(f"找不到视频: {video}", file=sys.stderr)
-        sys.exit(1)
-
-    out_dir = Path(args.output).expanduser().resolve()
-    prefix = args.prefix or video.stem.replace(" ", "_")
-    # 清理前缀非法字符
-    prefix = "".join(c if c.isalnum() or c in "-_" else "_" for c in prefix)
-
-    backend = args.backend
-    if backend == "auto":
-        backend = "ffmpeg" if which_ffmpeg() else "opencv"
-
-    print(f"视频: {video}")
-    print(f"输出: {out_dir}")
-    print(f"后端: {backend}  前缀: {prefix}")
-
     try:
-        if backend == "ffmpeg":
-            if not which_ffmpeg():
-                raise RuntimeError("系统未找到 ffmpeg")
-            # max：ffmpeg 用 -frames 限制时与 count 合并逻辑简单处理
-            count = args.count
-            if args.max and count:
-                count = min(count, args.max)
-            elif args.max and not count:
-                # 按时长估算后截断：先抽再删多余较麻烦，用 fps 抽完后裁剪
-                pass
-            n = extract_ffmpeg(
-                video,
-                out_dir,
-                fps=None if count else args.fps,
-                count=count,
-                start=args.start,
-                end=args.end,
-                prefix=prefix,
-                quality=max(2, min(args.quality, 31)),
-            )
-            if args.max and n > args.max:
-                # 删除多余
-                files = sorted(out_dir.glob(f"{prefix}_*.jpg"))
-                for f in files[args.max :]:
-                    f.unlink(missing_ok=True)
-                n = args.max
-        else:
-            n = extract_opencv(
-                video,
-                out_dir,
-                fps=args.fps,
-                count=args.count,
-                start=args.start,
-                end=args.end,
-                prefix=prefix,
-                max_frames=args.max,
-            )
+        n, be, out_dir = run_extract(
+            args.input,
+            args.output,
+            fps=args.fps,
+            count=args.count,
+            start=args.start,
+            end=args.end,
+            prefix=args.prefix,
+            max_frames=args.max,
+            quality=args.quality,
+            backend=args.backend,
+        )
     except Exception as e:
         print(f"失败: {e}", file=sys.stderr)
         sys.exit(2)
 
+    print(f"后端: {be}")
     print(f"完成: 共 {n} 张 → {out_dir}")
     print("请人工核对后，确认异常图在 anomaly、正常图在 normal。")
 

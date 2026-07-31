@@ -27,16 +27,30 @@ python train.py --data ./dataset_demo --out ./runs/demo --epochs 5 --batch-size 
 
 ## 异常/正常视频 → 训练图片
 
+### 可视化（推荐，Windows 可双击）
+
 ```bash
-# 每秒 1 帧，直接抽到训练集 anomaly（请先人工确认画面都是异常）
+cd training
+python video_to_frames_gui.py
+# 或双击：打开抽帧工具.bat
+```
+
+界面可选视频、输出目录、每秒几张/固定张数、时间段；有「→ train/anomaly」等快捷按钮。
+
+### 命令行
+
+```bash
 python video_to_frames.py -i /path/to/fault.ts -o ../dataset/train/anomaly --fps 1
-
-# 每 2 秒 1 张；只抽 30s～120s；最多 300 张
-python video_to_frames.py -i fault.mp4 -o ./frames_tmp --fps 0.5 --start 30 --end 120 --max 300
-
-# 整段均匀抽 80 张
+python video_to_frames.py -i fault.mp4 -o ./out --fps 0.5 --start 30 --end 120 --max 300
 python video_to_frames.py -i clip.mp4 -o ./out --count 80 --prefix clip01
 ```
+
+### 视频格式
+
+- **无特殊定制格式**：常见 **mp4 / ts / mts / mkv / avi / mov / flv / mpg / webm** 等均可试。  
+- 实际能否打开取决于本机 **ffmpeg**（推荐安装并加入 PATH）或 OpenCV 解码器。  
+- 台站常见 **MPEG-TS（.ts）**、**MP4** 一般没问题；若某种文件失败，先用播放器能播，再确认已装 ffmpeg。  
+- 输出统一为 **jpg** 图片。
 
 依赖：系统 **ffmpeg**（推荐）；没有则需 `opencv-python-headless`。  
 抽完后请人工筛选，再放进 `train|val` / `normal|anomaly`。
