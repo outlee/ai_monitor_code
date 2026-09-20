@@ -362,18 +362,23 @@ class StreamMonitor:
     def _build_ffmpeg_cmd(self) -> List[str]:
         """单进程：规则检测 + 可选旁路 latest.jpg；MPTS 用 program 选节目。"""
         fc = self._build_filter_complex()
+        ingest = self._input_url_with_timeout()
+        is_udp = ingest.lower().startswith("udp:")
+
         cmd: List[str] = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "level+info",
             "-fflags",
-            "+genpts",
+            "+genpts+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
             "-rw_timeout",
             "15000000",
         ]
-        # MPTS 选 program 时加大探测，便于解析 PAT/PMT
-        if self.program is not None:
+        # UDP MPEG-TS：必须显式 -f mpegts（与手测成功命令一致），并加大探测
+        if is_udp or self.program is not None:
             cmd.extend(
                 [
                     "-probesize",
@@ -382,10 +387,12 @@ class StreamMonitor:
                     "10M",
                 ]
             )
+        if is_udp:
+            cmd.extend(["-f", "mpegts"])
         cmd.extend(
             [
                 "-i",
-                self._input_url_with_timeout(),
+                ingest,
                 "-filter_complex",
                 fc,
                 "-map",
@@ -636,12 +643,16 @@ class StreamMonitor:
                 "error",
                 "-rw_timeout",
                 "8000000",
+                "-probesize",
+                "32M",
+                "-analyzeduration",
+                "10M",
             ]
-            if self.program is not None:
-                cmd.extend(["-probesize", "32M", "-analyzeduration", "10M"])
+            if src.lower().startswith("udp:"):
+                cmd.extend(["-f", "mpegts"])
             cmd.extend(["-i", src])
             if self.program is not None:
-                cmd.extend(["-map", f"0:p:{self.program}:v"])
+                cmd.extend(["-map", "0:p:%d:v" % self.program])
             cmd.extend(
                 [
                     "-frames:v",
