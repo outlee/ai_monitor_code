@@ -19,6 +19,7 @@ AI 节目监测 - Web 前端服务
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -201,6 +202,7 @@ def _channel_stats(
             "name": ch.get("name", cid),
             "url": ch.get("url", ""),
             "program": ch.get("program"),
+            "iface": ch.get("iface"),
             "enabled": ch.get("enabled", True),
             "event_count": 0,
             "last_event": None,
@@ -293,6 +295,7 @@ class ChannelUpdate(BaseModel):
     url: Optional[str] = None
     # None=不修改；传 null 可清空（见 model_fields_set）
     program: Optional[int] = Field(None, ge=0, le=65535)
+    iface: Optional[str] = None
 
 
 class ChannelCreate(BaseModel):
@@ -301,6 +304,7 @@ class ChannelCreate(BaseModel):
     url: str
     enabled: bool = True
     program: Optional[int] = Field(None, ge=0, le=65535)
+    iface: Optional[str] = None
 
 
 class ChannelImport(BaseModel):
@@ -557,6 +561,12 @@ def api_storage():
     return {"ok": True, **event_db.storage_info()}
 
 
+@app.get("/api/system/nics")
+def api_system_nics():
+    """频道管理：可选业务网卡列表。"""
+    return {"nics": _list_nics()}
+
+
 # ---------- 写配置 API（无鉴权）----------
 
 @app.post("/api/config/ai")
@@ -687,7 +697,50 @@ def _normalize_channel(raw: Dict[str, Any], require_all: bool = True) -> Dict[st
         prog = _parse_program_value(raw.get("program"))
         if prog is not None:
             out["program"] = prog
+    if "iface" in raw:
+        iface = str(raw.get("iface") or "").strip()
+        if iface:
+            out["iface"] = iface
     return out
+
+
+def _list_nics() -> List[Dict[str, Any]]:
+    """列出本机网卡（排除 lo），供频道管理下拉选择。"""
+    nics: List[Dict[str, Any]] = []
+    try:
+        import subprocess
+
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        # 3: enp1s0f1    inet 192.168.31.49/30 ...
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name = parts[1]
+            if name.endswith(":"):
+                name = name[:-1]
+            if name == "lo" or name.startswith("lo:"):
+                continue
+            ipv4 = ""
+            if "inet" in parts:
+                i = parts.index("inet")
+                if i + 1 < len(parts):
+                    ipv4 = parts[i + 1]
+            nics.append({"name": name, "ipv4": ipv4, "label": f"{name} ({ipv4})" if ipv4 else name})
+    except Exception:
+        # fallback: /sys/class/net
+        try:
+            for name in sorted(os.listdir("/sys/class/net")):
+                if name == "lo":
+                    continue
+                nics.append({"name": name, "ipv4": "", "label": name})
+        except OSError:
+            pass
+    return nics
 
 
 @app.post("/api/config/channels")
@@ -752,6 +805,15 @@ def api_update_channel(channel_id: str, body: ChannelUpdate):
             else:
                 target["program"] = p
                 changed.append(f"program={p}")
+    if "iface" in data:
+        iface = data["iface"]
+        if iface is None or str(iface).strip() == "":
+            if "iface" in target:
+                target.pop("iface", None)
+                changed.append("iface=cleared")
+        else:
+            target["iface"] = str(iface).strip()
+            changed.append(f"iface={target['iface']}")
 
     if not changed:
         raise HTTPException(400, "没有可更新的字段")

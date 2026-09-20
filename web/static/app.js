@@ -382,10 +382,46 @@
     if ($("#inp-silence-db")) $("#inp-silence-db").value = d.silence_threshold ?? -40;
   }
 
-  function openChannelModal(mode, ch) {
+  async function loadNicOptions(selected) {
+    const sel = $("#ch-iface");
+    if (!sel) return;
+    const cur = selected || "";
+    try {
+      const data = await fetchJSON("/api/system/nics");
+      const nics = data.nics || [];
+      sel.innerHTML = `<option value="">不指定（FFmpeg 直拉）</option>`;
+      nics.forEach((n) => {
+        const opt = document.createElement("option");
+        opt.value = n.name;
+        opt.textContent = n.label || n.name;
+        if (n.name === cur) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      // 若当前配置的网卡不在列表中，仍保留选项
+      if (cur && ![...sel.options].some((o) => o.value === cur)) {
+        const opt = document.createElement("option");
+        opt.value = cur;
+        opt.textContent = cur + "（当前配置）";
+        opt.selected = true;
+        sel.appendChild(opt);
+      }
+    } catch (e) {
+      sel.innerHTML = `<option value="">不指定</option>`;
+      if (cur) {
+        const opt = document.createElement("option");
+        opt.value = cur;
+        opt.textContent = cur;
+        opt.selected = true;
+        sel.appendChild(opt);
+      }
+    }
+  }
+
+  async function openChannelModal(mode, ch) {
     editMode = mode;
     $("#ch-modal-title").textContent = mode === "create" ? "新增频道" : "编辑频道";
     const idEl = $("#ch-id");
+    let ifaceVal = "";
     if (mode === "create") {
       idEl.value = "";
       idEl.disabled = false;
@@ -393,6 +429,7 @@
       $("#ch-url").value = "udp://@239.1.1.1:5000";
       $("#ch-program").value = "";
       $("#ch-enabled").checked = true;
+      ifaceVal = "";
     } else {
       idEl.value = ch.id;
       idEl.disabled = true;
@@ -403,7 +440,9 @@
           ? ch.program
           : "";
       $("#ch-enabled").checked = ch.enabled !== false;
+      ifaceVal = ch.iface || "";
     }
+    await loadNicOptions(ifaceVal);
     $("#ch-modal").classList.remove("hidden");
   }
 
@@ -525,7 +564,7 @@
     });
 
     if (!channels.length) {
-      tbody.innerHTML = `<tr><td colspan="9" class="empty">暂无频道，点击「新增」或「导入」</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="10" class="empty">暂无频道，点击「新增」或「导入」</td></tr>`;
     } else {
       tbody.innerHTML = channels
         .map(
@@ -544,7 +583,12 @@
               ? escapeHtml(c.program)
               : "<span style=\"color:var(--muted)\">-</span>"
           }</td>
-          <td>${escapeHtml(c.last_type || "-")}${
+          <td>${
+            c.iface
+              ? escapeHtml(c.iface)
+              : "<span style=\"color:var(--muted)\">-</span>"
+          }</td>
+          <td>${escapeHtml(c.last_type ? typeLabel(c.last_type) : "-")}${
             c.active_alarms && c.active_alarms.length
               ? `<br><span style="color:var(--alarm);font-size:11px">进行中: ${escapeHtml(
                   c.active_alarms.join(",")
@@ -817,12 +861,14 @@
       toast(err.message, "err");
       return;
     }
+    const iface = ($("#ch-iface") && $("#ch-iface").value) || "";
     const payload = {
       id: $("#ch-id").value.trim(),
       name: $("#ch-name").value.trim(),
       url: $("#ch-url").value.trim(),
       enabled: $("#ch-enabled").checked,
       program: program,
+      iface: iface || null,
     };
     try {
       let res;
@@ -835,6 +881,7 @@
           enabled: payload.enabled,
         };
         if (program !== null) body.program = program;
+        if (iface) body.iface = iface;
         res = await postJSON("/api/config/channels", body);
       } else {
         res = await postJSON(`/api/config/channels/${encodeURIComponent(payload.id)}`, {
@@ -842,6 +889,7 @@
           url: payload.url,
           enabled: payload.enabled,
           program: program, // null 表示清空
+          iface: iface || null,
         });
       }
       toast(res.message || "已保存", "ok");

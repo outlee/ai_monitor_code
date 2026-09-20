@@ -234,6 +234,7 @@
               <th>ID</th>
               <th>名称</th>
               <th>Program</th>
+              <th>网卡</th>
               <th>最近异常</th>
               <th>事件数</th>
               <th>地址</th>
@@ -241,7 +242,7 @@
             </tr>
           </thead>
           <tbody id="channel-tbody">
-            <tr><td colspan="9" class="empty">加载中…</td></tr>
+            <tr><td colspan="10" class="empty">加载中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -305,6 +306,13 @@
           <input type="number" id="ch-program" min="0" max="65535" step="1" placeholder="可选，MPTS 填节目号" />
         </label>
         <p class="hint" style="margin:-4px 0 8px">一地址一节目可留空；同一组播多节目时填 MPEG-TS program/service id，并各建一条频道</p>
+        <label class="field-row">
+          <span>业务网卡</span>
+          <select id="ch-iface">
+            <option value="">不指定（FFmpeg 直拉）</option>
+          </select>
+        </label>
+        <p class="hint" style="margin:-4px 0 8px">组播收流异常（localaddr 失败）时选择业务网卡，如 enp1s0f1；Worker 自动按网卡收流</p>
         <label class="switch-row">
           <span>启用监测</span>
           <input type="checkbox" id="ch-enabled" checked />
