@@ -24,18 +24,53 @@
   const TYPE_LABELS = {
     black: "黑场",
     freeze: "静帧",
-    silence: "静音",
+    silence: "无伴音",
     stream_down: "断流",
-    black_end: "黑场结束",
-    freeze_end: "静帧结束",
-    silence_end: "静音结束",
+    black_end: "黑场恢复",
+    freeze_end: "静帧恢复",
+    silence_end: "伴音恢复",
+    ai_mosaic: "花屏/马赛克",
+    ai_green_screen: "绿屏花屏",
+    ai_anomaly: "画面异常",
   };
+
+  let evOffset = 0;
+  const EV_PAGE = 20;
+  let evTotal = 0;
 
   function typeLabel(t) {
     if (!t) return "异常";
     if (TYPE_LABELS[t]) return TYPE_LABELS[t];
-    if (String(t).startsWith("ai_")) return "AI画面异常";
+    const s = String(t);
+    if (s.startsWith("ai_")) {
+      if (s.indexOf("mosaic") >= 0) return "花屏/马赛克";
+      if (s.indexOf("green") >= 0) return "绿屏花屏";
+      return "AI画面异常";
+    }
     return t;
+  }
+
+  function formatAlarmTags(list, lastType) {
+    const raw = (list && list.length ? list : lastType ? [lastType] : []).filter(Boolean);
+    if (!raw.length) return "正常";
+    return raw.map(typeLabel).join("、");
+  }
+
+  function relativeTime(timeStr) {
+    if (!timeStr) return "";
+    // expect YYYY-MM-DD HH:MM:SS
+    const m = String(timeStr).match(
+      /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/
+    );
+    if (!m) return timeStr;
+    const dt = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+    const sec = Math.floor((Date.now() - dt.getTime()) / 1000);
+    if (sec < 0) return timeStr;
+    if (sec < 60) return sec + "秒前";
+    if (sec < 3600) return Math.floor(sec / 60) + "分钟前";
+    if (sec < 86400) return Math.floor(sec / 3600) + "小时前";
+    if (sec < 86400 * 7) return Math.floor(sec / 86400) + "天前";
+    return timeStr;
   }
 
   function loadAlertPrefs() {
@@ -255,6 +290,19 @@
     return t;
   }
 
+  function statusText(status) {
+    const map = {
+      ok: "正常",
+      alarm: "异常",
+      disabled: "禁用",
+      unknown: "未知",
+      offline: "离线",
+      stale: "心跳超时",
+      reconnecting: "重连中",
+    };
+    return map[status] || "未知";
+  }
+
   function statusBadge(status) {
     const map = {
       ok: ["正常", "ok"],
@@ -390,20 +438,40 @@
       } else {
         grid.innerHTML = cards
           .map((c) => {
-            const alarms = (c.active_alarms || []).join(",") || c.last_type || "-";
+            const alarms = formatAlarmTags(c.active_alarms, c.last_type);
             const prog =
               c.program !== undefined && c.program !== null && c.program !== ""
                 ? "P" + c.program
                 : "";
-            return `<div class="ch-card lamp-${escapeHtml(c.lamp || "gray")}" title="${escapeHtml(
-              c.url || ""
-            )}">
-              <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
-              <div class="ch-id">${escapeHtml(c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
-              <div class="ch-meta">${escapeHtml(c.status || "")} · ${escapeHtml(alarms)}</div>
+            const thumb = c.thumb_url
+              ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
+              : `<div class="ch-thumb placeholder">暂无画面</div>`;
+            return `<div class="ch-card lamp-${escapeHtml(c.lamp || "gray")}" data-id="${escapeHtml(
+              c.id
+            )}" title="${escapeHtml(c.name || c.id)}">
+              ${thumb}
+              <div class="ch-body">
+                <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
+                <div class="ch-id">${escapeHtml(c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
+                <div class="ch-meta">${escapeHtml(statusText(c.status))} · ${escapeHtml(alarms)}</div>
+              </div>
             </div>`;
           })
           .join("");
+        grid.querySelectorAll(".ch-card").forEach((el) => {
+          el.addEventListener("click", () => {
+            setView("manage");
+            const id = el.dataset.id;
+            const row = document.querySelector(
+              '#channel-tbody tr[data-id="' + id.replace(/"/g, "") + '"]'
+            );
+            if (row) {
+              row.scrollIntoView({ behavior: "smooth", block: "center" });
+              row.style.outline = "1px solid var(--accent)";
+              setTimeout(() => (row.style.outline = ""), 2000);
+            }
+          });
+        });
       }
     }
 
@@ -542,24 +610,59 @@
     }
 
     const list = $("#event-list");
-    const events = data.recent_events || [];
+    const events = (data.recent_events || []).slice(0, 8);
     if (!events.length) {
       list.innerHTML = `<div class="empty">暂无事件</div>`;
     } else {
-      list.innerHTML = events
-        .map((ev) => {
-          const t = ev.type || "event";
-          const msg = ev.message || ev.msg || JSON.stringify(ev);
-          return `
-          <div class="event-item ${typeClass(t)}">
-            <div class="event-top">
-              <span class="event-type">${escapeHtml(t)}</span>
-              <span class="event-time">${escapeHtml(ev.time || "")}</span>
-            </div>
-            <div class="event-msg">${escapeHtml(ev.channel_name || ev.channel_id || "")} ${escapeHtml(msg)}</div>
-          </div>`;
-        })
-        .join("");
+      list.innerHTML = events.map(renderEventItem).join("");
+    }
+  }
+
+  function renderEventItem(ev) {
+    const t = ev.type || "event";
+    const msg = ev.message || ev.msg || "";
+    const name = ev.channel_name || ev.channel_id || "";
+    const abs = ev.time || "";
+    const rel = relativeTime(abs);
+    return `
+      <div class="event-item ${typeClass(t)}">
+        <div class="event-top">
+          <span class="event-type">${escapeHtml(typeLabel(t))}</span>
+          <span class="event-time" title="${escapeHtml(abs)}">${escapeHtml(rel || abs)}</span>
+        </div>
+        <div class="event-msg"><strong>${escapeHtml(name)}</strong> ${escapeHtml(msg)}</div>
+        <div class="event-time" style="margin-top:4px;font-size:11px;color:var(--muted)">${escapeHtml(abs)}</div>
+      </div>`;
+  }
+
+  async function loadEventsPage() {
+    const box = $("#event-list-dash");
+    if (!box) return;
+    const q = ($("#ev-q") && $("#ev-q").value.trim()) || "";
+    const typ = ($("#ev-type") && $("#ev-type").value) || "";
+    const hours = ($("#ev-hours") && $("#ev-hours").value) || "";
+    const params = new URLSearchParams();
+    params.set("limit", String(EV_PAGE));
+    params.set("offset", String(evOffset));
+    if (q) params.set("q", q);
+    if (typ) params.set("event_type", typ);
+    if (hours) params.set("hours", hours);
+    try {
+      const data = await fetchJSON("/api/alerts/history?" + params.toString());
+      const alerts = data.alerts || [];
+      evTotal = data.total || alerts.length;
+      if (!alerts.length) {
+        box.innerHTML = `<div class="empty">没有匹配的告警</div>`;
+      } else {
+        box.innerHTML = alerts.map(renderEventItem).join("");
+      }
+      const page = Math.floor(evOffset / EV_PAGE) + 1;
+      const pages = Math.max(1, Math.ceil(evTotal / EV_PAGE));
+      if ($("#ev-page-info")) {
+        $("#ev-page-info").textContent = `第 ${page}/${pages} 页 · 共 ${evTotal} 条 · 来源 ${data.source || "-"}`;
+      }
+    } catch (e) {
+      box.innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
     }
   }
 
@@ -571,18 +674,19 @@
       return;
     }
     grid.innerHTML = snaps
-      .map(
-        (s) => `
-      <div class="snap-card" data-url="${escapeHtml(s.url)}" data-cap="${escapeHtml(
-          s.channel_id + " · " + s.filename + " · " + s.mtime
-        )}">
-        <img src="${escapeHtml(s.url)}" loading="lazy" alt="${escapeHtml(s.filename)}" />
+      .map((s) => {
+        const title = s.channel_name || s.channel_id;
+        const cap = `${title} · ${s.filename} · ${s.mtime}`;
+        return `
+      <div class="snap-card" data-url="${escapeHtml(s.url)}" data-cap="${escapeHtml(cap)}">
+        <img src="${escapeHtml(s.url)}" loading="lazy" alt="${escapeHtml(title)}" />
         <div class="snap-meta">
-          <strong>${escapeHtml(s.channel_id)}</strong>
-          ${escapeHtml(s.filename)}<br/>${escapeHtml(s.mtime)}
+          <strong>${escapeHtml(title)}</strong>
+          <span style="color:var(--muted);font-size:11px"> ${escapeHtml(s.channel_id || "")}</span><br/>
+          ${escapeHtml(typeLabel((s.filename || "").split("_")[0]))} · ${escapeHtml(relativeTime(s.mtime) || s.mtime)}
         </div>
-      </div>`
-      )
+      </div>`;
+      })
       .join("");
     grid.querySelectorAll(".snap-card").forEach((el) => {
       el.addEventListener("click", () => openLightbox(el.dataset.url, el.dataset.cap));
@@ -625,6 +729,7 @@
       renderOverview(overview);
       renderSnapshots(snaps);
       if (dash) renderDashboard(dash);
+      await loadEventsPage();
       if ($("#stat-storage") && health.sqlite) {
         const mb = ((health.sqlite.db_size_bytes || 0) / 1024 / 1024).toFixed(2);
         $("#stat-storage").textContent =
@@ -862,6 +967,46 @@
   );
 
   $("#btn-refresh").addEventListener("click", refresh);
+
+  document.querySelectorAll(".card.clickable").forEach((el) => {
+    el.addEventListener("click", () => {
+      const go = el.dataset.goto;
+      if (go === "channels" || go === "alarms") {
+        setView("manage");
+        const table = document.querySelector(".table-wrap");
+        if (table) table.scrollIntoView({ behavior: "smooth" });
+      } else if (go === "events") {
+        setView("dash");
+        const a = $("#events-anchor");
+        if (a) a.scrollIntoView({ behavior: "smooth" });
+      }
+    });
+  });
+
+  if ($("#ev-search")) {
+    $("#ev-search").addEventListener("click", () => {
+      evOffset = 0;
+      loadEventsPage();
+    });
+    $("#ev-prev").addEventListener("click", () => {
+      evOffset = Math.max(0, evOffset - EV_PAGE);
+      loadEventsPage();
+    });
+    $("#ev-next").addEventListener("click", () => {
+      if (evOffset + EV_PAGE < evTotal) evOffset += EV_PAGE;
+      loadEventsPage();
+    });
+    ["ev-q", "ev-type", "ev-hours"].forEach((id) => {
+      const el = $("#" + id);
+      if (!el) return;
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          evOffset = 0;
+          loadEventsPage();
+        }
+      });
+    });
+  }
   $("#auto-refresh").addEventListener("change", setupAuto);
   $("#lb-close").addEventListener("click", closeLightbox);
   $("#lightbox").addEventListener("click", (e) => {

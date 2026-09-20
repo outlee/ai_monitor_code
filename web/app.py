@@ -111,11 +111,22 @@ def _read_events(limit: int = 100, channel_id: Optional[str] = None) -> List[Dic
     return events
 
 
+def _channel_name_map() -> Dict[str, str]:
+    cfg = _load_config()
+    m = {}
+    for ch in cfg.get("channels") or []:
+        cid = ch.get("id")
+        if cid:
+            m[str(cid)] = str(ch.get("name") or cid)
+    return m
+
+
 def _list_snapshots(channel_id: Optional[str] = None, limit: int = 40) -> List[Dict]:
     items: List[Dict] = []
     if not SNAPSHOT_DIR.is_dir():
         return items
 
+    names = _channel_name_map()
     if channel_id:
         dirs = [SNAPSHOT_DIR / channel_id] if (SNAPSHOT_DIR / channel_id).is_dir() else []
     else:
@@ -123,15 +134,20 @@ def _list_snapshots(channel_id: Optional[str] = None, limit: int = 40) -> List[D
 
     for d in dirs:
         for f in d.glob("*.jpg"):
+            if f.name == "latest.jpg" or f.name.startswith("."):
+                continue
             try:
                 st = f.stat()
                 items.append(
                     {
                         "channel_id": d.name,
+                        "channel_name": names.get(d.name, d.name),
                         "filename": f.name,
                         "url": f"/api/snapshots/{d.name}/{f.name}",
                         "size": st.st_size,
-                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
                         "mtime_ts": st.st_mtime,
                     }
                 )
@@ -437,16 +453,23 @@ def api_dashboard():
 
     cards = []
     for s in stats:
+        thumb = None
+        latest = SNAPSHOT_DIR / s["id"] / "latest.jpg"
+        if latest.is_file() and latest.stat().st_size > 0:
+            # cache-bust by mtime so大屏能刷新
+            thumb = f"/api/snapshots/{s['id']}/latest.jpg?t={int(latest.stat().st_mtime)}"
         cards.append(
             {
                 "id": s["id"],
                 "name": s["name"],
+                "url": s.get("url"),
                 "status": s["status"],
                 "lamp": lamp(s["status"]),
                 "last_type": s.get("last_type"),
                 "active_alarms": s.get("active_alarms") or [],
                 "program": s.get("program"),
                 "enabled": s.get("enabled", True),
+                "thumb_url": thumb,
             }
         )
 
@@ -475,30 +498,56 @@ def api_dashboard():
 @app.get("/api/alerts/history")
 def api_alerts_history(
     limit: int = Query(100, ge=1, le=2000),
+    offset: int = Query(0, ge=0, le=100000),
     channel_id: Optional[str] = None,
     event_type: Optional[str] = None,
+    q: Optional[str] = None,
     hours: Optional[float] = Query(None, ge=0.1, le=720),
 ):
-    """SQLite 告警历史；库不可用时回落 events.jsonl。"""
+    """SQLite 告警历史；库不可用时回落 events.jsonl。支持 q 模糊搜索。"""
     since_ts = None
     if hours is not None:
         since_ts = time.time() - float(hours) * 3600
+    rows: List[Dict[str, Any]] = []
+    source = "jsonl"
     if event_db is not None:
         try:
+            # 多取一些再过滤/分页
+            fetch_n = min(limit + offset + 200, 2000)
             rows = event_db.query_alerts(
-                limit=limit,
+                limit=fetch_n,
                 channel_id=channel_id,
                 event_type=event_type,
                 since_ts=since_ts,
             )
-            return {"source": "sqlite", "alerts": rows}
-        except Exception as e:
-            pass
-    # fallback
-    evs = _read_events(limit=limit, channel_id=channel_id)
-    if event_type:
-        evs = [e for e in evs if e.get("type") == event_type]
-    return {"source": "jsonl", "alerts": evs}
+            source = "sqlite"
+        except Exception:
+            rows = []
+    if not rows:
+        rows = _read_events(limit=min(limit + offset + 200, 2000), channel_id=channel_id)
+        if event_type:
+            rows = [e for e in rows if e.get("type") == event_type]
+        source = "jsonl"
+
+    if q:
+        ql = q.strip().lower()
+        def _match(ev: Dict) -> bool:
+            blob = " ".join(
+                str(ev.get(k) or "")
+                for k in ("channel_id", "channel_name", "type", "message", "msg", "time")
+            ).lower()
+            return ql in blob
+        rows = [e for e in rows if _match(e)]
+
+    total = len(rows)
+    page = rows[offset : offset + limit]
+    return {
+        "source": source,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "alerts": page,
+    }
 
 
 @app.get("/api/storage")

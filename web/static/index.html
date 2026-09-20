@@ -46,15 +46,15 @@
   <div id="toast" class="toast hidden"></div>
 
   <section class="cards" id="summary-cards">
-    <div class="card">
+    <div class="card clickable" id="card-total" title="点击查看频道管理" data-goto="channels">
       <div class="card-label">节目总数</div>
       <div class="card-value" id="stat-total">-</div>
     </div>
-    <div class="card">
+    <div class="card clickable" id="card-enabled" title="点击查看已启用" data-goto="channels">
       <div class="card-label">已启用</div>
       <div class="card-value" id="stat-enabled">-</div>
     </div>
-    <div class="card alarm">
+    <div class="card alarm clickable" id="card-alarm" title="点击筛选异常频道" data-goto="alarms">
       <div class="card-label">异常频道</div>
       <div class="card-value" id="stat-alarm">-</div>
     </div>
@@ -62,7 +62,7 @@
       <div class="card-label">AI 模块</div>
       <div class="card-value small" id="stat-ai">-</div>
     </div>
-    <div class="card">
+    <div class="card clickable" id="card-24h" title="点击查看告警列表" data-goto="events">
       <div class="card-label">24h 告警</div>
       <div class="card-value" id="stat-24h">-</div>
     </div>
@@ -93,13 +93,42 @@
     </div>
     <div class="hist-wrap">
       <div>
-        <h3 class="mini-h">按类型</h3>
+        <h3 class="mini-h">按类型（黑场/静帧/无伴音/断流/花屏等）</h3>
         <ul class="hist-list" id="hist-by-type"><li class="empty">暂无</li></ul>
       </div>
       <div>
         <h3 class="mini-h">按频道</h3>
         <ul class="hist-list" id="hist-by-ch"><li class="empty">暂无</li></ul>
       </div>
+    </div>
+
+    <div class="panel-head" style="margin-top:16px" id="events-anchor">
+      <h2>告警 / 事件</h2>
+      <span class="hint">支持筛选、搜索、翻页</span>
+    </div>
+    <div class="event-toolbar">
+      <input type="search" id="ev-q" placeholder="搜索节目名/ID/类型/内容" />
+      <select id="ev-type">
+        <option value="">全部类型</option>
+        <option value="black">黑场</option>
+        <option value="freeze">静帧</option>
+        <option value="silence">无伴音</option>
+        <option value="stream_down">断流</option>
+        <option value="ai_mosaic">花屏/马赛克(AI)</option>
+      </select>
+      <select id="ev-hours">
+        <option value="24">近 24 小时</option>
+        <option value="6">近 6 小时</option>
+        <option value="72">近 3 天</option>
+        <option value="">全部</option>
+      </select>
+      <button type="button" class="btn" id="ev-search">查询</button>
+      <button type="button" class="btn" id="ev-prev">上一页</button>
+      <button type="button" class="btn" id="ev-next">下一页</button>
+      <span class="hint" id="ev-page-info">-</span>
+    </div>
+    <div class="event-list" id="event-list-dash">
+      <div class="empty">加载中…</div>
     </div>
   </section>
 
@@ -218,10 +247,10 @@
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="manage-events-hint">
       <div class="panel-head">
         <h2>最近事件</h2>
-        <span class="hint">logs/events.jsonl</span>
+        <span class="hint">完整列表请到「大屏」下方告警区筛选翻页</span>
       </div>
       <div class="event-list" id="event-list">
         <div class="empty">加载中…</div>
@@ -229,10 +258,10 @@
     </section>
   </main>
 
-  <section class="panel snapshots-panel">
+  <section class="panel snapshots-panel" id="snapshots-anchor">
     <div class="panel-head">
       <h2>异常截图</h2>
-      <span class="hint">snapshots/</span>
+      <span class="hint">显示节目名称</span>
     </div>
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>

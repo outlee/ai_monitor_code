@@ -94,22 +94,53 @@ body {
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 10px;
 }
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: var(--accent); }
+
 .ch-card {
   border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--bg3);
-  padding: 12px 10px;
-  min-height: 88px;
-  cursor: default;
+  padding: 0;
+  min-height: 140px;
+  cursor: pointer;
+  overflow: hidden;
   transition: transform .12s, border-color .12s;
+  display: flex;
+  flex-direction: column;
 }
 .ch-card:hover { transform: translateY(-1px); border-color: #475569; }
+.ch-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0b1220;
+  object-fit: cover;
+  display: block;
+}
+.ch-thumb.placeholder {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 12px; background: repeating-linear-gradient(
+    -45deg, #0b1220, #0b1220 8px, #111827 8px, #111827 16px
+  );
+}
+.ch-card .ch-body { padding: 8px 10px 10px; }
 .ch-card .ch-name {
   font-size: 13px; font-weight: 600; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
 }
 .ch-card .ch-id { font-size: 11px; color: var(--muted); margin-top: 2px; }
-.ch-card .ch-meta { font-size: 11px; color: var(--muted); margin-top: 8px; min-height: 28px; }
+.ch-card .ch-meta { font-size: 11px; color: var(--muted); margin-top: 6px; min-height: 28px; }
+
+.event-toolbar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-bottom: 10px;
+}
+.event-toolbar input[type="search"],
+.event-toolbar select {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 7px 10px; font-size: 13px;
+}
+.event-toolbar input[type="search"] { min-width: 200px; flex: 1; }
 .ch-card.lamp-green { border-left: 4px solid var(--ok); background: rgba(34,197,94,.08); }
 .ch-card.lamp-red { border-left: 4px solid var(--alarm); background: rgba(239,68,68,.12); animation: card-pulse 1.6s infinite; }
 .ch-card.lamp-yellow { border-left: 4px solid var(--warn); background: rgba(245,158,11,.1); }
