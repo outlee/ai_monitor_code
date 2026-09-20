@@ -262,7 +262,28 @@ python3 -m uvicorn web.app:app --host 0.0.0.0 --port 8080
 
 ---
 
+## 5.1 组播收流：配置 `iface`（无需手工中继）
+
+若本机出现：FFmpeg `localaddr` 报 `No such device`，且无 `localaddr` 又解不出 TS，而 `tcpdump` 在业务口能看到包——可在频道上增加 **业务网卡名**：
+
+```yaml
+- id: gstv1
+  name: GSTV-1
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1          # 业务网卡
+  program: 106             # MPTS 节目号（十进制）；SPTS 可省略
+  enabled: true
+```
+
+说明：
+
+- Worker 会**自动**按网卡抓包并喂给 FFmpeg，你**不必**再手动开 `mcast_iface_relay`
+- **同一** `url` + `iface` 的多个 `program` **共用一个**抓包进程
+- 进程需有权限抓包（一般用 **root** 跑 Manager，或具备 `CAP_NET_RAW`）
+- 日志：`logs/iface_capture_*.log`
+
 ## 6. 网络与组播检查（上线前必做）
+
 
 ### 6.1 网卡与路由
 

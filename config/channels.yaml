@@ -33,16 +33,20 @@ channels:
 - id: test01
   name: 本地测试流
   url: udp://127.0.0.1:1234
-  enabled: true
+  enabled: false
   # program: 不填 = SPTS/默认节目
-# MPTS 示例（同一组播、不同 program，各一条配置）：
-# - id: ch_svc1
-#   name: 节目A
-#   url: udp://@239.1.1.1:5000
-#   program: 1
+
+# 组播示例（FFmpeg 无法 localaddr 加组时：写 iface，Worker 自动按网卡收流，无需手工中继）
+# 同一 MPTS 多节目：url/iface 相同，program 不同，只起一个抓包进程
+# - id: gstv1
+#   name: GSTV-1
+#   url: udp://@239.100.3.1:5000
+#   iface: enp1s0f1
+#   program: 106
 #   enabled: true
-# - id: ch_svc2
-#   name: 节目B
-#   url: udp://@239.1.1.1:5000
-#   program: 2
+# - id: gstv3
+#   name: GSTV-3
+#   url: udp://@239.100.3.1:5000
+#   iface: enp1s0f1
+#   program: 107
 #   enabled: true

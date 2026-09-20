@@ -82,6 +82,16 @@ class StreamMonitor:
         self.enabled = channel.get("enabled", True)
         # MPEG-TS program id（可选）。SPTS 多数不填；MPTS 填 service/program 号
         self.program = self._parse_program(channel.get("program"))
+        # 业务网卡名（可选）。FFmpeg localaddr 加组失败时，由 Worker 自动按网卡抓包再喂给 FFmpeg
+        # 例：iface: enp1s0f1 ；同一组播多 program 共用一个抓包进程
+        self.iface = (
+            channel.get("iface")
+            or defaults.get("iface")
+            or ""
+        )
+        self.iface = str(self.iface).strip() or None
+        self._ingest_url = self.url  # FFmpeg 实际读取的地址（可能是 127.0.0.1 中继）
+        self._capture_key = None  # (iface, group, port) for release
 
         self.black_duration = float(
             channel.get("black_duration", defaults.get("black_duration", 3.0))
@@ -229,20 +239,78 @@ class StreamMonitor:
             self.logger.warning(f"AI 初始化失败（不影响规则检测）: {e}")
             self.ai = None
 
+    def _ensure_ingest_url(self) -> str:
+        """
+        若配置了 iface 且 url 为组播，则自动启动（或复用）网卡抓包进程，
+        返回供 FFmpeg 使用的本机 UDP 地址。对使用者而言无需手工开中继。
+        """
+        if self._capture_key and self._ingest_url:
+            return self._ingest_url
+        if not self.iface:
+            self._ingest_url = self.url
+            return self._ingest_url
+        try:
+            from iface_mcast import resolve_ffmpeg_url
+        except ImportError:
+            try:
+                from workers.iface_mcast import resolve_ffmpeg_url
+            except ImportError as e:
+                self.logger.error("无法加载 iface_mcast: %s" % e)
+                self._ingest_url = self.url
+                return self._ingest_url
+        try:
+            local_url, key = resolve_ffmpeg_url(
+                str(self.work_dir), self.url, self.iface, logger=self.logger
+            )
+            self._ingest_url = local_url
+            self._capture_key = key
+            if key:
+                self.logger.info(
+                    "已启用网卡收流 iface=%s 原始=%s -> %s"
+                    % (self.iface, self.url, local_url)
+                )
+        except Exception as e:
+            self.logger.error("网卡收流启动失败: %s" % e)
+            self._ingest_url = self.url
+            self._capture_key = None
+        return self._ingest_url
+
+    def _release_capture(self):
+        if not self._capture_key:
+            return
+        try:
+            from iface_mcast import release
+        except ImportError:
+            try:
+                from workers.iface_mcast import release
+            except ImportError:
+                release = None
+        if release:
+            try:
+                iface, group, port = self._capture_key
+                release(iface, group, port, logger=self.logger)
+            except Exception as e:
+                self.logger.debug("release capture: %s" % e)
+        self._capture_key = None
+
     def _input_url_with_timeout(self) -> str:
         """
         为 UDP/RTP 注入收包超时，避免无流时 FFmpeg 永久阻塞、无法进入重连。
         超时单位：微秒（FFmpeg udp 协议 timeout 选项）。
         """
-        url = self.url
+        url = self._ensure_ingest_url()
         if "timeout=" in url:
             return url
         lower = url.lower()
         if not (lower.startswith("udp:") or lower.startswith("rtp:")):
             return url
-        timeout_us = int(float(self.defaults.get("input_timeout_sec", 15.0)) * 1_000_000)
+        # 本机中继可稍短超时；组播直拉用配置值
+        timeout_sec = float(self.defaults.get("input_timeout_sec", 15.0))
+        if "127.0.0.1" in url:
+            timeout_sec = max(timeout_sec, 20.0)
+        timeout_us = int(timeout_sec * 1_000_000)
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}timeout={timeout_us}"
+        return "%s%stimeout=%d" % (url, sep, timeout_us)
 
     def _build_filter_complex(self) -> str:
         """
@@ -356,6 +424,8 @@ class StreamMonitor:
             "channel_id": self.id,
             "channel_name": self.name,
             "url": self.url,
+            "ingest_url": self._ingest_url,
+            "iface": self.iface,
             "program": self.program,
             "enabled": self.enabled,
             "state": self._state,
@@ -555,8 +625,8 @@ class StreamMonitor:
         try:
             src = (
                 self._input_url_with_timeout()
-                if self.url.lower().startswith(("udp:", "rtp:"))
-                else self.url
+                if self._ensure_ingest_url().lower().startswith(("udp:", "rtp:"))
+                else self._ensure_ingest_url()
             )
             cmd = [
                 "ffmpeg",
@@ -890,10 +960,12 @@ class StreamMonitor:
 
     def _run_once(self) -> int:
         """跑一轮 FFmpeg，返回退出码。主循环只解析 stderr + 心跳。"""
+        ingest = self._ensure_ingest_url()
         cmd = self._build_ffmpeg_cmd()
         prog = f" program={self.program}" if self.program is not None else ""
+        iface_s = f" iface={self.iface}" if self.iface else ""
         self.logger.info(
-            f"启动 FFmpeg 监测: {self.name} ({self.url}){prog} "
+            f"启动 FFmpeg 监测: {self.name} ({self.url} -> {ingest}){prog}{iface_s} "
             f"detect_width={self.detect_width} "
             f"frame_interval={self.frame_interval_sec}s"
         )
@@ -995,6 +1067,7 @@ class StreamMonitor:
     def stop(self):
         self.running = False
         self._stop_ffmpeg()
+        self._release_capture()
         self._write_status("stopped")
 
 
