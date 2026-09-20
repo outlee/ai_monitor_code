@@ -1,8 +1,8 @@
 defaults:
   black_duration: 2.0
   freeze_duration: 3.0
-  silence_duration: 3.0
-  silence_threshold: -40
+  silence_duration: 5.0
+  silence_threshold: -45
   save_snapshot: true
   snapshot_dir: ./snapshots
   log_dir: ./logs

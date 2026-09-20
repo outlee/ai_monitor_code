@@ -91,7 +91,7 @@ class StreamMonitor:
         )
         self.iface = str(self.iface).strip() or None
         self._ingest_url = self.url  # FFmpeg 实际读取的地址（可能是 127.0.0.1 中继）
-        self._capture_key = None  # (iface, group, port) for release
+        self._capture_key = None  # (iface, group, port, consumer_id) for release
 
         self.black_duration = float(
             channel.get("black_duration", defaults.get("black_duration", 3.0))
@@ -260,13 +260,17 @@ class StreamMonitor:
                 return self._ingest_url
         try:
             local_url, key = resolve_ffmpeg_url(
-                str(self.work_dir), self.url, self.iface, logger=self.logger
+                str(self.work_dir),
+                self.url,
+                self.iface,
+                consumer_id=self.id,
+                logger=self.logger,
             )
             self._ingest_url = local_url
             self._capture_key = key
             if key:
                 self.logger.info(
-                    "已启用网卡收流 iface=%s 原始=%s -> %s"
+                    "已启用网卡收流 iface=%s 原始=%s -> %s (每路独立本地端口)"
                     % (self.iface, self.url, local_url)
                 )
         except Exception as e:
@@ -287,8 +291,8 @@ class StreamMonitor:
                 release = None
         if release:
             try:
-                iface, group, port = self._capture_key
-                release(iface, group, port, logger=self.logger)
+                iface, group, port, consumer_id = self._capture_key
+                release(iface, group, port, consumer_id, logger=self.logger)
             except Exception as e:
                 self.logger.debug("release capture: %s" % e)
         self._capture_key = None
