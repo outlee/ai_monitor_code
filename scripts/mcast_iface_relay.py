@@ -17,9 +17,8 @@ Example:
     --local-port 15501
 
 Requires: root (packet socket). Python3 stdlib only.
+Compatible with CentOS 7 Python 3.6.
 """
-
-from __future__ import annotations
 
 import argparse
 import socket
@@ -27,20 +26,34 @@ import struct
 import sys
 import time
 
+try:
+    from typing import Optional
+except ImportError:
+    Optional = None  # type: ignore
+
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 
 
-def mac_for_ipv4_mcast(ip: str) -> bytes:
+def mac_for_ipv4_mcast(ip):
     """Ethernet MAC for IPv4 multicast: 01:00:5e + lower 23 bits of IP."""
     parts = [int(x) for x in ip.split(".")]
     ip_int = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
     body = ip_int & 0x7FFFFF
-    return bytes([0x01, 0x00, 0x5E, (body >> 16) & 0xFF, (body >> 8) & 0xFF, body & 0xFF])
+    return bytes(
+        [
+            0x01,
+            0x00,
+            0x5E,
+            (body >> 16) & 0xFF,
+            (body >> 8) & 0xFF,
+            body & 0xFF,
+        ]
+    )
 
 
-def parse_ipv4_udp_payload(frame: bytes, group: str, udp_port: int) -> bytes | None:
+def parse_ipv4_udp_payload(frame, group, udp_port):
     if len(frame) < 14:
         return None
     ethertype = struct.unpack("!H", frame[12:14])[0]
@@ -77,7 +90,7 @@ def parse_ipv4_udp_payload(frame: bytes, group: str, udp_port: int) -> bytes | N
     return payload if payload else None
 
 
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser(description="AF_PACKET multicast -> localhost UDP relay")
     ap.add_argument("--iface", required=True, help="NIC name, e.g. enp1s0f1")
     ap.add_argument("--group", required=True, help="Multicast group, e.g. 239.100.3.1")
