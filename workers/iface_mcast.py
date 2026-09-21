@@ -3,15 +3,13 @@
 """
 In-process multicast capture hub (CentOS7 / Python 3.6).
 
-One AF_PACKET reader thread per (iface, group, port). Consumers each get
-a dedicated 127.0.0.1 port; packets are fan-out copied under a lock.
-Adding/removing a consumer does NOT restart capture (avoids freeze/silence
-false alarms from brief stream gaps).
+One AF_PACKET reader per (iface, group, port). Each consumer gets TWO
+localhost UDP ports: one for monitor FFmpeg, one for thumb/snapshot grab.
+Both receive a full fan-out copy so they never steal packets from each other.
 """
 
 from __future__ import print_function
 
-import os
 import re
 import socket
 import struct
@@ -19,7 +17,6 @@ import threading
 import time
 
 _lock = threading.Lock()
-# key -> hub dict
 _hubs = {}
 
 ETH_P_ALL = 0x0003
@@ -83,6 +80,14 @@ def _parse_payload(frame, group, udp_port):
     return payload if payload else None
 
 
+def _all_local_ports(hub):
+    ports = []
+    for item in hub["ports"].values():
+        ports.append(item["mon"])
+        ports.append(item["thumb"])
+    return ports
+
+
 def _capture_loop(hub):
     iface = hub["iface"]
     group = hub["group"]
@@ -103,7 +108,9 @@ def _capture_loop(hub):
             if logger:
                 logger.warning("promisc skip: %s" % e)
         if logger:
-            logger.info("iface capture thread running on %s for %s:%s" % (iface, group, mport))
+            logger.info(
+                "iface capture thread on %s for %s:%s" % (iface, group, mport)
+            )
         n = 0
         t0 = time.time()
         last = t0
@@ -122,7 +129,7 @@ def _capture_loop(hub):
             if not payload:
                 continue
             with hub["dest_lock"]:
-                dests = list(hub["ports"].values())
+                dests = list(_all_local_ports(hub))
             for lp in dests:
                 try:
                     out.sendto(payload, ("127.0.0.1", lp))
@@ -154,6 +161,9 @@ def _capture_loop(hub):
 
 
 def acquire(work_dir, iface, group, port, consumer_id, logger=None):
+    """
+    Returns (monitor_url, thumb_url).
+    """
     key = (iface, group, int(port))
     with _lock:
         hub = _hubs.get(key)
@@ -172,11 +182,16 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
             _hubs[key] = hub
 
         if consumer_id in hub["ports"]:
-            return "udp://127.0.0.1:%d" % hub["ports"][consumer_id]
+            item = hub["ports"][consumer_id]
+            return (
+                "udp://127.0.0.1:%d" % item["mon"],
+                "udp://127.0.0.1:%d" % item["thumb"],
+            )
 
-        local_port = _free_udp_port()
+        mon = _free_udp_port()
+        thumb = _free_udp_port()
         with hub["dest_lock"]:
-            hub["ports"][consumer_id] = local_port
+            hub["ports"][consumer_id] = {"mon": mon, "thumb": thumb}
 
         if hub["thread"] is None or not hub["thread"].is_alive():
             hub["stop"] = False
@@ -193,10 +208,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture assign %s -> 127.0.0.1:%d (consumers=%d, no restart)"
-                % (consumer_id, local_port, len(hub["ports"]))
+                "iface capture %s mon=:%d thumb=:%d consumers=%d"
+                % (consumer_id, mon, thumb, len(hub["ports"]))
             )
-        return "udp://127.0.0.1:%d" % local_port
+        return ("udp://127.0.0.1:%d" % mon, "udp://127.0.0.1:%d" % thumb)
 
 
 def release(iface, group, port, consumer_id, logger=None):
@@ -225,14 +240,18 @@ def release(iface, group, port, consumer_id, logger=None):
 
 
 def resolve_ffmpeg_url(work_dir, url, iface, consumer_id, logger=None):
+    """
+    Returns (monitor_url, thumb_url, key).
+    If no iface, returns (url, url, None).
+    """
     if not iface:
-        return url, None
+        return url, url, None
     group, port = parse_udp_group_port(url)
     if not group:
         if logger:
             logger.warning("iface=%s set but url is not udp multicast: %s" % (iface, url))
-        return url, None
-    local_url = acquire(
+        return url, url, None
+    mon_url, thumb_url = acquire(
         work_dir, iface, group, port, consumer_id=consumer_id, logger=logger
     )
-    return local_url, (iface, group, port, consumer_id)
+    return mon_url, thumb_url, (iface, group, port, consumer_id)

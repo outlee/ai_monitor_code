@@ -90,7 +90,8 @@ class StreamMonitor:
             or ""
         )
         self.iface = str(self.iface).strip() or None
-        self._ingest_url = self.url  # FFmpeg 实际读取的地址（可能是 127.0.0.1 中继）
+        self._ingest_url = self.url  # 监测 FFmpeg 读取地址
+        self._thumb_url = self.url  # 截图专用地址（与监测分端口，避免抢包）
         self._capture_key = None  # (iface, group, port, consumer_id) for release
 
         self.black_duration = float(
@@ -285,23 +286,25 @@ class StreamMonitor:
                 self._ingest_url = self.url
                 return self._ingest_url
         try:
-            local_url, key = resolve_ffmpeg_url(
+            mon_url, thumb_url, key = resolve_ffmpeg_url(
                 str(self.work_dir),
                 self.url,
                 self.iface,
                 consumer_id=self.id,
                 logger=self.logger,
             )
-            self._ingest_url = local_url
+            self._ingest_url = mon_url
+            self._thumb_url = thumb_url or mon_url
             self._capture_key = key
             if key:
                 self.logger.info(
-                    "已启用网卡收流 iface=%s 原始=%s -> %s (每路独立本地端口)"
-                    % (self.iface, self.url, local_url)
+                    "已启用网卡收流 iface=%s 原始=%s -> 监测%s 截图%s"
+                    % (self.iface, self.url, mon_url, self._thumb_url)
                 )
         except Exception as e:
             self.logger.error("网卡收流启动失败: %s" % e)
             self._ingest_url = self.url
+            self._thumb_url = self.url
             self._capture_key = None
         return self._ingest_url
 
@@ -727,14 +730,25 @@ class StreamMonitor:
                 pass
             return False
 
+    def _thumb_input_url(self) -> str:
+        """截图专用输入（与监测 FFmpeg 分端口）。"""
+        self._ensure_ingest_url()
+        src = self._thumb_url or self._ingest_url or self.url
+        if not src.lower().startswith(("udp:", "rtp:")):
+            return src
+        if "timeout=" in src:
+            return src
+        timeout_us = int(max(float(self.defaults.get("input_timeout_sec", 15.0)), 15.0) * 1_000_000)
+        sep = "&" if "?" in src else "?"
+        return "%s%stimeout=%d" % (src, sep, timeout_us)
+
     def _grab_frame_ffmpeg(
         self, out_path: Path, quality: int = 3, *, keyframe_only: bool = False
     ) -> bool:
-        """独立 FFmpeg 抽 1 帧。实时缩略图不要强等关键帧（易卡住无图）。"""
+        """独立 FFmpeg 抽 1 帧。使用截图专用端口，不与主监测抢包。"""
         try:
-            src = self._ensure_ingest_url()
-            if src.lower().startswith(("udp:", "rtp:")):
-                src = self._input_url_with_timeout()
+            src = self._thumb_input_url()
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -744,7 +758,7 @@ class StreamMonitor:
                 "-fflags",
                 "+genpts+discardcorrupt",
                 "-rw_timeout",
-                "8000000",
+                "10000000",
                 "-probesize",
                 "8M",
                 "-analyzeduration",
@@ -770,7 +784,7 @@ class StreamMonitor:
             )
             r = subprocess.run(
                 cmd,
-                timeout=12,
+                timeout=15,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
@@ -779,7 +793,9 @@ class StreamMonitor:
             if not ok and r.stderr:
                 err = (r.stderr or "").strip().splitlines()
                 if err:
-                    self.logger.warning("抽帧失败: %s" % err[-1][:200])
+                    self.logger.warning(
+                        "抽帧失败 src=%s: %s" % (src, err[-1][:200])
+                    )
             return ok
         except Exception as e:
             self.logger.warning("独立抽帧异常: %s" % e)
