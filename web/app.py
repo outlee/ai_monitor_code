@@ -599,30 +599,9 @@ def _read_meminfo() -> Dict[str, int]:
     return out
 
 
-def _cpu_percent(sample_sec: float = 0.15) -> Optional[float]:
-    def read():
-        with open("/proc/stat", "r", encoding="utf-8") as f:
-            parts = f.readline().split()
-        vals = [int(x) for x in parts[1:8]]
-        idle = vals[3] + vals[4]
-        total = sum(vals)
-        return idle, total
-
-    try:
-        i1, t1 = read()
-        time.sleep(sample_sec)
-        i2, t2 = read()
-        di, dt = i2 - i1, t2 - t1
-        if dt <= 0:
-            return None
-        return round(100.0 * (1.0 - di / dt), 1)
-    except Exception:
-        return None
-
-
 @app.get("/api/system/perf")
 def api_system_perf():
-    """当前服务器负载：CPU/内存/磁盘/负载。"""
+    """当前服务器负载：负载/内存/磁盘（不阻塞采样）。"""
     mem = _read_meminfo()
     mem_total = mem.get("MemTotal") or 0
     mem_avail = mem.get("MemAvailable") or mem.get("MemFree") or 0
@@ -631,6 +610,14 @@ def api_system_perf():
     try:
         load1, load5, load15 = os.getloadavg()
     except OSError:
+        pass
+    # 粗略 CPU：用 load1 / CPU核数 * 100，封顶 100
+    cpu_est = None
+    try:
+        cores = os.cpu_count() or 1
+        if load1 is not None:
+            cpu_est = round(min(100.0, 100.0 * float(load1) / float(cores)), 1)
+    except Exception:
         pass
     disk = {}
     try:
@@ -648,7 +635,8 @@ def api_system_perf():
         pass
     return {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "cpu_percent": _cpu_percent(),
+        "cpu_percent": cpu_est,
+        "cpu_cores": os.cpu_count(),
         "loadavg": {"1": load1, "5": load5, "15": load15},
         "memory": {
             "total_bytes": mem_total,
@@ -713,8 +701,9 @@ def api_storage_clear(body: StorageClearBody):
         n = 0
         for p in LOG_DIR.glob("iface_capture_*.log"):
             try:
-                p.unlink(missing_ok=True)
-                n += 1
+                if p.is_file():
+                    os.unlink(str(p))
+                    n += 1
             except OSError:
                 pass
         result["cleared"]["iface_capture_logs"] = n
@@ -722,8 +711,9 @@ def api_storage_clear(body: StorageClearBody):
         n = 0
         for p in SNAPSHOT_DIR.rglob("*.jpg"):
             try:
-                p.unlink(missing_ok=True)
-                n += 1
+                if p.is_file():
+                    os.unlink(str(p))
+                    n += 1
             except OSError:
                 pass
         result["cleared"]["snapshots"] = n

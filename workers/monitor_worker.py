@@ -686,28 +686,37 @@ class StreamMonitor:
         - 无伴音/断流：默认不截（画面参考价值低，且易截到损坏帧）
         - 黑场/静帧：优先用很新的旁路 latest；否则后台抽关键帧
         """
-        # 无伴音、断流不截屏
-        if event_type in ("silence", "stream_down") or str(event_type).endswith("_end"):
+        # 断流/结束事件不截；黑场/静帧/无伴音等异常仍截（保留异常截图）
+        if event_type in ("stream_down",) or str(event_type).endswith("_end"):
             return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = self.snapshot_dir / f"{event_type}_{ts}.jpg"
 
-        # 旁路帧必须足够新，否则宁可后台抽关键帧
+        def _unlink_quiet(p):
+            try:
+                if p.is_file():
+                    os.unlink(str(p))
+            except OSError:
+                pass
+
+        # 旁路 latest 仅在非常新时用；否则后台抽关键帧（减少花屏）
         age = self._latest_frame_age()
-        prefer = self.snapshot_prefer_latest and age is not None and age <= min(
-            2.0, self.latest_max_age_sec
+        prefer = (
+            self.snapshot_prefer_latest
+            and age is not None
+            and age <= 1.2
+            and event_type in ("black", "freeze")
         )
         if prefer and self._copy_latest_frame(out_path):
-            # 过小的 jpg 多半是坏图，丢掉改抽关键帧
             try:
                 if out_path.stat().st_size >= 8 * 1024:
                     self.logger.info(f"截图已保存(旁路): {out_path}")
                     self._prune_snapshots()
                     return out_path
-                out_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            _unlink_quiet(out_path)
 
         def _bg():
             with self._snapshot_lock:
@@ -715,10 +724,12 @@ class StreamMonitor:
                     return
                 self._snapshot_inflight = True
             try:
+                # 稍等半秒再抽，降低告警瞬间坏帧概率
+                time.sleep(0.5)
                 if self._grab_frame_ffmpeg(out_path, quality=3):
                     try:
                         if out_path.stat().st_size < 8 * 1024:
-                            out_path.unlink(missing_ok=True)
+                            _unlink_quiet(out_path)
                             self.logger.warning("截图过小已丢弃（可能花屏）")
                             return
                     except OSError:

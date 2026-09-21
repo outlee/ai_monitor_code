@@ -70,10 +70,6 @@
       <div class="card-label">存储</div>
       <div class="card-value small" id="stat-storage">-</div>
     </div>
-    <div class="card" id="card-perf" title="服务器性能">
-      <div class="card-label">服务器</div>
-      <div class="card-value small" id="stat-perf">-</div>
-    </div>
   </section>
 
   <!-- 大屏：四色交通灯网格 -->
@@ -204,15 +200,10 @@
         <button class="btn btn-primary" id="btn-save-defaults">保存规则参数</button>
       </div>
 
-      <div class="ctrl-block note-block">
-        <h3>说明</h3>
-        <ul class="note-list">
-          <li>开关无需登录，请仅在内网使用</li>
-          <li>修改后写入 <code>config/channels.yaml</code></li>
-          <li>Manager/Worker 默认热重载，约 3 秒内自动应用（--no-reload 可关）</li>
-          <li>本地提醒：顶部「声音」「桌面通知」（需保持面板打开）</li>
-          <li>下方表格可单独启用 / 禁用每个频道</li>
-        </ul>
+      <div class="ctrl-block note-block" id="perf-panel">
+        <h3>服务器性能</h3>
+        <div id="perf-detail" class="storage-detail">加载中…</div>
+        <button type="button" class="btn" id="btn-perf-refresh" style="margin-top:8px">刷新性能</button>
       </div>
     </div>
   </section>
@@ -266,7 +257,7 @@
   <section class="panel snapshots-panel" id="snapshots-anchor">
     <div class="panel-head">
       <h2>异常截图</h2>
-      <span class="hint">显示节目名称 · 无伴音默认不截屏</span>
+      <span class="hint">显示节目名称 · 异常告警保留截图</span>
     </div>
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>
