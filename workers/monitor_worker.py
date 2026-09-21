@@ -193,6 +193,7 @@ class StreamMonitor:
         self._snapshot_lock = threading.Lock()
         self._thumb_thread: Optional[threading.Thread] = None
         self._thumb_proc: Optional[subprocess.Popen] = None
+        self._thumb_feeder = None
         self._last_status_db_ts = 0.0
         self._status_db_interval = float(
             defaults.get("status_db_interval_sec", 30.0)
@@ -497,8 +498,35 @@ class StreamMonitor:
             self._write_status()
 
     def _stop_thumb_proc(self):
+        # 先注销 feeder，避免 capture 线程继续往已关闭的队列写
+        if self._capture_key:
+            try:
+                from iface_mcast import unregister_feeder
+            except ImportError:
+                try:
+                    from workers.iface_mcast import unregister_feeder
+                except ImportError:
+                    unregister_feeder = None
+            if unregister_feeder:
+                try:
+                    iface, group, port, cid = self._capture_key
+                    unregister_feeder(iface, group, port, cid)
+                except Exception:
+                    pass
+        feeder = getattr(self, "_thumb_feeder", None)
+        if feeder is not None:
+            try:
+                feeder.close()
+            except Exception:
+                pass
+            self._thumb_feeder = None
         if self._thumb_proc is not None and self._thumb_proc.poll() is None:
             try:
+                if self._thumb_proc.stdin:
+                    try:
+                        self._thumb_proc.stdin.close()
+                    except Exception:
+                        pass
                 self._thumb_proc.terminate()
                 self._thumb_proc.wait(timeout=3)
             except Exception:
@@ -508,182 +536,134 @@ class StreamMonitor:
                     pass
         self._thumb_proc = None
 
-    def _refresh_latest_from_ring(self) -> bool:
+    def _start_live_thumb_ffmpeg(self):
         """
-        从网卡抓包 TS 环形缓冲抽 1 帧写入 latest.jpg。
-        MPTS 下 ring 需足够大才能覆盖单 program 的关键帧；先对齐 0x47，
-        再落盘后有限次重试（pipe 直接喂易「Nothing was written」）。
+        常驻 FFmpeg：从抓包 TsFeeder 持续读 stdin，保持 H.264 SPS/PPS，
+        按间隔覆盖写 latest.jpg。解决「截一段 TS 快照解不出帧」的问题。
         """
-        if not self._capture_key:
-            return False
         try:
-            from iface_mcast import snapshot_ts, ring_size, align_ts_sync
+            from iface_mcast import TsFeeder, register_feeder
         except ImportError:
-            try:
-                from workers.iface_mcast import (
-                    snapshot_ts,
-                    ring_size,
-                    align_ts_sync,
-                )
-            except ImportError:
-                return False
-        try:
-            iface, group, port, _cid = self._capture_key
-        except Exception:
-            return False
+            from workers.iface_mcast import TsFeeder, register_feeder
 
-        # MPTS 多节目时单路码率占比小，至少要有数 MB 才容易碰到关键帧
-        data = snapshot_ts(iface, group, port, min_bytes=1024 * 1024)
-        if not data:
-            try:
-                rsz = ring_size(iface, group, port)
-            except Exception:
-                rsz = 0
-            self.logger.debug(
-                "TS ring 不足无法截图 ring=%dKB" % int(rsz / 1024)
-            )
-            return False
-
-        data = align_ts_sync(data)
+        iface, group, port, cid = self._capture_key
+        interval = max(float(self.frame_interval_sec), 2.0)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        ts_path = self.snapshot_dir / (".ring_%s.ts" % self.id)
-        jpg_tmp = self.snapshot_dir / (".latest_%s.tmp.jpg" % self.id)
-        out = self.latest_frame_path
-        last_err = ""
+        out = str(self.latest_frame_path)
+        err_path = self.snapshot_dir / "thumb_ffmpeg.err"
 
-        try:
-            with open(str(ts_path), "wb") as f:
-                f.write(data)
-                f.flush()
-        except OSError as e:
-            self.logger.warning("写 TS ring 临时文件失败: %s" % e)
-            return False
+        feeder = TsFeeder()
+        register_feeder(iface, group, port, cid, feeder=feeder, logger=self.logger)
+        self._thumb_feeder = feeder
 
-        # 少量高胜率组合，避免失败时拖成几十次 ffmpeg
-        attempts = []
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+genpts+discardcorrupt+igndts",
+            "-err_detect",
+            "ignore_err",
+            "-probesize",
+            "8M",
+            "-analyzeduration",
+            "5M",
+            "-f",
+            "mpegts",
+            "-i",
+            "pipe:0",
+        ]
+        # 新版 ffmpeg 默认 max_error_rate≈0.67，组播丢包时会直接放弃出图
+        cmd.extend(["-max_error_rate", "1.0"])
         if self.program is not None:
-            pid = int(self.program)
-            attempts.append((["-map", "0:p:%d:v:0" % pid], "1.0", False))
-            attempts.append((["-map", "0:p:%d:v:0" % pid], "2.0", True))
-            attempts.append((["-map", "0:p:%d:v" % pid], None, False))
-        attempts.append((["-map", "0:v:0"], "1.0", False))
-        attempts.append(([], "1.0", False))
-
-        def _try_once(maps, ss, iframe_only):
-            nonlocal last_err
-            try:
-                if jpg_tmp.is_file():
-                    jpg_tmp.unlink()
-            except OSError:
-                pass
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-fflags",
-                "+genpts+discardcorrupt+igndts",
-                "-err_detect",
-                "ignore_err",
-                "-probesize",
-                "16M",
-                "-analyzeduration",
-                "10M",
+            cmd.extend(["-map", "0:p:%d:v:0" % int(self.program)])
+        else:
+            cmd.extend(["-map", "0:v:0"])
+        cmd.extend(
+            [
+                "-an",
+                "-vf",
+                "fps=1/%s,scale=640:-2" % interval,
+                "-f",
+                "image2",
+                "-update",
+                "1",
+                "-q:v",
+                "5",
+                out,
             ]
-            if ss:
-                cmd.extend(["-ss", str(ss)])
-            cmd.extend(["-f", "mpegts", "-i", str(ts_path)])
-            cmd.extend(list(maps))
-            if iframe_only:
-                cmd.extend(
-                    [
-                        "-an",
-                        "-vf",
-                        r"select=eq(pict_type\,I),scale=640:-2",
-                        "-vsync",
-                        "vfr",
-                        "-frames:v",
-                        "1",
-                        "-q:v",
-                        "5",
-                        str(jpg_tmp),
-                    ]
-                )
-            else:
-                cmd.extend(
-                    [
-                        "-an",
-                        "-vf",
-                        "scale=640:-2",
-                        "-frames:v",
-                        "1",
-                        "-q:v",
-                        "5",
-                        str(jpg_tmp),
-                    ]
-                )
-            try:
-                r = subprocess.run(
-                    cmd,
-                    timeout=20,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-            except subprocess.TimeoutExpired:
-                last_err = "timeout"
-                return False
-            err = (r.stderr or b"").decode("utf-8", "replace").strip()
-            if err:
-                last_err = err.splitlines()[-1][:220]
-            return jpg_tmp.is_file() and jpg_tmp.stat().st_size > 1024
+        )
 
-        ok = False
-        try:
-            for maps, ss, iframe_only in attempts:
-                if _try_once(maps, ss, iframe_only):
-                    ok = True
-                    break
+        err_f = open(str(err_path), "w")
+        self.logger.info(
+            "启动实时截图 FFmpeg(stdin feeder) -> %s program=%s"
+            % (out, self.program)
+        )
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=err_f,
+            bufsize=0,
+        )
+        self._thumb_proc = proc
 
-            if ok:
-                os.replace(str(jpg_tmp), str(out))
-                return True
-
-            prog = (
-                (" program=%s" % self.program)
-                if self.program is not None
-                else ""
-            )
-            self.logger.warning(
-                "环缓冲抽帧失败 ring=%dKB%s: %s"
-                % (int(len(data) / 1024), prog, last_err or "no frame")
-            )
-            # 失败时偶尔留下 debug_ring.ts 便于现场手测
-            try:
-                dbg = self.snapshot_dir / "debug_ring.ts"
-                if (not dbg.is_file()) or (
-                    time.time() - dbg.stat().st_mtime > 120
-                ):
-                    os.replace(str(ts_path), str(dbg))
-                    ts_path = None
-            except OSError:
-                pass
-            return False
-        finally:
-            for p in (ts_path, jpg_tmp):
-                if p is None:
-                    continue
+        logged_ok = False
+        # 先喂一点数据帮助 probe
+        warm_deadline = time.time() + 8.0
+        while (
+            self.running
+            and self._state in ("running", "starting")
+            and proc.poll() is None
+        ):
+            batch = feeder.get_batch(max_bytes=512 * 1024, timeout=0.5)
+            if batch:
                 try:
-                    if p.is_file():
-                        p.unlink()
-                except OSError:
-                    pass
+                    proc.stdin.write(batch)
+                except (BrokenPipeError, OSError):
+                    break
+            if (
+                not logged_ok
+                and self.latest_frame_path.is_file()
+                and self.latest_frame_path.stat().st_size > 1024
+            ):
+                self.logger.info(
+                    "latest.jpg 已生成 size=%d"
+                    % self.latest_frame_path.stat().st_size
+                )
+                logged_ok = True
+            # 温启阶段过后继续正常喂
+            if time.time() > warm_deadline and not logged_ok:
+                # 仍无图也继续跑，等关键帧
+                pass
+
+        # 进程已退出或状态变更
+        rc = proc.poll()
+        err_tail = ""
+        try:
+            err_f.flush()
+            with open(str(err_path), "r") as rf:
+                err_tail = (rf.read() or "")[-400:]
+        except Exception:
+            pass
+        try:
+            err_f.close()
+        except Exception:
+            pass
+        if rc is not None:
+            self.logger.warning(
+                "实时截图 FFmpeg 退出 code=%s %s"
+                % (rc, err_tail.replace("\n", " ")[:240])
+            )
+        self._stop_thumb_proc()
 
     def _start_thumb_thread(self):
         """
-        周期性刷新 latest.jpg：
-        1) 优先从网卡 TS 环形缓冲抽帧（稳定、不占第二 UDP 口）
-        2) 无 iface/缓冲时退回一次性 UDP/URL 抽帧
+        刷新 latest.jpg：
+        - 有 iface 抓包：常驻 FFmpeg 读 TsFeeder（推荐，解码器保持状态）
+        - 否则：周期性一次性 ffmpeg 抽帧
         """
         if self.frame_interval_sec <= 0:
             return
@@ -695,61 +675,65 @@ class StreamMonitor:
             interval = max(float(self.frame_interval_sec), 2.0)
             fail_streak = 0
             logged_ok = False
+            mode = "stdin_feeder" if self._capture_key else "ffmpeg_grab"
             self.logger.info(
                 "实时截图线程运行中 mode=%s interval=%.1fs -> %s"
-                % (
-                    "ts_ring" if self._capture_key else "ffmpeg_grab",
-                    interval,
-                    self.latest_frame_path,
-                )
+                % (mode, interval, self.latest_frame_path)
             )
             while self.running:
                 if self._state not in ("running", "starting"):
                     self._stop_thumb_proc()
                     time.sleep(1.0)
                     continue
+
+                if self._capture_key:
+                    try:
+                        self._start_live_thumb_ffmpeg()
+                    except Exception as e:
+                        self.logger.warning("实时截图 stdin 模式失败: %s" % e)
+                        self._stop_thumb_proc()
+                        fail_streak += 1
+                        time.sleep(min(3.0 + fail_streak, 15.0))
+                        continue
+                    # 正常返回表示 ffmpeg 已退出，短暂等待后重启
+                    fail_streak += 1
+                    if self.latest_frame_path.is_file():
+                        fail_streak = 0
+                    time.sleep(2.0)
+                    continue
+
+                # 无 iface：退回周期性抽帧
                 ok = False
                 try:
-                    if self._capture_key:
-                        ok = self._refresh_latest_from_ring()
-                    if not ok:
-                        # 无环缓冲或抽帧失败时，退回一次性拉流
-                        ok = self._grab_frame_ffmpeg(self.latest_frame_path)
+                    ok = self._grab_frame_ffmpeg(self.latest_frame_path)
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
-                    ok = False
-
                 if ok:
                     fail_streak = 0
-                    try:
-                        sz = self.latest_frame_path.stat().st_size
-                    except OSError:
-                        sz = 0
                     if not logged_ok:
+                        try:
+                            sz = self.latest_frame_path.stat().st_size
+                        except OSError:
+                            sz = 0
                         self.logger.info("latest.jpg 已生成 size=%d" % sz)
                         logged_ok = True
                 else:
                     fail_streak += 1
                     if fail_streak <= 3 or fail_streak % 15 == 0:
                         self.logger.warning(
-                            "实时截图刷新失败 streak=%d（查 iface capture ring / program）"
-                            % fail_streak
+                            "实时截图刷新失败 streak=%d" % fail_streak
                         )
-
-                # 可中断睡眠
                 end = time.time() + interval
                 while self.running and time.time() < end:
                     time.sleep(min(0.5, max(0.05, end - time.time())))
 
         self._thumb_thread = threading.Thread(
-            target=_loop, name=f"thumb-{self.id}", daemon=True
+            target=_loop, name="thumb-%s" % self.id, daemon=True
         )
         self._thumb_thread.start()
         self.logger.info(
             "实时截图线程已启动 -> %s" % self.latest_frame_path
         )
-
-    # ---------- 事件与轮转 ----------
 
     def _rotate_events_if_needed(self, event_file: Path):
         """events.jsonl 超过阈值时轮转为 events.jsonl.1 .. .N"""
