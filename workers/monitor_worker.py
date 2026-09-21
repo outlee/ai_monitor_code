@@ -194,6 +194,8 @@ class StreamMonitor:
         self._thumb_thread: Optional[threading.Thread] = None
         self._thumb_proc: Optional[subprocess.Popen] = None
         self._thumb_feeder = None
+        # 部分旧 ffmpeg 不支持 -max_error_rate；失败一次后关掉
+        self._thumb_use_max_error_rate = True
         self._last_status_db_ts = 0.0
         self._status_db_interval = float(
             defaults.get("status_db_interval_sec", 30.0)
@@ -576,11 +578,13 @@ class StreamMonitor:
             "pipe:0",
         ]
         # 新版 ffmpeg 默认 max_error_rate≈0.67，组播丢包时会直接放弃出图
-        cmd.extend(["-max_error_rate", "1.0"])
         if self.program is not None:
-            cmd.extend(["-map", "0:p:%d:v:0" % int(self.program)])
+            map_opts = ["-map", "0:p:%d:v:0" % int(self.program)]
         else:
-            cmd.extend(["-map", "0:v:0"])
+            map_opts = ["-map", "0:v:0"]
+        if self._thumb_use_max_error_rate:
+            cmd.extend(["-max_error_rate", "1.0"])
+        cmd.extend(map_opts)
         cmd.extend(
             [
                 "-an",
@@ -598,7 +602,7 @@ class StreamMonitor:
 
         err_f = open(str(err_path), "w")
         self.logger.info(
-            "启动实时截图 FFmpeg(stdin feeder) -> %s program=%s"
+            "[thumb] start stdin_feeder -> %s program=%s"
             % (out, self.program)
         )
         proc = subprocess.Popen(
@@ -610,9 +614,10 @@ class StreamMonitor:
         )
         self._thumb_proc = proc
 
+
         logged_ok = False
-        # 先喂一点数据帮助 probe
-        warm_deadline = time.time() + 8.0
+        bytes_in = 0
+        last_progress = time.time()
         while (
             self.running
             and self._state in ("running", "starting")
@@ -622,6 +627,7 @@ class StreamMonitor:
             if batch:
                 try:
                     proc.stdin.write(batch)
+                    bytes_in += len(batch)
                 except (BrokenPipeError, OSError):
                     break
             if (
@@ -630,14 +636,20 @@ class StreamMonitor:
                 and self.latest_frame_path.stat().st_size > 1024
             ):
                 self.logger.info(
-                    "latest.jpg 已生成 size=%d"
-                    % self.latest_frame_path.stat().st_size
+                    "[thumb] latest_ok size=%d fed=%dKB"
+                    % (
+                        self.latest_frame_path.stat().st_size,
+                        int(bytes_in / 1024),
+                    )
                 )
                 logged_ok = True
-            # 温启阶段过后继续正常喂
-            if time.time() > warm_deadline and not logged_ok:
-                # 仍无图也继续跑，等关键帧
-                pass
+            now = time.time()
+            if not logged_ok and now - last_progress >= 15:
+                self.logger.info(
+                    "[thumb] waiting_frame fed=%dKB feeder_q=%dKB"
+                    % (int(bytes_in / 1024), int(feeder.size() / 1024))
+                )
+                last_progress = now
 
         # 进程已退出或状态变更
         rc = proc.poll()
@@ -645,7 +657,7 @@ class StreamMonitor:
         try:
             err_f.flush()
             with open(str(err_path), "r") as rf:
-                err_tail = (rf.read() or "")[-400:]
+                err_tail = (rf.read() or "")[-500:]
         except Exception:
             pass
         try:
@@ -654,9 +666,12 @@ class StreamMonitor:
             pass
         if rc is not None:
             self.logger.warning(
-                "实时截图 FFmpeg 退出 code=%s %s"
-                % (rc, err_tail.replace("\n", " ")[:240])
+                "[thumb] ffmpeg_exit code=%s fed=%dKB %s"
+                % (rc, int(bytes_in / 1024), err_tail.replace("\n", " ")[:240])
             )
+            if self._thumb_use_max_error_rate and "max_error_rate" in err_tail:
+                self._thumb_use_max_error_rate = False
+                self.logger.warning("[thumb] disable max_error_rate for retry")
         self._stop_thumb_proc()
 
     def _start_thumb_thread(self):
@@ -677,7 +692,7 @@ class StreamMonitor:
             logged_ok = False
             mode = "stdin_feeder" if self._capture_key else "ffmpeg_grab"
             self.logger.info(
-                "实时截图线程运行中 mode=%s interval=%.1fs -> %s"
+                "[thumb] thread_run mode=%s interval=%.1fs -> %s"
                 % (mode, interval, self.latest_frame_path)
             )
             while self.running:
@@ -690,7 +705,9 @@ class StreamMonitor:
                     try:
                         self._start_live_thumb_ffmpeg()
                     except Exception as e:
-                        self.logger.warning("实时截图 stdin 模式失败: %s" % e)
+                        self.logger.warning(
+                            "[thumb] stdin_mode_fail: %s" % e
+                        )
                         self._stop_thumb_proc()
                         fail_streak += 1
                         time.sleep(min(3.0 + fail_streak, 15.0))
@@ -731,9 +748,7 @@ class StreamMonitor:
             target=_loop, name="thumb-%s" % self.id, daemon=True
         )
         self._thumb_thread.start()
-        self.logger.info(
-            "实时截图线程已启动 -> %s" % self.latest_frame_path
-        )
+        self.logger.info("[thumb] thread_started -> %s" % self.latest_frame_path)
 
     def _rotate_events_if_needed(self, event_file: Path):
         """events.jsonl 超过阈值时轮转为 events.jsonl.1 .. .N"""
