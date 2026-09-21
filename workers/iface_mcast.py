@@ -256,6 +256,10 @@ def _capture_loop(hub):
         raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
         raw.bind((iface, 0))
         try:
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        except Exception:
+            pass
+        try:
             PACKET_MR_PROMISC = 1
             ifindex = socket.if_nametoindex(iface)
             mreq = struct.pack("IHH8s", ifindex, PACKET_MR_PROMISC, 0, b"\x00" * 8)
@@ -286,38 +290,25 @@ def _capture_loop(hub):
             if not payload:
                 n_skip += 1
                 continue
-            if ring is not None:
-                try:
-                    ring.write(payload)
-                except Exception:
-                    pass
             with hub["dest_lock"]:
                 dests = list(_all_local_ports(hub))
-                feeders = list(hub.get("feeders", {}).values())
             for lp in dests:
                 try:
                     out.sendto(payload, ("127.0.0.1", lp))
                 except Exception:
                     pass
-            for feeder in feeders:
-                try:
-                    feeder.put(payload)
-                except Exception:
-                    pass
             n += 1
             now = time.time()
             if logger and now - last >= 30:
-                rsz = ring.size() if ring is not None else 0
                 logger.info(
-                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d feeders=%d ring=%dKB"
+                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d"
                     % (
                         group,
                         mport,
                         n,
                         n / max(now - t0, 1e-6),
                         len(dests),
-                        len(feeders),
-                        int(rsz / 1024),
+                        n_skip,
                     )
                 )
                 last = now

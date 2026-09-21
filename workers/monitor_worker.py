@@ -351,11 +351,11 @@ class StreamMonitor:
 
     def _build_filter_complex(self) -> str:
         """
-        视频：可选 program 选轨 → 降采样 → 规则检测
+        视频：可选 program 选轨 → 降采样 → 规则检测；可选旁路写 latest.jpg
         音频：可选 silencedetect；关闭时音频直通，避免误报
 
-        latest.jpg 由截图线程从网卡 TS 环形缓冲抽取，不再走本进程 image2，
-        避免与检测抢图、也避免第二路 UDP 监听挂死不出图。
+        旁路按「帧序号」抽帧（select=mod(n)），不使用 fps 滤镜——组播 PTS 乱跳时
+        fps 会永远不吐帧。
         """
         vin = self._v_label()
         ain = self._a_label()
@@ -373,10 +373,34 @@ class StreamMonitor:
                 f"d={self.silence_duration}[aout]"
             )
         else:
-            # 直通，不做静音检测
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
+        use_side = self.frame_interval_sec > 0
+        # 按 25fps 估算抽帧间隔；与真实帧率略有偏差只影响刷新快慢
+        every = max(int(round(float(self.frame_interval_sec) * 25.0)), 8)
+        snap = (
+            "select='not(mod(n\\,%d))',"
+            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
+            % every
+        )
+
+        if use_side:
+            if dw and dw > 0:
+                v = (
+                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
+                    f"[vs]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            else:
+                v = (
+                    f"[{vin}]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            return f"{v};{audio}"
+
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -387,7 +411,7 @@ class StreamMonitor:
         return f"{v};{audio}"
 
     def _build_ffmpeg_cmd(self) -> List[str]:
-        """单进程：规则检测；MPTS 用 program 选节目。latest.jpg 由截图线程负责。"""
+        """单进程：规则检测 + 旁路 latest.jpg；MPTS 用 program 选节目。"""
         fc = self._build_filter_complex()
         ingest = self._input_url_with_timeout()
         is_udp = ingest.lower().startswith("udp:")
@@ -403,6 +427,8 @@ class StreamMonitor:
             "ignore_err",
             "-rw_timeout",
             "15000000",
+            "-max_error_rate",
+            "1.0",
         ]
         # UDP MPEG-TS：必须显式 -f mpegts（与手测成功命令一致），并加大探测
         if is_udp or self.program is not None:
@@ -416,12 +442,27 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
+        cmd.extend(["-i", ingest, "-filter_complex", fc])
+        if self.frame_interval_sec > 0:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            cmd.extend(
+                [
+                    "-map",
+                    "[vsnap]",
+                    "-vsync",
+                    "vfr",
+                    "-f",
+                    "image2",
+                    "-update",
+                    "1",
+                    "-q:v",
+                    "5",
+                    "-y",
+                    str(self.latest_frame_path),
+                ]
+            )
         cmd.extend(
             [
-                "-i",
-                ingest,
-                "-filter_complex",
-                fc,
                 "-map",
                 "[vout]",
                 "-map",
@@ -684,19 +725,51 @@ class StreamMonitor:
             interval = max(float(self.frame_interval_sec), 2.0)
             fail_streak = 0
             logged_ok = False
-            mode = "udp_live" if self._capture_key else "ffmpeg_grab"
+            # 优先等主监测 FFmpeg 旁路出图（同一解码器，不另起一路）
+            mode = "watch_main" if self._capture_key else "ffmpeg_grab"
             self.logger.info(
                 "[thumb] thread_run mode=%s interval=%.1fs -> %s"
                 % (mode, interval, self.latest_frame_path)
             )
+            wait_main_s = 45.0
+            waited = 0.0
             while self.running:
                 if self._state not in ("running", "starting"):
                     self._stop_thumb_proc()
                     time.sleep(1.0)
+                    waited = 0.0
+                    continue
+
+                if (
+                    self.latest_frame_path.is_file()
+                    and self.latest_frame_path.stat().st_size > 1024
+                ):
+                    if not logged_ok:
+                        self.logger.info(
+                            "[thumb] latest_ok size=%d via=main"
+                            % self.latest_frame_path.stat().st_size
+                        )
+                        logged_ok = True
+                    fail_streak = 0
+                    waited = 0.0
+                    time.sleep(interval)
+                    continue
+
+                if self._capture_key and waited < wait_main_s:
+                    if int(waited) % 15 == 0:
+                        self.logger.info(
+                            "[thumb] wait_main t=%.0fs (no extra decoder yet)"
+                            % waited
+                        )
+                    time.sleep(1.0)
+                    waited += 1.0
                     continue
 
                 if self._capture_key:
                     try:
+                        self.logger.info(
+                            "[thumb] fallback udp_live after wait_main"
+                        )
                         self._start_live_thumb_ffmpeg()
                     except Exception as e:
                         self.logger.warning(
@@ -706,10 +779,8 @@ class StreamMonitor:
                         fail_streak += 1
                         time.sleep(min(3.0 + fail_streak, 15.0))
                         continue
-                    # 正常返回表示 ffmpeg 已退出，短暂等待后重启
                     fail_streak += 1
-                    if self.latest_frame_path.is_file():
-                        fail_streak = 0
+                    waited = 0.0
                     time.sleep(2.0)
                     continue
 
