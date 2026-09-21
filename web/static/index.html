@@ -66,9 +66,13 @@
       <div class="card-label">24h 告警</div>
       <div class="card-value" id="stat-24h">-</div>
     </div>
-    <div class="card">
+    <div class="card clickable" id="card-storage" title="点击管理存储" data-goto="storage">
       <div class="card-label">存储</div>
       <div class="card-value small" id="stat-storage">-</div>
+    </div>
+    <div class="card" id="card-perf" title="服务器性能">
+      <div class="card-label">服务器</div>
+      <div class="card-value small" id="stat-perf">-</div>
     </div>
   </section>
 
@@ -262,10 +266,27 @@
   <section class="panel snapshots-panel" id="snapshots-anchor">
     <div class="panel-head">
       <h2>异常截图</h2>
-      <span class="hint">显示节目名称</span>
+      <span class="hint">显示节目名称 · 无伴音默认不截屏</span>
     </div>
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>
+    </div>
+  </section>
+
+  <section class="panel" id="storage-anchor">
+    <div class="panel-head">
+      <h2>日志与存储</h2>
+      <span class="hint">清理前请确认；运行中的监测会继续写新日志</span>
+    </div>
+    <div id="storage-detail" class="storage-detail">加载中…</div>
+    <div class="event-toolbar" style="margin-top:10px">
+      <label class="auto-refresh"><input type="checkbox" id="clr-events" /> 清空事件 jsonl</label>
+      <label class="auto-refresh"><input type="checkbox" id="clr-logs" /> 清空频道日志</label>
+      <label class="auto-refresh"><input type="checkbox" id="clr-iface" /> 删除抓包日志</label>
+      <label class="auto-refresh"><input type="checkbox" id="clr-snaps" /> 删除截图</label>
+      <label class="auto-refresh"><input type="checkbox" id="clr-sqlite" /> 清空告警库</label>
+      <button type="button" class="btn" id="btn-storage-refresh">刷新占用</button>
+      <button type="button" class="btn btn-primary" id="btn-storage-clear">执行清理</button>
     </div>
   </section>
   </div><!-- /view-manage -->

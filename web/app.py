@@ -567,6 +567,174 @@ def api_system_nics():
     return {"nics": _list_nics()}
 
 
+def _dir_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _read_meminfo() -> Dict[str, int]:
+    out = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    key = parts[0][:-1]
+                    out[key] = int(parts[1]) * 1024  # kB -> bytes
+    except OSError:
+        pass
+    return out
+
+
+def _cpu_percent(sample_sec: float = 0.15) -> Optional[float]:
+    def read():
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            parts = f.readline().split()
+        vals = [int(x) for x in parts[1:8]]
+        idle = vals[3] + vals[4]
+        total = sum(vals)
+        return idle, total
+
+    try:
+        i1, t1 = read()
+        time.sleep(sample_sec)
+        i2, t2 = read()
+        di, dt = i2 - i1, t2 - t1
+        if dt <= 0:
+            return None
+        return round(100.0 * (1.0 - di / dt), 1)
+    except Exception:
+        return None
+
+
+@app.get("/api/system/perf")
+def api_system_perf():
+    """当前服务器负载：CPU/内存/磁盘/负载。"""
+    mem = _read_meminfo()
+    mem_total = mem.get("MemTotal") or 0
+    mem_avail = mem.get("MemAvailable") or mem.get("MemFree") or 0
+    mem_used = max(mem_total - mem_avail, 0)
+    load1 = load5 = load15 = None
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except OSError:
+        pass
+    disk = {}
+    try:
+        st = os.statvfs(str(ROOT))
+        total = st.f_frsize * st.f_blocks
+        free = st.f_frsize * st.f_bavail
+        disk = {
+            "path": str(ROOT),
+            "total_bytes": total,
+            "free_bytes": free,
+            "used_bytes": total - free,
+            "used_percent": round(100.0 * (total - free) / total, 1) if total else None,
+        }
+    except OSError:
+        pass
+    return {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cpu_percent": _cpu_percent(),
+        "loadavg": {"1": load1, "5": load5, "15": load15},
+        "memory": {
+            "total_bytes": mem_total,
+            "available_bytes": mem_avail,
+            "used_bytes": mem_used,
+            "used_percent": round(100.0 * mem_used / mem_total, 1) if mem_total else None,
+        },
+        "disk": disk,
+    }
+
+
+@app.get("/api/storage/detail")
+def api_storage_detail():
+    """日志/截图/数据库占用。"""
+    detail = {
+        "logs_bytes": _dir_size(LOG_DIR),
+        "snapshots_bytes": _dir_size(SNAPSHOT_DIR),
+        "data_bytes": _dir_size(ROOT / "data"),
+        "events_bytes": EVENTS_FILE.stat().st_size if EVENTS_FILE.is_file() else 0,
+        "sqlite": None,
+    }
+    if event_db is not None:
+        try:
+            detail["sqlite"] = event_db.storage_info()
+        except Exception as e:
+            detail["sqlite"] = {"error": str(e)}
+    detail["total_bytes"] = (
+        detail["logs_bytes"] + detail["snapshots_bytes"] + detail["data_bytes"]
+    )
+    return detail
+
+
+class StorageClearBody(BaseModel):
+    events_jsonl: bool = False
+    channel_logs: bool = False
+    snapshots: bool = False
+    sqlite_alerts: bool = False
+    iface_capture_logs: bool = False
+
+
+@app.post("/api/storage/clear")
+def api_storage_clear(body: StorageClearBody):
+    """清理日志/截图/告警库（危险操作，仅内网使用）。"""
+    result: Dict[str, Any] = {"ok": True, "cleared": {}}
+    if body.events_jsonl and EVENTS_FILE.is_file():
+        try:
+            EVENTS_FILE.write_text("", encoding="utf-8")
+            result["cleared"]["events_jsonl"] = True
+        except OSError as e:
+            result["cleared"]["events_jsonl"] = str(e)
+    if body.channel_logs and LOG_DIR.is_dir():
+        n = 0
+        for p in LOG_DIR.glob("*.log"):
+            # 保留正在写的也可清空
+            try:
+                p.write_text("", encoding="utf-8")
+                n += 1
+            except OSError:
+                pass
+        result["cleared"]["channel_logs"] = n
+    if body.iface_capture_logs and LOG_DIR.is_dir():
+        n = 0
+        for p in LOG_DIR.glob("iface_capture_*.log"):
+            try:
+                p.unlink(missing_ok=True)
+                n += 1
+            except OSError:
+                pass
+        result["cleared"]["iface_capture_logs"] = n
+    if body.snapshots and SNAPSHOT_DIR.is_dir():
+        n = 0
+        for p in SNAPSHOT_DIR.rglob("*.jpg"):
+            try:
+                p.unlink(missing_ok=True)
+                n += 1
+            except OSError:
+                pass
+        result["cleared"]["snapshots"] = n
+    if body.sqlite_alerts and event_db is not None:
+        try:
+            result["cleared"]["sqlite_alerts"] = event_db.clear_alerts()
+        except Exception as e:
+            result["cleared"]["sqlite_alerts"] = str(e)
+    return result
+
+
 # ---------- 写配置 API（无鉴权）----------
 
 @app.post("/api/config/ai")

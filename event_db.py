@@ -284,3 +284,22 @@ def prune_old(days: int = 30) -> Dict[str, int]:
         finally:
             conn.close()
     return {"deleted_alerts": c1, "deleted_status_samples": c2}
+
+
+def clear_alerts() -> Dict[str, int]:
+    """清空全部告警历史。"""
+    path = get_db_path()
+    with _lock:
+        conn = _connect(path)
+        try:
+            n = conn.execute("SELECT COUNT(*) AS c FROM alerts").fetchone()["c"]
+            conn.execute("DELETE FROM alerts")
+            conn.execute("DELETE FROM status_samples")
+            conn.commit()
+            try:
+                conn.execute("VACUUM")
+            except Exception:
+                pass
+        finally:
+            conn.close()
+    return {"deleted_alerts": int(n)}

@@ -784,9 +784,61 @@
       let h = health.ok ? "服务正常" : "服务异常";
       if (health.sqlite && health.sqlite.db_path) h += " · SQLite";
       $("#health").textContent = h;
+      await refreshPerf();
+      await refreshStorageDetail();
     } catch (e) {
       console.error(e);
       $("#health").textContent = "接口请求失败";
+    }
+  }
+
+  function fmtBytes(n) {
+    if (n == null || Number.isNaN(n)) return "-";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let v = Number(n);
+    let i = 0;
+    while (v >= 1024 && i < u.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return v.toFixed(i === 0 ? 0 : 1) + u[i];
+  }
+
+  async function refreshPerf() {
+    const el = $("#stat-perf");
+    if (!el) return;
+    try {
+      const p = await fetchJSON("/api/system/perf");
+      const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
+      const mem = p.memory && p.memory.used_percent != null ? p.memory.used_percent + "%" : "-";
+      const disk = p.disk && p.disk.used_percent != null ? p.disk.used_percent + "%" : "-";
+      const load = p.loadavg && p.loadavg["1"] != null ? Number(p.loadavg["1"]).toFixed(2) : "-";
+      el.textContent = `CPU ${cpu} · 内存 ${mem} · 盘 ${disk}`;
+      el.title = `负载 ${load} / 内存 ${fmtBytes(p.memory && p.memory.used_bytes)}/${fmtBytes(
+        p.memory && p.memory.total_bytes
+      )} / 磁盘剩余 ${fmtBytes(p.disk && p.disk.free_bytes)}`;
+    } catch (e) {
+      el.textContent = "获取失败";
+    }
+  }
+
+  async function refreshStorageDetail() {
+    const box = $("#storage-detail");
+    if (!box) return;
+    try {
+      const d = await fetchJSON("/api/storage/detail");
+      const sql = d.sqlite || {};
+      box.innerHTML = `
+        日志目录 <b>${fmtBytes(d.logs_bytes)}</b> ·
+        事件文件 <b>${fmtBytes(d.events_bytes)}</b> ·
+        截图 <b>${fmtBytes(d.snapshots_bytes)}</b> ·
+        数据目录 <b>${fmtBytes(d.data_bytes)}</b> ·
+        合计约 <b>${fmtBytes(d.total_bytes)}</b><br/>
+        告警库 ${sql.alerts_count != null ? sql.alerts_count + " 条" : "-"} ·
+        库文件 <b>${fmtBytes(sql.db_size_bytes)}</b>
+      `;
+    } catch (e) {
+      box.textContent = "无法读取存储信息";
     }
   }
 
@@ -1027,9 +1079,43 @@
         setView("dash");
         const a = $("#events-anchor");
         if (a) a.scrollIntoView({ behavior: "smooth" });
+      } else if (go === "storage") {
+        setView("manage");
+        const a = $("#storage-anchor");
+        if (a) a.scrollIntoView({ behavior: "smooth" });
+        refreshStorageDetail();
       }
     });
   });
+
+  if ($("#btn-storage-refresh")) {
+    $("#btn-storage-refresh").addEventListener("click", refreshStorageDetail);
+  }
+  if ($("#btn-storage-clear")) {
+    $("#btn-storage-clear").addEventListener("click", async () => {
+      const body = {
+        events_jsonl: !!($("#clr-events") && $("#clr-events").checked),
+        channel_logs: !!($("#clr-logs") && $("#clr-logs").checked),
+        iface_capture_logs: !!($("#clr-iface") && $("#clr-iface").checked),
+        snapshots: !!($("#clr-snaps") && $("#clr-snaps").checked),
+        sqlite_alerts: !!($("#clr-sqlite") && $("#clr-sqlite").checked),
+      };
+      if (!Object.values(body).some(Boolean)) {
+        toast("请先勾选要清理的项", "err");
+        return;
+      }
+      if (!confirm("确认清理所选日志/截图/告警？此操作不可恢复。")) return;
+      try {
+        const res = await postJSON("/api/storage/clear", body);
+        toast("清理完成", "ok");
+        console.log(res);
+        await refreshStorageDetail();
+        await refresh();
+      } catch (e) {
+        toast("清理失败: " + e.message, "err");
+      }
+    });
+  }
 
   if ($("#ev-search")) {
     $("#ev-search").addEventListener("click", () => {

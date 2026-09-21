@@ -657,8 +657,11 @@ class StreamMonitor:
             cmd.extend(["-i", src])
             if self.program is not None:
                 cmd.extend(["-map", "0:p:%d:v" % self.program])
+            # 尽量取关键帧，减少半截/花屏截图
             cmd.extend(
                 [
+                    "-skip_frame",
+                    "nokey",
                     "-frames:v",
                     "1",
                     "-q:v",
@@ -679,18 +682,33 @@ class StreamMonitor:
 
     def _take_snapshot(self, event_type: str) -> Optional[Path]:
         """
-        优先复制旁路 latest.jpg；过期或不存在时再独立拉帧。
-        复制路径很快，不阻塞；独立拉帧放到后台线程，避免堵 stderr。
+        告警截图策略（降低花屏误截）：
+        - 无伴音/断流：默认不截（画面参考价值低，且易截到损坏帧）
+        - 黑场/静帧：优先用很新的旁路 latest；否则后台抽关键帧
         """
+        # 无伴音、断流不截屏
+        if event_type in ("silence", "stream_down") or str(event_type).endswith("_end"):
+            return None
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = self.snapshot_dir / f"{event_type}_{ts}.jpg"
 
-        if self.snapshot_prefer_latest and self._copy_latest_frame(out_path):
-            self.logger.info(f"截图已保存(旁路): {out_path}")
-            self._prune_snapshots()
-            return out_path
+        # 旁路帧必须足够新，否则宁可后台抽关键帧
+        age = self._latest_frame_age()
+        prefer = self.snapshot_prefer_latest and age is not None and age <= min(
+            2.0, self.latest_max_age_sec
+        )
+        if prefer and self._copy_latest_frame(out_path):
+            # 过小的 jpg 多半是坏图，丢掉改抽关键帧
+            try:
+                if out_path.stat().st_size >= 8 * 1024:
+                    self.logger.info(f"截图已保存(旁路): {out_path}")
+                    self._prune_snapshots()
+                    return out_path
+                out_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-        # 回退：后台独立 FFmpeg，避免阻塞检测循环
         def _bg():
             with self._snapshot_lock:
                 if self._snapshot_inflight:
@@ -698,7 +716,14 @@ class StreamMonitor:
                 self._snapshot_inflight = True
             try:
                 if self._grab_frame_ffmpeg(out_path, quality=3):
-                    self.logger.info(f"截图已保存(独立拉流): {out_path}")
+                    try:
+                        if out_path.stat().st_size < 8 * 1024:
+                            out_path.unlink(missing_ok=True)
+                            self.logger.warning("截图过小已丢弃（可能花屏）")
+                            return
+                    except OSError:
+                        pass
+                    self.logger.info(f"截图已保存(关键帧): {out_path}")
                     self._prune_snapshots()
                 else:
                     self.logger.warning(f"截图失败: {out_path}")
@@ -759,7 +784,7 @@ class StreamMonitor:
         pairs = (
             ("black", "black_start", "black_end", "黑场"),
             ("freeze", "freeze_start", "freeze_end", "静帧"),
-            ("silence", "silence_start", "silence_end", "静音"),
+            ("silence", "silence_start", "silence_end", "无伴音"),
         )
         handled = False
         for key, start_tok, end_tok, label in pairs:
@@ -778,7 +803,7 @@ class StreamMonitor:
                         "phase": "start",
                         "channel_id": self.id,
                         "channel_name": self.name,
-                        "message": f"检测到{label}开始: {line}",
+                        "message": f"检测到{label}",
                         "time": now,
                     },
                 )
@@ -789,7 +814,8 @@ class StreamMonitor:
                     "phase": "end",
                     "channel_id": self.id,
                     "channel_name": self.name,
-                    "message": f"{label}结束: {line}",
+                    "message": f"{label}已恢复"
+                    + (f"（持续 {dur:.1f} 秒）" if dur is not None else ""),
                     "time": now,
                 }
                 if dur is not None:
@@ -1052,8 +1078,7 @@ class StreamMonitor:
                 "channel_id": self.id,
                 "channel_name": self.name,
                 "message": (
-                    f"流中断或 FFmpeg 退出 (code={rc})，"
-                    f"{delay:.1f}s 后第 {self.reconnect_count} 次重连"
+                    f"节目流中断，{delay:.0f} 秒后第 {self.reconnect_count} 次重连"
                 ),
                 "returncode": rc,
                 "reconnect_count": self.reconnect_count,
