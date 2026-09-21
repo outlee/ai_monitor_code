@@ -3,9 +3,11 @@
 """
 In-process multicast capture hub (CentOS7 / Python 3.6).
 
-One AF_PACKET reader per (iface, group, port). Each consumer gets TWO
-localhost UDP ports: one for monitor FFmpeg, one for thumb/snapshot grab.
-Both receive a full fan-out copy so they never steal packets from each other.
+One AF_PACKET reader per (iface, group, port). Each consumer gets one
+localhost UDP port for the monitor FFmpeg.
+
+A per-hub MPEG-TS ring buffer keeps recent packets so latest.jpg can be
+extracted without a second UDP listener (which often hung / wrote nothing).
 """
 
 from __future__ import print_function
@@ -21,6 +23,46 @@ _hubs = {}
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
+
+# ~4–8 Mbps HD ≈ 0.5–1 MB/s; keep enough for probe + a keyframe
+_DEFAULT_RING_BYTES = 6 * 1024 * 1024
+
+
+class _TsRing(object):
+    """Thread-safe byte ring, trimmed on 188-byte TS boundaries when possible."""
+
+    def __init__(self, maxlen=_DEFAULT_RING_BYTES):
+        self.maxlen = int(maxlen)
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self.packets = 0
+        self.bytes_in = 0
+
+    def write(self, data):
+        if not data:
+            return
+        with self._lock:
+            self._buf.extend(data)
+            self.packets += 1
+            self.bytes_in += len(data)
+            if len(self._buf) > self.maxlen:
+                excess = len(self._buf) - self.maxlen
+                # Prefer cutting on TS sync (0x47 every 188 bytes)
+                cut = excess
+                aligned = (excess // 188) * 188
+                if aligned >= 188:
+                    cut = aligned
+                del self._buf[:cut]
+
+    def snapshot(self, min_bytes=0):
+        with self._lock:
+            if len(self._buf) < int(min_bytes):
+                return None
+            return bytes(self._buf)
+
+    def size(self):
+        with self._lock:
+            return len(self._buf)
 
 
 def parse_udp_group_port(url):
@@ -83,8 +125,13 @@ def _parse_payload(frame, group, udp_port):
 def _all_local_ports(hub):
     ports = []
     for item in hub["ports"].values():
-        ports.append(item["mon"])
-        ports.append(item["thumb"])
+        mon = item.get("mon")
+        if mon:
+            ports.append(mon)
+        thumb = item.get("thumb")
+        # legacy dual-port entries; skip if same as mon
+        if thumb and thumb != mon:
+            ports.append(thumb)
     return ports
 
 
@@ -93,6 +140,7 @@ def _capture_loop(hub):
     group = hub["group"]
     mport = hub["mport"]
     logger = hub.get("logger")
+    ring = hub.get("ring")
     raw = None
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -128,6 +176,11 @@ def _capture_loop(hub):
             payload = _parse_payload(frame, group, mport)
             if not payload:
                 continue
+            if ring is not None:
+                try:
+                    ring.write(payload)
+                except Exception:
+                    pass
             with hub["dest_lock"]:
                 dests = list(_all_local_ports(hub))
             for lp in dests:
@@ -138,9 +191,17 @@ def _capture_loop(hub):
             n += 1
             now = time.time()
             if logger and now - last >= 30:
+                rsz = ring.size() if ring is not None else 0
                 logger.info(
-                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d"
-                    % (group, mport, n, n / max(now - t0, 1e-6), len(dests))
+                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d ring=%dKB"
+                    % (
+                        group,
+                        mport,
+                        n,
+                        n / max(now - t0, 1e-6),
+                        len(dests),
+                        int(rsz / 1024),
+                    )
                 )
                 last = now
     except Exception as e:
@@ -163,6 +224,9 @@ def _capture_loop(hub):
 def acquire(work_dir, iface, group, port, consumer_id, logger=None):
     """
     Returns (monitor_url, thumb_url).
+
+    thumb_url equals monitor_url: screenshots should use snapshot_ts() ring
+    buffer, not a second UDP listener.
     """
     key = (iface, group, int(port))
     with _lock:
@@ -178,21 +242,24 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
                 "stop": False,
                 "thread": None,
                 "logger": logger,
+                "ring": _TsRing(_DEFAULT_RING_BYTES),
             }
             _hubs[key] = hub
+        elif hub.get("ring") is None:
+            hub["ring"] = _TsRing(_DEFAULT_RING_BYTES)
 
-        # FFmpeg 收流要用监听地址 udp://@:port（不要写 127.0.0.1，否则可能收不到）
         def _listen_url(p):
+            # FFmpeg 收流要用监听地址 udp://@:port（不要写 127.0.0.1）
             return "udp://@:%d" % int(p)
 
         if consumer_id in hub["ports"]:
             item = hub["ports"][consumer_id]
-            return (_listen_url(item["mon"]), _listen_url(item["thumb"]))
+            mon = item["mon"]
+            return (_listen_url(mon), _listen_url(mon))
 
         mon = _free_udp_port()
-        thumb = _free_udp_port()
         with hub["dest_lock"]:
-            hub["ports"][consumer_id] = {"mon": mon, "thumb": thumb}
+            hub["ports"][consumer_id] = {"mon": mon}
 
         if hub["thread"] is None or not hub["thread"].is_alive():
             hub["stop"] = False
@@ -209,10 +276,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture %s mon=@:%d thumb=@:%d consumers=%d"
-                % (consumer_id, mon, thumb, len(hub["ports"]))
+                "iface capture %s mon=@:%d ring=on consumers=%d"
+                % (consumer_id, mon, len(hub["ports"]))
             )
-        return (_listen_url(mon), _listen_url(thumb))
+        return (_listen_url(mon), _listen_url(mon))
 
 
 def release(iface, group, port, consumer_id, logger=None):
@@ -238,6 +305,31 @@ def release(iface, group, port, consumer_id, logger=None):
                 "iface capture release %s remaining=%d"
                 % (consumer_id, len(hub["ports"]))
             )
+
+
+def snapshot_ts(iface, group, port, min_bytes=300 * 1024):
+    """
+    Return a copy of the hub TS ring for (iface, group, port), or None.
+    Used to feed ffmpeg stdin for latest.jpg without a second UDP bind.
+    """
+    key = (iface, group, int(port))
+    with _lock:
+        hub = _hubs.get(key)
+        if not hub:
+            return None
+        ring = hub.get("ring")
+        if ring is None:
+            return None
+    return ring.snapshot(min_bytes=min_bytes)
+
+
+def ring_size(iface, group, port):
+    key = (iface, group, int(port))
+    with _lock:
+        hub = _hubs.get(key)
+        if not hub or hub.get("ring") is None:
+            return 0
+        return hub["ring"].size()
 
 
 def resolve_ffmpeg_url(work_dir, url, iface, consumer_id, logger=None):
