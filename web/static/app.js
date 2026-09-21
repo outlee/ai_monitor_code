@@ -51,7 +51,8 @@
   }
 
   function formatAlarmTags(list, lastType) {
-    const raw = (list && list.length ? list : lastType ? [lastType] : []).filter(Boolean);
+    // 只显示当前仍活动的告警；不要用历史上最后一次「断流」冒充当前状态
+    const raw = (list && list.length ? list : []).filter(Boolean);
     if (!raw.length) return "正常";
     return raw.map(typeLabel).join("、");
   }

@@ -341,21 +341,20 @@ class StreamMonitor:
         lower = url.lower()
         if not (lower.startswith("udp:") or lower.startswith("rtp:")):
             return url
-        # 本机中继可稍短超时；组播直拉用配置值
         timeout_sec = float(self.defaults.get("input_timeout_sec", 15.0))
-        if "127.0.0.1" in url:
-            timeout_sec = max(timeout_sec, 20.0)
+        # 本机 fan-out（127.0.0.1 或 udp://@:port）探测需要更长时间
+        if "127.0.0.1" in url or "@:" in url:
+            timeout_sec = max(timeout_sec, 30.0)
         timeout_us = int(timeout_sec * 1_000_000)
         sep = "&" if "?" in url else "?"
         return "%s%stimeout=%d" % (url, sep, timeout_us)
 
     def _build_filter_complex(self) -> str:
         """
-        视频：可选 program 选轨 → 降采样 → 规则检测；可选旁路写 latest.jpg
+        视频：可选 program 选轨 → 降采样 → 规则检测
         音频：可选 silencedetect；关闭时音频直通，避免误报
 
-        旁路按「帧序号」抽帧（select=mod(n)），不使用 fps 滤镜——组播 PTS 乱跳时
-        fps 会永远不吐帧。
+        先保证能稳定监测。latest.jpg 旁路曾导致 FFmpeg 立刻退出、全台断流。
         """
         vin = self._v_label()
         ain = self._a_label()
@@ -376,31 +375,6 @@ class StreamMonitor:
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
-        use_side = self.frame_interval_sec > 0
-        # 按 25fps 估算抽帧间隔；与真实帧率略有偏差只影响刷新快慢
-        every = max(int(round(float(self.frame_interval_sec) * 25.0)), 8)
-        snap = (
-            "fifo,select='not(mod(n\\,%d))',"
-            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
-            % every
-        )
-
-        if use_side:
-            if dw and dw > 0:
-                v = (
-                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
-                    f"[vs]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            else:
-                v = (
-                    f"[{vin}]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            return f"{v};{audio}"
-
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -411,7 +385,7 @@ class StreamMonitor:
         return f"{v};{audio}"
 
     def _build_ffmpeg_cmd(self) -> List[str]:
-        """单进程：规则检测 + 旁路 latest.jpg；MPTS 用 program 选节目。"""
+        """单进程规则检测；MPTS 用 program 选节目。"""
         fc = self._build_filter_complex()
         ingest = self._input_url_with_timeout()
         is_udp = ingest.lower().startswith("udp:")
@@ -427,40 +401,24 @@ class StreamMonitor:
             "ignore_err",
             "-rw_timeout",
             "15000000",
-            "-max_error_rate",
-            "1.0",
         ]
-        # UDP MPEG-TS：必须显式 -f mpegts（与手测成功命令一致），并加大探测
         if is_udp or self.program is not None:
             cmd.extend(
                 [
                     "-probesize",
-                    "32M",
+                    "8M",
                     "-analyzeduration",
-                    "10M",
+                    "5M",
                 ]
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
-        cmd.extend(["-i", ingest, "-filter_complex", fc])
-        if self.frame_interval_sec > 0:
-            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            cmd.extend(
-                [
-                    "-map",
-                    "[vsnap]",
-                    "-f",
-                    "image2",
-                    "-update",
-                    "1",
-                    "-q:v",
-                    "5",
-                    "-y",
-                    str(self.latest_frame_path),
-                ]
-            )
         cmd.extend(
             [
+                "-i",
+                ingest,
+                "-filter_complex",
+                fc,
                 "-map",
                 "[vout]",
                 "-map",
@@ -1452,6 +1410,7 @@ class StreamMonitor:
 
         rc = self.process.returncode if self.process else -1
         self.process = None
+        self.logger.info("FFmpeg 退出 code=%s state=%s" % (rc, self._state))
         return rc if rc is not None else -1
 
     def run(self):
