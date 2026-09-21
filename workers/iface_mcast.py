@@ -219,11 +219,17 @@ def _parse_payload(frame, group, udp_port):
     payload = udp[8:ulen]
     if not payload:
         return None
-    # Prefer TS-looking payloads (typical IPTV = N*188 starting at 0x47)
-    if payload[0] != 0x47 and len(payload) >= 188:
-        # Still accept — some packers don't align; ring align helps later
-        pass
-    return payload
+    # IPTV UDP 载荷通常是 N*188 且从 0x47 开始；若略有偏移，在报文内对齐
+    if payload[0] != 0x47 and len(payload) >= 188 * 2:
+        aligned = align_ts_sync(payload)
+        if aligned and aligned[0] == 0x47:
+            payload = aligned
+    # 截断到完整 TS 包，避免尾部半包污染下一 UDP（对 stdin 拼接尤其致命）
+    if len(payload) >= 188:
+        n = (len(payload) // 188) * 188
+        if n > 0:
+            payload = payload[:n]
+    return payload if payload else None
 
 
 def _all_local_ports(hub):
@@ -335,7 +341,9 @@ def _capture_loop(hub):
 def acquire(work_dir, iface, group, port, consumer_id, logger=None):
     """
     Returns (monitor_url, thumb_url).
-    thumb_url equals monitor_url; use register_feeder() for screenshots.
+
+    监测与截图使用不同的本机 UDP 口：UDP 按「数据报」边界递交，能保持
+    每包内的 188 字节 TS 对齐；若拼成 stdin 字节流，一次错位会整路 PES 错乱。
     """
     key = (iface, group, int(port))
     with _lock:
@@ -367,11 +375,18 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
         if consumer_id in hub["ports"]:
             item = hub["ports"][consumer_id]
             mon = item["mon"]
-            return (_listen_url(mon), _listen_url(mon))
+            thumb = item.get("thumb") or mon
+            # 旧条目只有 mon：补开 thumb 口
+            if thumb == mon or "thumb" not in item:
+                thumb = _free_udp_port()
+                with hub["dest_lock"]:
+                    item["thumb"] = thumb
+            return (_listen_url(mon), _listen_url(thumb))
 
         mon = _free_udp_port()
+        thumb = _free_udp_port()
         with hub["dest_lock"]:
-            hub["ports"][consumer_id] = {"mon": mon}
+            hub["ports"][consumer_id] = {"mon": mon, "thumb": thumb}
 
         if hub["thread"] is None or not hub["thread"].is_alive():
             hub["stop"] = False
@@ -388,10 +403,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture %s mon=@:%d feeders=%d consumers=%d"
-                % (consumer_id, mon, len(hub.get("feeders", {})), len(hub["ports"]))
+                "iface capture %s mon=@:%d thumb=@:%d consumers=%d"
+                % (consumer_id, mon, thumb, len(hub["ports"]))
             )
-        return (_listen_url(mon), _listen_url(mon))
+        return (_listen_url(mon), _listen_url(thumb))
 
 
 def release(iface, group, port, consumer_id, logger=None):

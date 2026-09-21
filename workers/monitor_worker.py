@@ -500,7 +500,13 @@ class StreamMonitor:
             self._write_status()
 
     def _stop_thumb_proc(self):
-        # 先注销 feeder，避免 capture 线程继续往已关闭的队列写
+        feeder = getattr(self, "_thumb_feeder", None)
+        if feeder is not None:
+            try:
+                feeder.close()
+            except Exception:
+                pass
+            self._thumb_feeder = None
         if self._capture_key:
             try:
                 from iface_mcast import unregister_feeder
@@ -515,13 +521,6 @@ class StreamMonitor:
                     unregister_feeder(iface, group, port, cid)
                 except Exception:
                     pass
-        feeder = getattr(self, "_thumb_feeder", None)
-        if feeder is not None:
-            try:
-                feeder.close()
-            except Exception:
-                pass
-            self._thumb_feeder = None
         if self._thumb_proc is not None and self._thumb_proc.poll() is None:
             try:
                 if self._thumb_proc.stdin:
@@ -538,30 +537,31 @@ class StreamMonitor:
                     pass
         self._thumb_proc = None
 
+    def _thumb_udp_url(self) -> str:
+        """截图专用本机 UDP（与监测分端口，保留数据报边界）。"""
+        self._ensure_ingest_url()
+        src = self._thumb_url or self._ingest_url or self.url
+        # 不要加短 timeout，否则长驻截图会被误杀；fifo 防抖
+        if src.lower().startswith("udp:"):
+            if "fifo_size=" not in src:
+                sep = "&" if "?" in src else "?"
+                src = "%s%sfifo_size=5000000&overrun_nonfatal=1" % (src, sep)
+        return src
+
     def _start_live_thumb_ffmpeg(self):
         """
-        常驻 FFmpeg：从抓包 TsFeeder 持续读 stdin，保持 H.264 SPS/PPS，
-        按间隔覆盖写 latest.jpg。解决「截一段 TS 快照解不出帧」的问题。
-        """
-        try:
-            from iface_mcast import TsFeeder, register_feeder
-        except ImportError:
-            from workers.iface_mcast import TsFeeder, register_feeder
+        常驻 FFmpeg 读截图专用 UDP 口，覆盖写 latest.jpg。
 
-        iface, group, port, cid = self._capture_key
+        注意：不能把多包 TS 拼进 stdin——UDP 每包自带 188 对齐，拼流后一旦
+        错位会整路 PES mismatch，表现为喂了上百 MB 仍无图最后 ffmpeg_exit。
+        """
         interval = max(float(self.frame_interval_sec), 2.0)
+        out_fps = max(1.0 / interval, 0.2)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         out = str(self.latest_frame_path)
         err_path = self.snapshot_dir / "thumb_ffmpeg.err"
+        src = self._thumb_udp_url()
 
-        feeder = TsFeeder()
-        register_feeder(iface, group, port, cid, feeder=feeder, logger=self.logger)
-        self._thumb_feeder = feeder
-
-        # 组播 TS 的 PTS/DTS 常乱跳；fps 滤镜按「流时间」凑间隔，会一直不出帧
-        # （表现为 fed 几十 MB、err 空、latest.jpg 却不存在）。
-        # 改用墙钟时间戳 + 输出 -r 限帧，解码一有帧就能写图。
-        out_fps = max(1.0 / interval, 0.2)
         cmd = [
             "ffmpeg",
             "-y",
@@ -578,11 +578,10 @@ class StreamMonitor:
             "8M",
             "-analyzeduration",
             "5M",
-            "-f",
-            "mpegts",
-            "-i",
-            "pipe:0",
         ]
+        if src.lower().startswith("udp:"):
+            cmd.extend(["-f", "mpegts"])
+        cmd.extend(["-i", src])
         if self._thumb_use_max_error_rate:
             cmd.extend(["-max_error_rate", "1.0"])
         if self.program is not None:
@@ -608,45 +607,34 @@ class StreamMonitor:
 
         err_f = open(str(err_path), "w")
         self.logger.info(
-            "[thumb] start stdin_feeder -> %s program=%s"
-            % (out, self.program)
+            "[thumb] start udp_live -> %s src=%s program=%s"
+            % (out, src, self.program)
         )
+        # stderr 必须落到文件，PIPE 不读会堵死 FFmpeg
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=err_f,
-            bufsize=0,
         )
         self._thumb_proc = proc
 
-
         logged_ok = False
-        bytes_in = 0
         last_progress = time.time()
         while (
             self.running
             and self._state in ("running", "starting")
             and proc.poll() is None
         ):
-            batch = feeder.get_batch(max_bytes=512 * 1024, timeout=0.5)
-            if batch:
-                try:
-                    proc.stdin.write(batch)
-                    bytes_in += len(batch)
-                except (BrokenPipeError, OSError):
-                    break
+            time.sleep(1.0)
             if (
                 not logged_ok
                 and self.latest_frame_path.is_file()
                 and self.latest_frame_path.stat().st_size > 1024
             ):
                 self.logger.info(
-                    "[thumb] latest_ok size=%d fed=%dKB"
-                    % (
-                        self.latest_frame_path.stat().st_size,
-                        int(bytes_in / 1024),
-                    )
+                    "[thumb] latest_ok size=%d"
+                    % self.latest_frame_path.stat().st_size
                 )
                 logged_ok = True
             now = time.time()
@@ -655,13 +643,9 @@ class StreamMonitor:
                     err_f.flush()
                 except Exception:
                     pass
-                self.logger.info(
-                    "[thumb] waiting_frame fed=%dKB feeder_q=%dKB"
-                    % (int(bytes_in / 1024), int(feeder.size() / 1024))
-                )
+                self.logger.info("[thumb] waiting_frame src=%s" % src)
                 last_progress = now
 
-        # 进程已退出或状态变更
         rc = proc.poll()
         err_tail = ""
         try:
@@ -676,8 +660,8 @@ class StreamMonitor:
             pass
         if rc is not None:
             self.logger.warning(
-                "[thumb] ffmpeg_exit code=%s fed=%dKB %s"
-                % (rc, int(bytes_in / 1024), err_tail.replace("\n", " ")[:240])
+                "[thumb] ffmpeg_exit code=%s %s"
+                % (rc, err_tail.replace("\n", " ")[:240])
             )
             if self._thumb_use_max_error_rate and "max_error_rate" in err_tail:
                 self._thumb_use_max_error_rate = False
@@ -700,7 +684,7 @@ class StreamMonitor:
             interval = max(float(self.frame_interval_sec), 2.0)
             fail_streak = 0
             logged_ok = False
-            mode = "stdin_feeder" if self._capture_key else "ffmpeg_grab"
+            mode = "udp_live" if self._capture_key else "ffmpeg_grab"
             self.logger.info(
                 "[thumb] thread_run mode=%s interval=%.1fs -> %s"
                 % (mode, interval, self.latest_frame_path)
@@ -716,7 +700,7 @@ class StreamMonitor:
                         self._start_live_thumb_ffmpeg()
                     except Exception as e:
                         self.logger.warning(
-                            "[thumb] stdin_mode_fail: %s" % e
+                            "[thumb] udp_live_fail: %s" % e
                         )
                         self._stop_thumb_proc()
                         fail_streak += 1
