@@ -511,22 +511,29 @@ class StreamMonitor:
     def _refresh_latest_from_ring(self) -> bool:
         """
         从网卡抓包 TS 环形缓冲抽 1 帧写入 latest.jpg。
-        不依赖第二路 UDP 监听，避免「进程在跑但永远无图」。
+        MPTS 下 ring 需足够大才能覆盖单 program 的关键帧；先对齐 0x47，
+        再落盘后有限次重试（pipe 直接喂易「Nothing was written」）。
         """
         if not self._capture_key:
             return False
         try:
-            from iface_mcast import snapshot_ts, ring_size
+            from iface_mcast import snapshot_ts, ring_size, align_ts_sync
         except ImportError:
             try:
-                from workers.iface_mcast import snapshot_ts, ring_size
+                from workers.iface_mcast import (
+                    snapshot_ts,
+                    ring_size,
+                    align_ts_sync,
+                )
             except ImportError:
                 return False
         try:
             iface, group, port, _cid = self._capture_key
         except Exception:
             return False
-        data = snapshot_ts(iface, group, port, min_bytes=200 * 1024)
+
+        # MPTS 多节目时单路码率占比小，至少要有数 MB 才容易碰到关键帧
+        data = snapshot_ts(iface, group, port, min_bytes=1024 * 1024)
         if not data:
             try:
                 rsz = ring_size(iface, group, port)
@@ -537,84 +544,140 @@ class StreamMonitor:
             )
             return False
 
+        data = align_ts_sync(data)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.snapshot_dir / (".latest_%s.tmp.jpg" % self.id)
+        ts_path = self.snapshot_dir / (".ring_%s.ts" % self.id)
+        jpg_tmp = self.snapshot_dir / (".latest_%s.tmp.jpg" % self.id)
         out = self.latest_frame_path
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "+genpts+discardcorrupt",
-            "-err_detect",
-            "ignore_err",
-            "-probesize",
-            "4M",
-            "-analyzeduration",
-            "2M",
-            "-f",
-            "mpegts",
-            "-i",
-            "pipe:0",
-        ]
-        if self.program is not None:
-            cmd.extend(["-map", "0:p:%d:v:0" % int(self.program)])
-        else:
-            cmd.extend(["-map", "0:v:0"])
-        cmd.extend(
-            [
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale=640:-2",
-                "-q:v",
-                "5",
-                str(tmp),
-            ]
-        )
+        last_err = ""
+
         try:
-            r = subprocess.run(
-                cmd,
-                input=data,
-                timeout=20,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
+            with open(str(ts_path), "wb") as f:
+                f.write(data)
+                f.flush()
+        except OSError as e:
+            self.logger.warning("写 TS ring 临时文件失败: %s" % e)
+            return False
+
+        # 少量高胜率组合，避免失败时拖成几十次 ffmpeg
+        attempts = []
+        if self.program is not None:
+            pid = int(self.program)
+            attempts.append((["-map", "0:p:%d:v:0" % pid], "1.0", False))
+            attempts.append((["-map", "0:p:%d:v:0" % pid], "2.0", True))
+            attempts.append((["-map", "0:p:%d:v" % pid], None, False))
+        attempts.append((["-map", "0:v:0"], "1.0", False))
+        attempts.append(([], "1.0", False))
+
+        def _try_once(maps, ss, iframe_only):
+            nonlocal last_err
+            try:
+                if jpg_tmp.is_file():
+                    jpg_tmp.unlink()
+            except OSError:
+                pass
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "+genpts+discardcorrupt+igndts",
+                "-err_detect",
+                "ignore_err",
+                "-probesize",
+                "16M",
+                "-analyzeduration",
+                "10M",
+            ]
+            if ss:
+                cmd.extend(["-ss", str(ss)])
+            cmd.extend(["-f", "mpegts", "-i", str(ts_path)])
+            cmd.extend(list(maps))
+            if iframe_only:
+                cmd.extend(
+                    [
+                        "-an",
+                        "-vf",
+                        r"select=eq(pict_type\,I),scale=640:-2",
+                        "-vsync",
+                        "vfr",
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "5",
+                        str(jpg_tmp),
+                    ]
+                )
+            else:
+                cmd.extend(
+                    [
+                        "-an",
+                        "-vf",
+                        "scale=640:-2",
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "5",
+                        str(jpg_tmp),
+                    ]
+                )
+            try:
+                r = subprocess.run(
+                    cmd,
+                    timeout=20,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.TimeoutExpired:
+                last_err = "timeout"
+                return False
             err = (r.stderr or b"").decode("utf-8", "replace").strip()
-            ok = tmp.is_file() and tmp.stat().st_size > 1024
-            if not ok:
-                if err:
-                    self.logger.warning(
-                        "环缓冲抽帧失败 ring=%dKB: %s"
-                        % (int(len(data) / 1024), err.splitlines()[-1][:200])
-                    )
+            if err:
+                last_err = err.splitlines()[-1][:220]
+            return jpg_tmp.is_file() and jpg_tmp.stat().st_size > 1024
+
+        ok = False
+        try:
+            for maps, ss, iframe_only in attempts:
+                if _try_once(maps, ss, iframe_only):
+                    ok = True
+                    break
+
+            if ok:
+                os.replace(str(jpg_tmp), str(out))
+                return True
+
+            prog = (
+                (" program=%s" % self.program)
+                if self.program is not None
+                else ""
+            )
+            self.logger.warning(
+                "环缓冲抽帧失败 ring=%dKB%s: %s"
+                % (int(len(data) / 1024), prog, last_err or "no frame")
+            )
+            # 失败时偶尔留下 debug_ring.ts 便于现场手测
+            try:
+                dbg = self.snapshot_dir / "debug_ring.ts"
+                if (not dbg.is_file()) or (
+                    time.time() - dbg.stat().st_mtime > 120
+                ):
+                    os.replace(str(ts_path), str(dbg))
+                    ts_path = None
+            except OSError:
+                pass
+            return False
+        finally:
+            for p in (ts_path, jpg_tmp):
+                if p is None:
+                    continue
                 try:
-                    if tmp.is_file():
-                        tmp.unlink()
+                    if p.is_file():
+                        p.unlink()
                 except OSError:
                     pass
-                return False
-            # 原子替换，避免 Web 读到半截 JPEG
-            os.replace(str(tmp), str(out))
-            return True
-        except subprocess.TimeoutExpired:
-            self.logger.warning("环缓冲抽帧超时")
-            try:
-                if tmp.is_file():
-                    tmp.unlink()
-            except OSError:
-                pass
-            return False
-        except Exception as e:
-            self.logger.warning("环缓冲抽帧异常: %s" % e)
-            try:
-                if tmp.is_file():
-                    tmp.unlink()
-            except OSError:
-                pass
-            return False
 
     def _start_thumb_thread(self):
         """

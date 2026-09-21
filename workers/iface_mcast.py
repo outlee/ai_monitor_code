@@ -24,8 +24,32 @@ _hubs = {}
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 
-# ~4–8 Mbps HD ≈ 0.5–1 MB/s; keep enough for probe + a keyframe
-_DEFAULT_RING_BYTES = 6 * 1024 * 1024
+# MPTS 多路高清复用可达数十 Mbps；过小的 ring 往往凑不齐单 program 的关键帧，
+# 导致 ffmpeg 报 “Nothing was written… received no packets”。
+_DEFAULT_RING_BYTES = 32 * 1024 * 1024
+
+
+def align_ts_sync(data):
+    """
+    Find first MPEG-TS sync (0x47 repeating every 188 bytes).
+    Returns aligned bytes, or original data if not found.
+    """
+    if not data:
+        return data
+    n = len(data)
+    limit = min(n - 188 * 2, 188 * 40)
+    if limit < 0:
+        return data
+    for i in range(0, limit + 1):
+        if (
+            data[i] == 0x47
+            and data[i + 188] == 0x47
+            and data[i + 376] == 0x47
+        ):
+            if i == 0:
+                return data
+            return data[i:]
+    return data
 
 
 class _TsRing(object):
