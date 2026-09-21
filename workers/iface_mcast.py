@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Per-process multicast capture hub (CentOS7 / Python 3.6).
+In-process multicast capture hub (CentOS7 / Python 3.6).
 
-One AF_PACKET capture per (iface, group, port). Each consumer (FFmpeg /
-program channel) gets its OWN 127.0.0.1 local port; the relay fan-outs
-every packet to all local ports. This avoids Linux unicast UDP "only one
-socket receives" when two programs share one MPTS.
+One AF_PACKET reader thread per (iface, group, port). Consumers each get
+a dedicated 127.0.0.1 port; packets are fan-out copied under a lock.
+Adding/removing a consumer does NOT restart capture (avoids freeze/silence
+false alarms from brief stream gaps).
 """
 
 from __future__ import print_function
@@ -14,14 +14,16 @@ from __future__ import print_function
 import os
 import re
 import socket
-import subprocess
-import sys
+import struct
 import threading
 import time
 
 _lock = threading.Lock()
-# key -> {proc, ports: {consumer_id: local_port}, logf, work_dir}
+# key -> hub dict
 _hubs = {}
+
+ETH_P_ALL = 0x0003
+ETH_P_IP = 0x0800
 
 
 def parse_udp_group_port(url):
@@ -46,125 +48,153 @@ def _free_udp_port():
     return port
 
 
-def _relay_script_path(work_dir):
-    candidates = [
-        os.path.join(work_dir, "scripts", "mcast_iface_relay.py"),
-        os.path.join(os.path.dirname(__file__), "..", "scripts", "mcast_iface_relay.py"),
-    ]
-    for p in candidates:
-        p = os.path.abspath(p)
-        if os.path.isfile(p):
-            return p
-    return None
+def _parse_payload(frame, group, udp_port):
+    if len(frame) < 14:
+        return None
+    ethertype = struct.unpack("!H", frame[12:14])[0]
+    off = 14
+    if ethertype == 0x8100:
+        if len(frame) < 18:
+            return None
+        ethertype = struct.unpack("!H", frame[16:18])[0]
+        off = 18
+    if ethertype != ETH_P_IP:
+        return None
+    ip = frame[off:]
+    if len(ip) < 20:
+        return None
+    vihl = ip[0]
+    version, ihl = vihl >> 4, (vihl & 0x0F) * 4
+    if version != 4 or len(ip) < ihl + 8:
+        return None
+    if ip[9] != 17:
+        return None
+    dst = socket.inet_ntoa(ip[16:20])
+    if dst != group:
+        return None
+    udp = ip[ihl:]
+    if len(udp) < 8:
+        return None
+    dport = struct.unpack("!H", udp[2:4])[0]
+    if dport != udp_port:
+        return None
+    ulen = struct.unpack("!H", udp[4:6])[0]
+    payload = udp[8:ulen] if ulen >= 8 else udp[8:]
+    return payload if payload else None
 
 
-def _stop_proc(ent):
-    proc = ent.get("proc")
-    if proc is not None and proc.poll() is None:
+def _capture_loop(hub):
+    iface = hub["iface"]
+    group = hub["group"]
+    mport = hub["mport"]
+    logger = hub.get("logger")
+    raw = None
+    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        raw.bind((iface, 0))
         try:
-            proc.terminate()
-            proc.wait(5)
-        except Exception:
+            PACKET_ADD_MEMBERSHIP = 1
+            PACKET_MR_PROMISC = 1
+            ifindex = socket.if_nametoindex(iface)
+            mreq = struct.pack("IHH8s", ifindex, PACKET_MR_PROMISC, 0, b"\x00" * 8)
+            raw.setsockopt(socket.SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
+        except Exception as e:
+            if logger:
+                logger.warning("promisc skip: %s" % e)
+        if logger:
+            logger.info("iface capture thread running on %s for %s:%s" % (iface, group, mport))
+        n = 0
+        t0 = time.time()
+        last = t0
+        while not hub["stop"]:
             try:
-                proc.kill()
+                raw.settimeout(1.0)
+                frame = raw.recv(65535)
+            except socket.timeout:
+                continue
             except Exception:
-                pass
-    logf = ent.get("logf")
-    if logf and logf is not subprocess.DEVNULL:
+                if hub["stop"]:
+                    break
+                time.sleep(0.05)
+                continue
+            payload = _parse_payload(frame, group, mport)
+            if not payload:
+                continue
+            with hub["dest_lock"]:
+                dests = list(hub["ports"].values())
+            for lp in dests:
+                try:
+                    out.sendto(payload, ("127.0.0.1", lp))
+                except Exception:
+                    pass
+            n += 1
+            now = time.time()
+            if logger and now - last >= 30:
+                logger.info(
+                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d"
+                    % (group, mport, n, n / max(now - t0, 1e-6), len(dests))
+                )
+                last = now
+    except Exception as e:
+        if logger:
+            logger.error("iface capture thread error: %s" % e)
+    finally:
         try:
-            logf.close()
+            out.close()
         except Exception:
             pass
-    ent["proc"] = None
-    ent["logf"] = None
-
-
-def _start_proc(ent, iface, group, mport, logger=None):
-    script = _relay_script_path(ent["work_dir"])
-    if not script:
-        raise RuntimeError("mcast_iface_relay.py not found under scripts/")
-    ports = sorted(set(ent["ports"].values()))
-    if not ports:
-        return
-    cmd = [
-        sys.executable,
-        script,
-        "--iface",
-        iface,
-        "--group",
-        group,
-        "--port",
-        str(int(mport)),
-        "--local-ports",
-        ",".join(str(p) for p in ports),
-        "--stats-every",
-        "30",
-    ]
-    log_dir = os.path.join(ent["work_dir"], "logs")
-    if not os.path.isdir(log_dir):
-        os.makedirs(log_dir)
-    log_path = os.path.join(
-        log_dir,
-        "iface_capture_%s_%s_%s.log" % (iface, group.replace(".", "_"), mport),
-    )
-    logf = open(log_path, "a", buffering=1)
-    logf.write(
-        "\n===== start %s ports=%s =====\n"
-        % (time.strftime("%Y-%m-%d %H:%M:%S"), ports)
-    )
-    proc = subprocess.Popen(
-        cmd,
-        cwd=ent["work_dir"],
-        stdout=logf,
-        stderr=subprocess.STDOUT,
-    )
-    ent["proc"] = proc
-    ent["logf"] = logf
-    ent["cmd"] = cmd
-    if logger:
-        logger.info(
-            "iface capture pid=%s %s %s:%s fan-out %s"
-            % (proc.pid, iface, group, mport, ports)
-        )
-    time.sleep(0.4)
-    if proc.poll() is not None:
-        raise RuntimeError(
-            "iface capture exited early code=%s (need root? see %s)"
-            % (proc.poll(), log_path)
-        )
+        if raw is not None:
+            try:
+                raw.close()
+            except Exception:
+                pass
+        if logger:
+            logger.info("iface capture thread stopped %s:%s" % (group, mport))
 
 
 def acquire(work_dir, iface, group, port, consumer_id, logger=None):
-    """
-    Register consumer_id for (iface,group,port); return dedicated local url.
-    """
     key = (iface, group, int(port))
     with _lock:
-        ent = _hubs.get(key)
-        if ent is None:
-            ent = {
+        hub = _hubs.get(key)
+        if hub is None:
+            hub = {
+                "iface": iface,
+                "group": group,
+                "mport": int(port),
                 "work_dir": work_dir,
                 "ports": {},
-                "proc": None,
-                "logf": None,
+                "dest_lock": threading.Lock(),
+                "stop": False,
+                "thread": None,
+                "logger": logger,
             }
-            _hubs[key] = ent
+            _hubs[key] = hub
 
-        if consumer_id in ent["ports"]:
-            lp = ent["ports"][consumer_id]
-            if ent["proc"] is not None and ent["proc"].poll() is None:
-                return "udp://127.0.0.1:%d" % lp
-            # process died — restart below
+        if consumer_id in hub["ports"]:
+            return "udp://127.0.0.1:%d" % hub["ports"][consumer_id]
 
         local_port = _free_udp_port()
-        ent["ports"][consumer_id] = local_port
-        # restart capture with full fan-out list
-        _stop_proc(ent)
-        _start_proc(ent, iface, group, port, logger=logger)
+        with hub["dest_lock"]:
+            hub["ports"][consumer_id] = local_port
+
+        if hub["thread"] is None or not hub["thread"].is_alive():
+            hub["stop"] = False
+            hub["logger"] = logger or hub.get("logger")
+            t = threading.Thread(
+                target=_capture_loop,
+                args=(hub,),
+                name="mcap-%s-%s" % (iface, group),
+                daemon=True,
+            )
+            hub["thread"] = t
+            t.start()
+            time.sleep(0.3)
+
         if logger:
             logger.info(
-                "iface capture assign %s -> 127.0.0.1:%d (consumers=%d)"
-                % (consumer_id, local_port, len(ent["ports"]))
+                "iface capture assign %s -> 127.0.0.1:%d (consumers=%d, no restart)"
+                % (consumer_id, local_port, len(hub["ports"]))
             )
         return "udp://127.0.0.1:%d" % local_port
 
@@ -172,29 +202,26 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 def release(iface, group, port, consumer_id, logger=None):
     key = (iface, group, int(port))
     with _lock:
-        ent = _hubs.get(key)
-        if not ent:
+        hub = _hubs.get(key)
+        if not hub:
             return
-        if consumer_id in ent["ports"]:
-            del ent["ports"][consumer_id]
-        if ent["ports"]:
-            # still have consumers — restart with remaining ports
-            _stop_proc(ent)
-            try:
-                _start_proc(ent, iface, group, port, logger=logger)
-            except Exception as e:
-                if logger:
-                    logger.error("restart iface capture failed: %s" % e)
+        with hub["dest_lock"]:
+            if consumer_id in hub["ports"]:
+                del hub["ports"][consumer_id]
+            empty = not hub["ports"]
+        if empty:
+            hub["stop"] = True
+            t = hub.get("thread")
+            if t and t.is_alive():
+                t.join(timeout=3)
+            del _hubs[key]
             if logger:
-                logger.info(
-                    "iface capture release %s remaining=%d"
-                    % (consumer_id, len(ent["ports"]))
-                )
-            return
-        _stop_proc(ent)
-        del _hubs[key]
-        if logger:
-            logger.info("stopped iface capture %s" % (key,))
+                logger.info("stopped iface capture %s" % (key,))
+        elif logger:
+            logger.info(
+                "iface capture release %s remaining=%d"
+                % (consumer_id, len(hub["ports"]))
+            )
 
 
 def resolve_ffmpeg_url(work_dir, url, iface, consumer_id, logger=None):

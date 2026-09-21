@@ -97,21 +97,42 @@ class StreamMonitor:
             channel.get("black_duration", defaults.get("black_duration", 3.0))
         )
         self.freeze_duration = float(
-            channel.get("freeze_duration", defaults.get("freeze_duration", 8.0))
+            channel.get("freeze_duration", defaults.get("freeze_duration", 12.0))
         )
-        # freezedetect 噪声阈值，越大越不敏感（默认 0.01，原 0.003 易误报）
+        # freezedetect 噪声阈值，越大越不敏感（组播环境建议 >= 0.02）
         self.freeze_noise = float(
-            channel.get("freeze_noise", defaults.get("freeze_noise", 0.01))
+            channel.get("freeze_noise", defaults.get("freeze_noise", 0.02))
         )
         self.silence_duration = float(
-            channel.get("silence_duration", defaults.get("silence_duration", 5.0))
+            channel.get("silence_duration", defaults.get("silence_duration", 12.0))
         )
         self.silence_threshold = channel.get(
-            "silence_threshold", defaults.get("silence_threshold", -40)
+            "silence_threshold", defaults.get("silence_threshold", -50)
         )
         self.save_snapshot = channel.get(
             "save_snapshot", defaults.get("save_snapshot", True)
         )
+        # 分项开关：组播+网卡抓包时默认先关掉无伴音（丢包极易误报）
+        self.detect_black = bool(
+            channel.get("detect_black", defaults.get("detect_black", True))
+        )
+        self.detect_freeze = bool(
+            channel.get("detect_freeze", defaults.get("detect_freeze", True))
+        )
+        _def_sil = False if self.iface else True
+        self.detect_silence = bool(
+            channel.get("detect_silence", defaults.get("detect_silence", _def_sil))
+        )
+        # 告警确认：ffmpeg 报 start 后还要再持续 confirm 秒且未 end 才正式告警
+        self.alarm_confirm_sec = float(
+            defaults.get("alarm_confirm_sec", 3.0)
+        )
+        # 同类告警冷却，避免静帧/恢复来回刷
+        self.alarm_cooldown_sec = float(
+            defaults.get("alarm_cooldown_sec", 90.0)
+        )
+        self._pending_alarms = {}  # key -> {event, since}
+        self._cooldown_until = {}  # key -> ts
 
         # 运维参数 (P0/P1)
         self.reconnect_delay = float(defaults.get("reconnect_delay", 5.0))
@@ -323,18 +344,26 @@ class StreamMonitor:
     def _build_filter_complex(self) -> str:
         """
         视频：可选 program 选轨 → 降采样 → split → 规则检测 + 旁路 fps
-        音频：silencedetect（同样按 program 选轨）
+        音频：可选 silencedetect；关闭时音频直通，避免误报
         """
         vin = self._v_label()
         ain = self._a_label()
-        detect = (
-            f"blackdetect=d={self.black_duration}:pix_th=0.10,"
-            f"freezedetect=n={self.freeze_noise}:d={self.freeze_duration}"
-        )
-        audio = (
-            f"[{ain}]silencedetect=noise={self.silence_threshold}dB:"
-            f"d={self.silence_duration}[aout]"
-        )
+        vparts = []
+        if self.detect_black:
+            vparts.append(f"blackdetect=d={self.black_duration}:pix_th=0.10")
+        if self.detect_freeze:
+            vparts.append(
+                f"freezedetect=n={self.freeze_noise}:d={self.freeze_duration}"
+            )
+        detect = ",".join(vparts) if vparts else "null"
+        if self.detect_silence:
+            audio = (
+                f"[{ain}]silencedetect=noise={self.silence_threshold}dB:"
+                f"d={self.silence_duration}[aout]"
+            )
+        else:
+            # 直通，不做静音检测
+            audio = f"[{ain}]volume=1[aout]"
 
         use_side = self.frame_interval_sec > 0
         dw = self.detect_width
@@ -758,6 +787,37 @@ class StreamMonitor:
         re.I,
     )
 
+    def _commit_alarm_start(self, alarm_key: str, event: Dict):
+        """真正落库的开始告警（已过确认期）。"""
+        now = _now_ts()
+        cool = self._cooldown_until.get(alarm_key, 0)
+        if now < cool:
+            self.logger.info(
+                "告警冷却中，忽略 %s（还需 %.0fs）"
+                % (alarm_key, cool - now)
+            )
+            return
+        self._active_alarms[alarm_key] = now
+        self._cooldown_until[alarm_key] = now + self.alarm_cooldown_sec
+        self.logger.warning(json.dumps(event, ensure_ascii=False))
+        self._save_event(event)
+        if self.save_snapshot:
+            self._take_snapshot(event["type"])
+        self._write_status()
+
+    def _flush_pending_alarms(self):
+        """确认期内仍未收到 end 的 pending → 正式告警。"""
+        if not self._pending_alarms:
+            return
+        now = _now_ts()
+        done = []
+        for key, item in list(self._pending_alarms.items()):
+            if now - item["since"] >= self.alarm_confirm_sec:
+                self._commit_alarm_start(key, item["event"])
+                done.append(key)
+        for key in done:
+            self._pending_alarms.pop(key, None)
+
     def _emit_alarm_event(
         self,
         *,
@@ -766,21 +826,37 @@ class StreamMonitor:
         is_end: bool,
         event: Dict,
     ):
+        # 开始：先进入确认队列，避免组播抖动/瞬间误报
         if is_start and alarm_key:
-            self._active_alarms[alarm_key] = _now_ts()
+            if alarm_key in self._active_alarms:
+                return
+            if alarm_key not in self._pending_alarms:
+                self._pending_alarms[alarm_key] = {
+                    "event": event,
+                    "since": _now_ts(),
+                }
+                self.logger.info(
+                    "待确认告警 %s（%.1fs 内若恢复则不计）"
+                    % (alarm_key, self.alarm_confirm_sec)
+                )
+            return
+
+        # 结束
         if is_end and alarm_key:
+            # 还在确认期：直接撤销，不记恢复事件
+            if alarm_key in self._pending_alarms:
+                self._pending_alarms.pop(alarm_key, None)
+                self.logger.info("告警未确认已撤销: %s" % alarm_key)
+                return
+            if alarm_key not in self._active_alarms:
+                return
             start_ts = self._active_alarms.pop(alarm_key, None)
             if start_ts and "duration" not in event:
                 event["duration"] = round(_now_ts() - start_ts, 3)
-
-        level = self.logger.warning if is_start else self.logger.info
-        level(json.dumps(event, ensure_ascii=False))
-        self._save_event(event)
-
-        if is_start and self.save_snapshot:
-            self._take_snapshot(event["type"])
-
-        self._write_status()
+            self.logger.info(json.dumps(event, ensure_ascii=False))
+            self._save_event(event)
+            self._write_status()
+            return
 
     def _parse_ffmpeg_line(self, line: str):
         """
@@ -796,11 +872,13 @@ class StreamMonitor:
         lower = line.lower()
 
         # 按类型检查；同一行可先后发出 start 与 end
-        pairs = (
-            ("black", "black_start", "black_end", "黑场"),
-            ("freeze", "freeze_start", "freeze_end", "静帧"),
-            ("silence", "silence_start", "silence_end", "无伴音"),
-        )
+        pairs = []
+        if self.detect_black:
+            pairs.append(("black", "black_start", "black_end", "黑场"))
+        if self.detect_freeze:
+            pairs.append(("freeze", "freeze_start", "freeze_end", "静帧"))
+        if self.detect_silence:
+            pairs.append(("silence", "silence_start", "silence_end", "无伴音"))
         handled = False
         for key, start_tok, end_tok, label in pairs:
             has_start = start_tok in lower
@@ -841,6 +919,7 @@ class StreamMonitor:
                     is_end=True,
                     event=ev,
                 )
+        self._flush_pending_alarms()
         if not handled:
             return
 
@@ -1041,6 +1120,8 @@ class StreamMonitor:
             line = self.process.stderr.readline()
             if line:
                 self._parse_ffmpeg_line(line)
+            else:
+                self._flush_pending_alarms()
             self._maybe_run_ai_inline()
             self._maybe_heartbeat()
 

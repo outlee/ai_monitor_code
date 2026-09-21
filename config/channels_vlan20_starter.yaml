@@ -12,10 +12,13 @@
 
 defaults:
   black_duration: 2.0
-  freeze_duration: 8.0
-  freeze_noise: 0.01
-  silence_duration: 5.0
-  silence_threshold: -45
+  freeze_duration: 12.0
+  freeze_noise: 0.02
+  silence_duration: 12.0
+  silence_threshold: -50
+  detect_silence: false
+  alarm_confirm_sec: 3.0
+  alarm_cooldown_sec: 90.0
   save_snapshot: true
   snapshot_dir: ./snapshots
   log_dir: ./logs
