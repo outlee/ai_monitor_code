@@ -480,14 +480,12 @@ def _capture_loop(hub):
         except Exception as e:
             if logger:
                 logger.warning("promisc skip: %s" % e)
-        try:
-            _attach_bpf(raw, _bpf_udp_or_frag(group, mport), logger=logger)
-        except Exception as e:
-            if logger:
-                logger.warning("iface BPF attach failed: %s" % e)
+        # BPF 在部分网卡/VLAN 卸载场景会把组播全部滤掉 → 全频道断流。
+        # 先不挂 BPF，仍靠用户态匹配 group:port（skip 会偏大，但能收到流）。
         if logger:
             logger.info(
-                "iface capture thread on %s for %s:%s" % (iface, group, mport)
+                "iface capture thread on %s for %s:%s bpf=off"
+                % (iface, group, mport)
             )
         n = 0
         n_skip = 0
