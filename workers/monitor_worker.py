@@ -584,11 +584,11 @@ class StreamMonitor:
                     cmd.extend(["-map", "0:p:%d:v" % int(self.program)])
                 else:
                     cmd.extend(["-map", "0:v:0"])
-                # 持续按间隔刷新同一张 jpg
+                # 持续按间隔刷新同一张 jpg（scale 表达式避免 filter 逗号转义问题）
                 cmd.extend(
                     [
                         "-vf",
-                        "fps=1/%s,scale=w='min(iw\\,640)':h=-2" % interval,
+                        "fps=1/%s,scale=640:-2" % interval,
                         "-f",
                         "image2",
                         "-update",
@@ -600,28 +600,53 @@ class StreamMonitor:
                 )
                 try:
                     self.logger.info("启动实时截图 FFmpeg -> %s src=%s" % (out, src))
+                    # 注意：stderr 绝不能 PIPE 又不读，否则缓冲区满会卡死 FFmpeg，永远写不出图
+                    err_path = self.snapshot_dir / "thumb_ffmpeg.err"
+                    err_f = open(str(err_path), "w")
                     self._thumb_proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
+                        stderr=err_f,
                         universal_newlines=True,
                     )
-                    # 等待看是否立刻退出
-                    time.sleep(2.0)
+                    # 等待看是否立刻退出 / 是否写出文件
+                    for _ in range(8):
+                        time.sleep(1.0)
+                        if self._thumb_proc.poll() is not None:
+                            break
+                        if self.latest_frame_path.is_file() and self.latest_frame_path.stat().st_size > 1024:
+                            self.logger.info(
+                                "latest.jpg 已生成 size=%d"
+                                % self.latest_frame_path.stat().st_size
+                            )
+                            break
                     if self._thumb_proc.poll() is not None:
                         err = ""
                         try:
-                            err = (self._thumb_proc.stderr.read() or "")[-300:]
+                            err_f.flush()
+                            with open(str(err_path), "r") as rf:
+                                err = (rf.read() or "")[-400:]
+                        except Exception:
+                            pass
+                        try:
+                            err_f.close()
                         except Exception:
                             pass
                         self.logger.warning(
                             "实时截图 FFmpeg 退出 code=%s %s"
-                            % (self._thumb_proc.returncode, err.replace("\n", " ")[:200])
+                            % (
+                                self._thumb_proc.returncode,
+                                err.replace("\n", " ")[:240],
+                            )
                         )
                         self._thumb_proc = None
                         time.sleep(3.0)
                         continue
-                    # 正常跑着，直到结束或 running 结束
+                    try:
+                        err_f.close()
+                    except Exception:
+                        pass
+                    # 正常跑着
                     while self.running and self._thumb_proc.poll() is None:
                         if self._state not in ("running", "starting"):
                             break
