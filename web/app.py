@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -458,10 +458,26 @@ def api_dashboard():
     cards = []
     for s in stats:
         thumb = None
-        latest = SNAPSHOT_DIR / s["id"] / "latest.jpg"
-        if latest.is_file() and latest.stat().st_size > 0:
-            # cache-bust by mtime so大屏能刷新
+        ch_dir = SNAPSHOT_DIR / s["id"]
+        latest = ch_dir / "latest.jpg"
+        if latest.is_file() and latest.stat().st_size > 1024:
             thumb = f"/api/snapshots/{s['id']}/latest.jpg?t={int(latest.stat().st_mtime)}"
+        elif ch_dir.is_dir():
+            # 回退：最近一张告警截图
+            try:
+                cands = [
+                    p
+                    for p in ch_dir.glob("*.jpg")
+                    if p.name != "latest.jpg" and p.stat().st_size > 1024
+                ]
+                if cands:
+                    newest = max(cands, key=lambda p: p.stat().st_mtime)
+                    thumb = (
+                        f"/api/snapshots/{s['id']}/{newest.name}"
+                        f"?t={int(newest.stat().st_mtime)}"
+                    )
+            except OSError:
+                pass
         cards.append(
             {
                 "id": s["id"],
@@ -565,6 +581,103 @@ def api_storage():
 def api_system_nics():
     """频道管理：可选业务网卡列表。"""
     return {"nics": _list_nics()}
+
+
+def _preview_input_url(channel: Dict[str, Any]) -> str:
+    """
+    预览输入：优先用监测心跳里的 ingest_url（已是本机分发端口），
+    否则用配置 url（组播直拉可能失败）。
+    """
+    cid = channel.get("id")
+    st = _read_status_file(str(cid)) if cid else None
+    if st and st.get("ingest_url"):
+        return str(st["ingest_url"])
+    return str(channel.get("url") or "")
+
+
+@app.get("/api/preview/{channel_id}")
+def api_preview_stream(channel_id: str):
+    """
+    点击预览：FFmpeg 将频道 TS 以 MPEG-TS 流式输出给浏览器（mpegts.js）。
+    需频道监测在跑（才能用到 ingest_url）；短时预览。
+    """
+    import subprocess
+
+    cfg = _load_config()
+    channel = None
+    for ch in cfg.get("channels") or []:
+        if ch.get("id") == channel_id:
+            channel = ch
+            break
+    if not channel:
+        raise HTTPException(404, f"频道不存在: {channel_id}")
+    if not channel.get("enabled", True):
+        raise HTTPException(400, "频道未启用，请先启用监测后再预览")
+
+    src = _preview_input_url(channel)
+    if not src:
+        raise HTTPException(400, "无可用预览地址")
+
+    prog = channel.get("program")
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-probesize",
+        "32M",
+        "-analyzeduration",
+        "8M",
+    ]
+    if str(src).lower().startswith("udp:"):
+        cmd.extend(["-f", "mpegts"])
+    cmd.extend(["-i", src])
+    if prog is not None and str(prog).strip() != "":
+        try:
+            p = int(prog)
+            cmd.extend(["-map", f"0:p:{p}"])
+        except (TypeError, ValueError):
+            pass
+    cmd.extend(["-c", "copy", "-f", "mpegts", "pipe:1"])
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+    except OSError as e:
+        raise HTTPException(500, f"无法启动预览: {e}")
+
+    def gen():
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(32 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        gen(),
+        media_type="video/mp2t",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Channel-Id": channel_id,
+        },
+    )
 
 
 def _dir_size(path: Path) -> int:

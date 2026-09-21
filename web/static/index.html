@@ -283,14 +283,30 @@
   </div><!-- /view-manage -->
 
   <footer class="footer">
-    <span>内网面板 · 无登录 · SQLite 历史 · TTS 告警 · 配置可写</span>
+    <span>内网面板 · 无登录 · SQLite 历史 · TTS 告警 · 点击大屏卡片可预览</span>
     <span id="health">-</span>
   </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
 
   <div id="lightbox" class="lightbox hidden">
     <button class="lb-close" id="lb-close">×</button>
     <img id="lb-img" alt="snapshot" />
     <div id="lb-cap"></div>
+  </div>
+
+  <!-- 节目预览 -->
+  <div id="preview-modal" class="modal hidden">
+    <div class="modal-card" style="max-width:900px">
+      <div class="modal-head">
+        <h3 id="preview-title">节目预览</h3>
+        <button class="lb-close" id="preview-close" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <video id="preview-video" controls muted autoplay playsinline style="width:100%;background:#000;max-height:70vh"></video>
+        <p class="hint" id="preview-hint" style="margin-top:8px">需频道已启用且监测在跑；关闭弹窗即停止预览</p>
+      </div>
+    </div>
   </div>
 
   <!-- 频道编辑弹窗 -->

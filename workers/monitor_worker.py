@@ -1114,9 +1114,13 @@ class StreamMonitor:
         )
         self._write_status("running")
         self._start_ai_thread()
+        run_started = _now_ts()
 
         assert self.process.stderr is not None
         while self.running and self.process.poll() is None:
+            # 稳定运行超过 60s 则清零断流计数，避免偶发一次就累计告警
+            if self.reconnect_count and _now_ts() - run_started >= 60:
+                self.reconnect_count = 0
             line = self.process.stderr.readline()
             if line:
                 self._parse_ffmpeg_line(line)
@@ -1168,20 +1172,36 @@ class StreamMonitor:
             self._active_alarms.clear()
             self._write_status("reconnecting")
 
-            event = {
-                "type": "stream_down",
-                "phase": "start",
-                "channel_id": self.id,
-                "channel_name": self.name,
-                "message": (
-                    f"节目流中断，{delay:.0f} 秒后第 {self.reconnect_count} 次重连"
-                ),
-                "returncode": rc,
-                "reconnect_count": self.reconnect_count,
-                "time": _now_str(),
-            }
-            self.logger.warning(json.dumps(event, ensure_ascii=False))
-            self._save_event(event)
+            # 断流也要确认：连续失败达到阈值才记告警，避免偶发抖动误报
+            down_confirm = int(self.defaults.get("stream_down_confirm", 2))
+            if self.reconnect_count >= down_confirm:
+                cool_key = "stream_down"
+                now = _now_ts()
+                if now >= self._cooldown_until.get(cool_key, 0):
+                    event = {
+                        "type": "stream_down",
+                        "phase": "start",
+                        "channel_id": self.id,
+                        "channel_name": self.name,
+                        "message": (
+                            f"节目流中断，{delay:.0f} 秒后第 "
+                            f"{self.reconnect_count} 次重连"
+                        ),
+                        "returncode": rc,
+                        "reconnect_count": self.reconnect_count,
+                        "time": _now_str(),
+                    }
+                    self.logger.warning(json.dumps(event, ensure_ascii=False))
+                    self._save_event(event)
+                    self._cooldown_until[cool_key] = now + self.alarm_cooldown_sec
+                else:
+                    self.logger.info(
+                        f"断流抖动忽略（冷却中）第 {self.reconnect_count} 次, code={rc}"
+                    )
+            else:
+                self.logger.info(
+                    f"短暂中断，暂不计告警（{self.reconnect_count}/{down_confirm}）code={rc}"
+                )
 
             self._interruptible_sleep(delay)
             delay = min(delay * 1.5, self.reconnect_max_delay)

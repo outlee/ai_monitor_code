@@ -525,16 +525,11 @@
           .join("");
         grid.querySelectorAll(".ch-card").forEach((el) => {
           el.addEventListener("click", () => {
-            setView("manage");
             const id = el.dataset.id;
-            const row = document.querySelector(
-              '#channel-tbody tr[data-id="' + id.replace(/"/g, "") + '"]'
-            );
-            if (row) {
-              row.scrollIntoView({ behavior: "smooth", block: "center" });
-              row.style.outline = "1px solid var(--accent)";
-              setTimeout(() => (row.style.outline = ""), 2000);
-            }
+            const name =
+              (el.querySelector(".ch-name") && el.querySelector(".ch-name").textContent) ||
+              id;
+            openPreview(id, name);
           });
         });
       }
@@ -568,6 +563,69 @@
           .join("");
       } else {
         byCh.innerHTML = `<li class="empty">暂无</li>`;
+      }
+    }
+  }
+
+  let previewPlayer = null;
+
+  function closePreview() {
+    const modal = $("#preview-modal");
+    if (modal) modal.classList.add("hidden");
+    try {
+      if (previewPlayer) {
+        previewPlayer.pause();
+        previewPlayer.unload();
+        previewPlayer.detachMediaElement();
+        previewPlayer.destroy();
+      }
+    } catch (e) {}
+    previewPlayer = null;
+    const v = $("#preview-video");
+    if (v) {
+      try {
+        v.pause();
+        v.removeAttribute("src");
+        v.load();
+      } catch (e) {}
+    }
+  }
+
+  function openPreview(channelId, name) {
+    const modal = $("#preview-modal");
+    const video = $("#preview-video");
+    const title = $("#preview-title");
+    const hint = $("#preview-hint");
+    if (!modal || !video) return;
+    closePreview();
+    if (title) title.textContent = "预览: " + (name || channelId);
+    if (hint) {
+      hint.textContent = "正在连接… 需监测进程在跑；关闭窗口即停止";
+    }
+    modal.classList.remove("hidden");
+
+    const url = "/api/preview/" + encodeURIComponent(channelId);
+    if (window.mpegts && mpegts.getFeatureList().mseLivePlayback) {
+      try {
+        previewPlayer = mpegts.createPlayer({
+          type: "mse",
+          isLive: true,
+          url: url,
+        });
+        previewPlayer.attachMediaElement(video);
+        previewPlayer.load();
+        previewPlayer.play().catch(() => {});
+        if (hint) {
+          hint.textContent = "直播预览中。若黑屏请确认该路为 running 且已启用";
+        }
+      } catch (e) {
+        if (hint) hint.textContent = "播放器启动失败: " + e.message;
+      }
+    } else {
+      video.src = url;
+      video.play().catch(() => {});
+      if (hint) {
+        hint.textContent = "建议使用 Chrome；若无画面请检查 CDN/mpegts.js 是否加载";
       }
     }
   }
@@ -1149,6 +1207,15 @@
   if (btnPerfRefresh) {
     btnPerfRefresh.addEventListener("click", () => refreshPerf());
   }
+  const previewClose = document.getElementById("preview-close");
+  if (previewClose) previewClose.addEventListener("click", closePreview);
+  const previewModal = document.getElementById("preview-modal");
+  if (previewModal) {
+    previewModal.addEventListener("click", (e) => {
+      if (e.target === previewModal) closePreview();
+    });
+  }
+
   const btnStorageClear = document.getElementById("btn-storage-clear");
   if (btnStorageClear) {
     btnStorageClear.addEventListener("click", async () => {
