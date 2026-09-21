@@ -519,39 +519,53 @@ class StreamMonitor:
             self._write_status()
 
     def _start_thumb_thread(self):
-        """旁路 latest 写失败时的兜底：定时抽关键帧覆盖 latest.jpg。"""
+        """定时写出 latest.jpg，供大屏/预览（不依赖主 FFmpeg 双路输出）。"""
         if self.frame_interval_sec <= 0:
             return
         if self._thumb_thread and self._thumb_thread.is_alive():
             return
 
         def _loop():
-            interval = max(float(self.frame_interval_sec), 2.0)
+            interval = max(float(self.frame_interval_sec), 3.0)
+            fails = 0
             while self.running:
                 try:
-                    # 已有较新旁路帧则跳过
-                    age = self._latest_frame_age()
-                    if age is not None and age < interval * 1.5:
-                        time.sleep(1.0)
-                        continue
                     if self._state != "running":
                         time.sleep(1.0)
                         continue
-                    tmp = self.snapshot_dir / "latest_tmp.jpg"
-                    if self._grab_frame_ffmpeg(tmp, quality=4):
+                    age = self._latest_frame_age()
+                    # 已有足够新的图则少抽，省 CPU
+                    if age is not None and age < interval:
+                        time.sleep(0.8)
+                        continue
+                    tmp = self.snapshot_dir / ("latest_tmp_%s.jpg" % os.getpid())
+                    ok = self._grab_frame_ffmpeg(tmp, quality=5, keyframe_only=False)
+                    if ok:
                         try:
-                            if tmp.stat().st_size >= 4 * 1024:
+                            if tmp.stat().st_size >= 3 * 1024:
                                 tmp.replace(self.latest_frame_path)
-                        except OSError:
-                            pass
+                                fails = 0
+                                self.logger.debug("latest.jpg 已更新")
+                            else:
+                                try:
+                                    os.unlink(str(tmp))
+                                except OSError:
+                                    pass
+                        except OSError as e:
+                            self.logger.debug("latest 替换失败: %s" % e)
+                    else:
+                        fails += 1
+                        if fails in (1, 5, 15):
+                            self.logger.warning(
+                                "实时截图失败 x%d（检查 ingest/program）" % fails
+                            )
                     try:
                         if tmp.is_file():
                             os.unlink(str(tmp))
                     except OSError:
                         pass
-                except Exception:
-                    pass
-                # interruptible sleep
+                except Exception as e:
+                    self.logger.debug("thumb loop: %s" % e)
                 end = time.time() + interval
                 while self.running and time.time() < end:
                     time.sleep(0.5)
@@ -560,6 +574,10 @@ class StreamMonitor:
             target=_loop, name=f"thumb-{self.id}", daemon=True
         )
         self._thumb_thread.start()
+        self.logger.info(
+            "实时截图线程已启动 interval=%ss -> %s"
+            % (max(float(self.frame_interval_sec), 3.0), self.latest_frame_path)
+        )
 
     # ---------- 事件与轮转 ----------
 
@@ -709,37 +727,40 @@ class StreamMonitor:
                 pass
             return False
 
-    def _grab_frame_ffmpeg(self, out_path: Path, quality: int = 3) -> bool:
-        """独立 FFmpeg 抽 1 帧（回退路径，会多占一路连接）。"""
+    def _grab_frame_ffmpeg(
+        self, out_path: Path, quality: int = 3, *, keyframe_only: bool = False
+    ) -> bool:
+        """独立 FFmpeg 抽 1 帧。实时缩略图不要强等关键帧（易卡住无图）。"""
         try:
-            src = (
-                self._input_url_with_timeout()
-                if self._ensure_ingest_url().lower().startswith(("udp:", "rtp:"))
-                else self._ensure_ingest_url()
-            )
+            src = self._ensure_ingest_url()
+            if src.lower().startswith(("udp:", "rtp:")):
+                src = self._input_url_with_timeout()
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-fflags",
+                "+genpts+discardcorrupt",
                 "-rw_timeout",
                 "8000000",
                 "-probesize",
-                "32M",
+                "8M",
                 "-analyzeduration",
-                "10M",
+                "3M",
             ]
             if src.lower().startswith("udp:"):
                 cmd.extend(["-f", "mpegts"])
             cmd.extend(["-i", src])
             if self.program is not None:
-                cmd.extend(["-map", "0:p:%d:v" % self.program])
-            # 尽量取关键帧，减少半截/花屏截图
+                cmd.extend(["-map", "0:p:%d:v" % int(self.program)])
+            else:
+                cmd.extend(["-map", "0:v:0"])
+            if keyframe_only:
+                cmd.extend(["-skip_frame", "nokey"])
             cmd.extend(
                 [
-                    "-skip_frame",
-                    "nokey",
                     "-frames:v",
                     "1",
                     "-q:v",
@@ -747,15 +768,21 @@ class StreamMonitor:
                     str(out_path),
                 ]
             )
-            subprocess.run(
+            r = subprocess.run(
                 cmd,
-                timeout=10,
+                timeout=12,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
             )
-            return out_path.is_file() and out_path.stat().st_size > 0
+            ok = out_path.is_file() and out_path.stat().st_size > 0
+            if not ok and r.stderr:
+                err = (r.stderr or "").strip().splitlines()
+                if err:
+                    self.logger.warning("抽帧失败: %s" % err[-1][:200])
+            return ok
         except Exception as e:
-            self.logger.debug(f"独立抽帧失败: {e}")
+            self.logger.warning("独立抽帧异常: %s" % e)
             return False
 
     def _take_snapshot(self, event_type: str) -> Optional[Path]:
@@ -804,7 +831,7 @@ class StreamMonitor:
             try:
                 # 稍等半秒再抽，降低告警瞬间坏帧概率
                 time.sleep(0.5)
-                if self._grab_frame_ffmpeg(out_path, quality=3):
+                if self._grab_frame_ffmpeg(out_path, quality=3, keyframe_only=True):
                     try:
                         if out_path.stat().st_size < 8 * 1024:
                             _unlink_quiet(out_path)

@@ -627,72 +627,16 @@
   }
 
   function openPreview(channelId, name) {
+    // 内网默认用实时截图轮询（稳）；不依赖浏览器播 TS
     const modal = $("#preview-modal");
     const video = $("#preview-video");
     const title = $("#preview-title");
     const hint = $("#preview-hint");
     if (!modal || !video) return;
     closePreview();
-    video.style.display = "block";
-    const old = document.getElementById("preview-thumb");
-    if (old) old.style.display = "none";
     if (title) title.textContent = "预览: " + (name || channelId);
-    if (hint) {
-      hint.textContent = "正在连接… 需监测进程在跑；关闭窗口即停止";
-    }
     modal.classList.remove("hidden");
-
-    const url = "/api/preview/" + encodeURIComponent(channelId) + "?t=" + Date.now();
-
-    const fallback = (msg) => {
-      if (hint) hint.textContent = (msg || "直播预览失败") + "，改为截图预览…";
-      startThumbFallback(channelId, hint);
-    };
-
-    if (window.mpegts && mpegts.isSupported && mpegts.isSupported()) {
-      try {
-        previewPlayer = mpegts.createPlayer(
-          {
-            type: "mpegts",
-            isLive: true,
-            hasAudio: true,
-            hasVideo: true,
-            url: url,
-          },
-          {
-            enableWorker: false,
-            stashInitialSize: 384,
-            liveBufferLatencyChasing: true,
-          }
-        );
-        previewPlayer.attachMediaElement(video);
-        previewPlayer.on(mpegts.Events.ERROR, (type, detail, info) => {
-          console.warn("mpegts error", type, detail, info);
-          fallback("播放错误");
-        });
-        previewPlayer.load();
-        const p = previewPlayer.play();
-        if (p && p.catch) p.catch(() => fallback("自动播放被拦截"));
-        if (hint) {
-          hint.textContent = "直播预览中。若长时间黑屏将自动改为截图预览";
-        }
-        // 5 秒仍几乎无进度则降级截图
-        setTimeout(() => {
-          if (!previewPlayer) return;
-          try {
-            if (video.currentTime < 0.1 && video.readyState < 2) {
-              fallback("画面未出来");
-            }
-          } catch (e) {
-            fallback("预览异常");
-          }
-        }, 5000);
-      } catch (e) {
-        fallback("播放器启动失败: " + e.message);
-      }
-    } else {
-      fallback("mpegts 播放器不可用");
-    }
+    startThumbFallback(channelId, hint);
   }
 
   function renderOverview(data) {
