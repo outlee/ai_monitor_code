@@ -558,16 +558,22 @@ class StreamMonitor:
         register_feeder(iface, group, port, cid, feeder=feeder, logger=self.logger)
         self._thumb_feeder = feeder
 
+        # 组播 TS 的 PTS/DTS 常乱跳；fps 滤镜按「流时间」凑间隔，会一直不出帧
+        # （表现为 fed 几十 MB、err 空、latest.jpg 却不存在）。
+        # 改用墙钟时间戳 + 输出 -r 限帧，解码一有帧就能写图。
+        out_fps = max(1.0 / interval, 0.2)
         cmd = [
             "ffmpeg",
             "-y",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "warning",
             "-fflags",
             "+genpts+discardcorrupt+igndts",
             "-err_detect",
             "ignore_err",
+            "-use_wallclock_as_timestamps",
+            "1",
             "-probesize",
             "8M",
             "-analyzeduration",
@@ -577,19 +583,19 @@ class StreamMonitor:
             "-i",
             "pipe:0",
         ]
-        # 新版 ffmpeg 默认 max_error_rate≈0.67，组播丢包时会直接放弃出图
-        if self.program is not None:
-            map_opts = ["-map", "0:p:%d:v:0" % int(self.program)]
-        else:
-            map_opts = ["-map", "0:v:0"]
         if self._thumb_use_max_error_rate:
             cmd.extend(["-max_error_rate", "1.0"])
-        cmd.extend(map_opts)
+        if self.program is not None:
+            cmd.extend(["-map", "0:p:%d:v:0" % int(self.program)])
+        else:
+            cmd.extend(["-map", "0:v:0"])
         cmd.extend(
             [
                 "-an",
                 "-vf",
-                "fps=1/%s,scale=640:-2" % interval,
+                "scale=640:-2",
+                "-r",
+                "%.4f" % out_fps,
                 "-f",
                 "image2",
                 "-update",
@@ -645,6 +651,10 @@ class StreamMonitor:
                 logged_ok = True
             now = time.time()
             if not logged_ok and now - last_progress >= 15:
+                try:
+                    err_f.flush()
+                except Exception:
+                    pass
                 self.logger.info(
                     "[thumb] waiting_frame fed=%dKB feeder_q=%dKB"
                     % (int(bytes_in / 1024), int(feeder.size() / 1024))
