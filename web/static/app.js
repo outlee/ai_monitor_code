@@ -4,7 +4,7 @@
   let suppressRefresh = false;
   let editMode = null;
   let channelCache = {};
-  const REFRESH_MS = 5000;
+  const REFRESH_MS = 8000;
   // 本地提醒：记录已见事件，避免刷新时重复吵
   let seenEventKeys = new Set();
   let alertsPrimed = false; // 首次加载只建基线，不提醒
@@ -335,10 +335,20 @@
     el._t = setTimeout(() => el.classList.add("hidden"), 3200);
   }
 
-  async function fetchJSON(url) {
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(url + " " + r.status);
-    return r.json();
+  async function fetchJSON(url, timeoutMs) {
+    const ms = timeoutMs || 15000;
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), ms) : null;
+    try {
+      const r = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+      if (!r.ok) throw new Error(url + " " + r.status);
+      return await r.json();
+    } catch (e) {
+      if (e && e.name === "AbortError") throw new Error("请求超时: " + url);
+      throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async function postJSON(url, body) {
@@ -752,12 +762,12 @@
 
   async function refresh() {
     try {
-      const [overview, snaps, health, full, dash] = await Promise.all([
-        fetchJSON("/api/overview"),
-        fetchJSON("/api/snapshots?limit=24"),
-        fetchJSON("/api/health"),
-        fetchJSON("/api/channels"),
-        fetchJSON("/api/dashboard").catch(() => null),
+      // 先拉核心数据；存储/性能分开，避免拖死整页
+      const [overview, health, full, dash] = await Promise.all([
+        fetchJSON("/api/overview", 20000),
+        fetchJSON("/api/health", 8000).catch(() => ({ ok: false })),
+        fetchJSON("/api/channels", 20000).catch(() => ({ channels: [] })),
+        fetchJSON("/api/dashboard", 20000).catch(() => null),
       ]);
       const byId = {};
       (full.channels || []).forEach((c) => {
@@ -769,13 +779,12 @@
           c.name = byId[c.id].name || c.name;
           c.enabled = byId[c.id].enabled;
           if (byId[c.id].program !== undefined) c.program = byId[c.id].program;
+          if (byId[c.id].iface) c.iface = byId[c.id].iface;
         }
       });
       handleNewEvents(overview.recent_events || []);
       renderOverview(overview);
-      renderSnapshots(snaps);
       if (dash) renderDashboard(dash);
-      await loadEventsPage();
       if ($("#stat-storage") && health.sqlite) {
         const mb = ((health.sqlite.db_size_bytes || 0) / 1024 / 1024).toFixed(2);
         $("#stat-storage").textContent =
@@ -785,12 +794,31 @@
       }
       let h = health.ok ? "服务正常" : "服务异常";
       if (health.sqlite && health.sqlite.db_path) h += " · SQLite";
+      const en = (overview.channels || []).filter((c) => c.enabled).length;
+      if (en > 30) h += " · 启用" + en + "路偏多";
       $("#health").textContent = h;
-      await refreshPerf();
-      await refreshStorageDetail();
+
+      // 次要数据：失败不挡住主界面
+      fetchJSON("/api/snapshots?limit=24", 12000)
+        .then((snaps) => renderSnapshots(snaps))
+        .catch(() => {});
+      loadEventsPage().catch(() => {});
+      const manageVisible =
+        $("#view-manage") && !$("#view-manage").classList.contains("hidden");
+      if (manageVisible) {
+        refreshPerf().catch(() => {});
+        refreshStorageDetail().catch(() => {});
+      }
     } catch (e) {
       console.error(e);
-      $("#health").textContent = "接口请求失败";
+      $("#health").textContent = "接口请求失败: " + (e.message || e);
+      const grid = $("#channel-grid");
+      if (grid && grid.innerHTML.indexOf("加载中") >= 0) {
+        grid.innerHTML =
+          '<div class="empty">加载超时/失败。请减少启用频道数后刷新。' +
+          escapeHtml(e.message || "") +
+          "</div>";
+      }
     }
   }
 

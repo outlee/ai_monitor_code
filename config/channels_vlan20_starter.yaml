@@ -1,0 +1,73 @@
+# 精简启动配置：仅 VLAN20 甘肃高清 5 套（239.100.3.1）
+# 确认稳定后再把 channels_vlan20.yaml 里其它 enabled 逐步打开
+# 使用: cp config/channels_vlan20_starter.yaml config/channels.yaml
+
+# 由《地市组播地址Vlan划分详细表》VLAN20 自动生成
+# 业务网卡: enp1s0f1
+# 1) 已排除停播
+# 2) 239.100.3.1 甘肃高清已填 program 106-110，可直接监测
+# 3) 其它多节目同地址：先启用该地址下第 1 条（无 program=默认节目）；其余 disabled，补 program 后再开
+# 4) 使用: 备份原 channels.yaml 后复制本文件覆盖，或 -c config/channels_vlan20.yaml
+# 5) Manager 需 root
+
+defaults:
+  black_duration: 2.0
+  freeze_duration: 3.0
+  silence_duration: 5.0
+  silence_threshold: -45
+  save_snapshot: true
+  snapshot_dir: ./snapshots
+  log_dir: ./logs
+  reconnect_delay: 5.0
+  reconnect_max_delay: 60.0
+  input_timeout_sec: 20.0
+  heartbeat_interval: 5.0
+  status_stale_sec: 30.0
+  events_max_bytes: 52428800
+  events_keep_files: 5
+  snapshot_max_per_channel: 100
+  detect_width: 480
+  frame_interval_sec: 2.0
+  latest_max_age_sec: 5.0
+  snapshot_prefer_latest: true
+  ai_async: true
+  iface: enp1s0f1
+ai:
+  enabled: false
+  mode: auto
+  model_path: models/mosaic_detector.onnx
+  interval_sec: 2.0
+  threshold: 0.55
+  green_ratio_th: 0.35
+  block_score_th: 0.12
+channels:
+- id: hd_92
+  name: 甘肃卫视HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 106
+  enabled: true
+- id: hd_93
+  name: 甘肃文化影视HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 107
+  enabled: true
+- id: hd_94
+  name: 甘肃公共应急HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 108
+  enabled: true
+- id: hd_95
+  name: 甘肃科教HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 109
+  enabled: true
+- id: hd_96
+  name: 甘肃少儿HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 110
+  enabled: true
