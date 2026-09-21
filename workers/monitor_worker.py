@@ -192,6 +192,7 @@ class StreamMonitor:
         self._snapshot_inflight = False
         self._snapshot_lock = threading.Lock()
         self._thumb_thread: Optional[threading.Thread] = None
+        self._thumb_proc: Optional[subprocess.Popen] = None
         self._last_status_db_ts = 0.0
         self._status_db_interval = float(
             defaults.get("status_db_interval_sec", 30.0)
@@ -521,65 +522,116 @@ class StreamMonitor:
         if _now_ts() - self._last_heartbeat_ts >= self.heartbeat_interval:
             self._write_status()
 
+    def _stop_thumb_proc(self):
+        if self._thumb_proc is not None and self._thumb_proc.poll() is None:
+            try:
+                self._thumb_proc.terminate()
+                self._thumb_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._thumb_proc.kill()
+                except Exception:
+                    pass
+        self._thumb_proc = None
+
     def _start_thumb_thread(self):
-        """定时写出 latest.jpg，供大屏/预览（不依赖主 FFmpeg 双路输出）。"""
+        """
+        常驻 FFmpeg 写 latest.jpg（挂在截图专用 UDP 口上持续收包）。
+        以前「偶尔抽一帧」时端口无人听，UDP 包被丢光，所以总是没有图。
+        """
         if self.frame_interval_sec <= 0:
             return
         if self._thumb_thread and self._thumb_thread.is_alive():
             return
 
         def _loop():
-            interval = max(float(self.frame_interval_sec), 3.0)
-            fails = 0
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            interval = max(float(self.frame_interval_sec), 2.0)
             while self.running:
+                if self._state not in ("running", "starting"):
+                    self._stop_thumb_proc()
+                    time.sleep(1.0)
+                    continue
+                # 已有进程在写则监控即可
+                if self._thumb_proc is not None and self._thumb_proc.poll() is None:
+                    time.sleep(2.0)
+                    continue
+                src = self._thumb_input_url()
+                out = str(self.latest_frame_path)
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-fflags",
+                    "+genpts+discardcorrupt",
+                    "-probesize",
+                    "8M",
+                    "-analyzeduration",
+                    "3M",
+                ]
+                if src.lower().startswith("udp:"):
+                    cmd.extend(["-f", "mpegts"])
+                cmd.extend(["-i", src])
+                if self.program is not None:
+                    cmd.extend(["-map", "0:p:%d:v" % int(self.program)])
+                else:
+                    cmd.extend(["-map", "0:v:0"])
+                # 持续按间隔刷新同一张 jpg
+                cmd.extend(
+                    [
+                        "-vf",
+                        "fps=1/%s,scale=w='min(iw\\,640)':h=-2" % interval,
+                        "-f",
+                        "image2",
+                        "-update",
+                        "1",
+                        "-q:v",
+                        "5",
+                        out,
+                    ]
+                )
                 try:
-                    if self._state != "running":
-                        time.sleep(1.0)
-                        continue
-                    age = self._latest_frame_age()
-                    # 已有足够新的图则少抽，省 CPU
-                    if age is not None and age < interval:
-                        time.sleep(0.8)
-                        continue
-                    tmp = self.snapshot_dir / ("latest_tmp_%s.jpg" % os.getpid())
-                    ok = self._grab_frame_ffmpeg(tmp, quality=5, keyframe_only=False)
-                    if ok:
+                    self.logger.info("启动实时截图 FFmpeg -> %s src=%s" % (out, src))
+                    self._thumb_proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                    )
+                    # 等待看是否立刻退出
+                    time.sleep(2.0)
+                    if self._thumb_proc.poll() is not None:
+                        err = ""
                         try:
-                            if tmp.stat().st_size >= 3 * 1024:
-                                tmp.replace(self.latest_frame_path)
-                                fails = 0
-                                self.logger.debug("latest.jpg 已更新")
-                            else:
-                                try:
-                                    os.unlink(str(tmp))
-                                except OSError:
-                                    pass
-                        except OSError as e:
-                            self.logger.debug("latest 替换失败: %s" % e)
-                    else:
-                        fails += 1
-                        if fails in (1, 5, 15):
-                            self.logger.warning(
-                                "实时截图失败 x%d（检查 ingest/program）" % fails
-                            )
-                    try:
-                        if tmp.is_file():
-                            os.unlink(str(tmp))
-                    except OSError:
-                        pass
+                            err = (self._thumb_proc.stderr.read() or "")[-300:]
+                        except Exception:
+                            pass
+                        self.logger.warning(
+                            "实时截图 FFmpeg 退出 code=%s %s"
+                            % (self._thumb_proc.returncode, err.replace("\n", " ")[:200])
+                        )
+                        self._thumb_proc = None
+                        time.sleep(3.0)
+                        continue
+                    # 正常跑着，直到结束或 running 结束
+                    while self.running and self._thumb_proc.poll() is None:
+                        if self._state not in ("running", "starting"):
+                            break
+                        time.sleep(1.0)
+                    self._stop_thumb_proc()
                 except Exception as e:
-                    self.logger.debug("thumb loop: %s" % e)
-                end = time.time() + interval
-                while self.running and time.time() < end:
-                    time.sleep(0.5)
+                    self.logger.warning("实时截图启动失败: %s" % e)
+                    self._stop_thumb_proc()
+                    time.sleep(3.0)
 
         self._thumb_thread = threading.Thread(
             target=_loop, name=f"thumb-{self.id}", daemon=True
         )
         self._thumb_thread.start()
         self.logger.info(
-            "实时截图线程已启动 interval=%ss -> %s"
-            % (max(float(self.frame_interval_sec), 3.0), self.latest_frame_path)
+            "实时截图线程已启动 -> %s" % self.latest_frame_path
         )
 
     # ---------- 事件与轮转 ----------
@@ -1311,6 +1363,7 @@ class StreamMonitor:
 
     def stop(self):
         self.running = False
+        self._stop_thumb_proc()
         self._stop_ffmpeg()
         self._release_capture()
         self._write_status("stopped")
