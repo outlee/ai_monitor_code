@@ -12,7 +12,8 @@
 
 defaults:
   black_duration: 2.0
-  freeze_duration: 3.0
+  freeze_duration: 8.0
+  freeze_noise: 0.01
   silence_duration: 5.0
   silence_threshold: -45
   save_snapshot: true

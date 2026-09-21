@@ -97,7 +97,11 @@ class StreamMonitor:
             channel.get("black_duration", defaults.get("black_duration", 3.0))
         )
         self.freeze_duration = float(
-            channel.get("freeze_duration", defaults.get("freeze_duration", 5.0))
+            channel.get("freeze_duration", defaults.get("freeze_duration", 8.0))
+        )
+        # freezedetect 噪声阈值，越大越不敏感（默认 0.01，原 0.003 易误报）
+        self.freeze_noise = float(
+            channel.get("freeze_noise", defaults.get("freeze_noise", 0.01))
         )
         self.silence_duration = float(
             channel.get("silence_duration", defaults.get("silence_duration", 5.0))
@@ -325,7 +329,7 @@ class StreamMonitor:
         ain = self._a_label()
         detect = (
             f"blackdetect=d={self.black_duration}:pix_th=0.10,"
-            f"freezedetect=n=0.003:d={self.freeze_duration}"
+            f"freezedetect=n={self.freeze_noise}:d={self.freeze_duration}"
         )
         audio = (
             f"[{ain}]silencedetect=noise={self.silence_threshold}dB:"
