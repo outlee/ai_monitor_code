@@ -380,7 +380,7 @@ class StreamMonitor:
         # 按 25fps 估算抽帧间隔；与真实帧率略有偏差只影响刷新快慢
         every = max(int(round(float(self.frame_interval_sec) * 25.0)), 8)
         snap = (
-            "select='not(mod(n\\,%d))',"
+            "fifo,select='not(mod(n\\,%d))',"
             "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
             % every
         )
@@ -449,8 +449,6 @@ class StreamMonitor:
                 [
                     "-map",
                     "[vsnap]",
-                    "-vsync",
-                    "vfr",
                     "-f",
                     "image2",
                     "-update",
@@ -755,33 +753,15 @@ class StreamMonitor:
                     time.sleep(interval)
                     continue
 
-                if self._capture_key and waited < wait_main_s:
+                if self._capture_key:
+                    # 不再另起 udp_live：多路二次解码会把 AF_PACKET 拖垮（skip 远大于 pkts）
                     if int(waited) % 15 == 0:
                         self.logger.info(
-                            "[thumb] wait_main t=%.0fs (no extra decoder yet)"
+                            "[thumb] wait_main t=%.0fs (main ffmpeg JPEG only)"
                             % waited
                         )
                     time.sleep(1.0)
                     waited += 1.0
-                    continue
-
-                if self._capture_key:
-                    try:
-                        self.logger.info(
-                            "[thumb] fallback udp_live after wait_main"
-                        )
-                        self._start_live_thumb_ffmpeg()
-                    except Exception as e:
-                        self.logger.warning(
-                            "[thumb] udp_live_fail: %s" % e
-                        )
-                        self._stop_thumb_proc()
-                        fail_streak += 1
-                        time.sleep(min(3.0 + fail_streak, 15.0))
-                        continue
-                    fail_streak += 1
-                    waited = 0.0
-                    time.sleep(2.0)
                     continue
 
                 # 无 iface：退回周期性抽帧
@@ -1434,7 +1414,7 @@ class StreamMonitor:
             f"detect_width={self.detect_width} "
             f"frame_interval={self.frame_interval_sec}s"
         )
-        self.logger.debug("FFmpeg cmd: %s", " ".join(cmd))
+        self.logger.info("[ffmpeg] %s", " ".join(cmd))
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,

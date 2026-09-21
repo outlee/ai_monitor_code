@@ -164,12 +164,213 @@ def _free_udp_port():
     return port
 
 
-def _parse_payload(frame, group, udp_port):
-    """
-    Extract complete UDP payload for group:port.
-    Drops IP fragments and truncated frames — partial datagrams corrupt TS
-    (PES mismatch / missing SPS) and make one-shot JPEG extract fail.
-    """
+def _ip4_to_int(ip):
+    a, b, c, d = [int(x) for x in ip.split(".")]
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def _assemble_bpf(ops):
+    labels = {}
+    ins = []
+    for op in ops:
+        if op[0] == "label":
+            labels[op[1]] = len(ins)
+            continue
+        ins.append(op)
+
+    def rel(i, lab):
+        if not lab:
+            return 0
+        return labels[lab] - (i + 1)
+
+    out = []
+    for i, op in enumerate(ins):
+        n = op[0]
+        if n == "ldh":
+            out.append((0x28, 0, 0, op[1]))
+        elif n == "ldb":
+            out.append((0x30, 0, 0, op[1]))
+        elif n == "ld":
+            out.append((0x20, 0, 0, op[1]))
+        elif n == "jeq":
+            out.append((0x15, rel(i, op[2]), rel(i, op[3]), op[1] & 0xFFFFFFFF))
+        elif n == "jset":
+            out.append((0x45, rel(i, op[2]), rel(i, op[3]), op[1] & 0xFFFFFFFF))
+        elif n == "ldxb_msh":
+            out.append((0xB1, 0, 0, op[1]))
+        elif n == "ldh_ind":
+            out.append((0x48, 0, 0, op[1]))
+        elif n == "ret":
+            out.append((0x06, 0, 0, op[1] & 0xFFFFFFFF))
+        else:
+            raise ValueError("bad bpf op %r" % (op,))
+    return out
+
+
+def _bpf_udp_or_frag(group, port):
+    """Accept IPv4 UDP to group:port, plus IP fragments to group (for reassembly)."""
+    dst = _ip4_to_int(group)
+    port = int(port)
+    return _assemble_bpf(
+        [
+            ("ldh", 12),
+            ("jeq", 0x8100, "vlan", "untag"),
+            ("label", "untag"),
+            ("ldh", 12),
+            ("jeq", 0x0800, "ip4", "drop"),
+            ("label", "ip4"),
+            ("ld", 30),
+            ("jeq", dst, "frag4", "drop"),
+            ("label", "frag4"),
+            ("ldh", 20),
+            ("jset", 0x1FFF, "accept", "proto4"),
+            ("label", "proto4"),
+            ("ldb", 23),
+            ("jeq", 17, "udp4", "drop"),
+            ("label", "udp4"),
+            ("ldxb_msh", 14),
+            ("ldh_ind", 16),
+            ("jeq", port, "accept", "drop"),
+            ("label", "vlan"),
+            ("ldh", 16),
+            ("jeq", 0x0800, "ip4v", "drop"),
+            ("label", "ip4v"),
+            ("ld", 34),
+            ("jeq", dst, "fragv", "drop"),
+            ("label", "fragv"),
+            ("ldh", 24),
+            ("jset", 0x1FFF, "accept", "protov"),
+            ("label", "protov"),
+            ("ldb", 27),
+            ("jeq", 17, "udpv", "drop"),
+            ("label", "udpv"),
+            ("ldxb_msh", 18),
+            ("ldh_ind", 20),
+            ("jeq", port, "accept", "drop"),
+            ("label", "accept"),
+            ("ret", 0x40000),
+            ("label", "drop"),
+            ("ret", 0),
+        ]
+    )
+
+
+def _attach_bpf(sock, insns, logger=None):
+    import ctypes
+
+    SO_ATTACH_FILTER = 26
+    raw = b"".join(
+        struct.pack("HBBI", int(c), int(jt), int(jf), int(k) & 0xFFFFFFFF)
+        for c, jt, jf, k in insns
+    )
+    buf = ctypes.create_string_buffer(raw)
+    class SockFprog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+    prog = SockFprog()
+    prog.len = len(insns)
+    prog.filter = ctypes.addressof(buf)
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    rc = libc.setsockopt(
+        int(sock.fileno()),
+        socket.SOL_SOCKET,
+        SO_ATTACH_FILTER,
+        ctypes.byref(prog),
+        ctypes.sizeof(prog),
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, "SO_ATTACH_FILTER")
+    if logger:
+        logger.info("iface BPF attached insns=%d" % len(insns))
+
+
+class _IpReassembler(object):
+    def __init__(self, timeout=1.5):
+        self.timeout = timeout
+        self._bufs = {}
+        self._last_gc = time.time()
+
+    def feed(self, ip):
+        if not ip or len(ip) < 20:
+            return None
+        ihl = (ip[0] & 0x0F) * 4
+        if ihl < 20 or len(ip) < ihl:
+            return None
+        total_len = struct.unpack("!H", ip[2:4])[0]
+        if total_len < ihl or len(ip) < min(total_len, ihl):
+            return None
+        body_end = min(total_len, len(ip))
+        ident = struct.unpack("!H", ip[4:6])[0]
+        frag_field = struct.unpack("!H", ip[6:8])[0]
+        mf = bool(frag_field & 0x2000)
+        frag_off = (frag_field & 0x1FFF) * 8
+        proto = ip[9]
+        src = ip[12:16]
+        dst = ip[16:20]
+        key = (src, dst, ident, proto)
+        payload = ip[ihl:body_end]
+        if not mf and frag_off == 0:
+            return ip[:body_end]
+        now = time.time()
+        rec = self._bufs.get(key)
+        if rec is None:
+            rec = {"parts": {}, "t": now, "end": None}
+            self._bufs[key] = rec
+        rec["parts"][frag_off] = payload
+        rec["t"] = now
+        if not mf:
+            rec["end"] = frag_off + len(payload)
+        if rec["end"] is None:
+            self._gc(now)
+            return None
+        assembled = bytearray()
+        off = 0
+        while off < rec["end"]:
+            part = rec["parts"].get(off)
+            if part is None:
+                self._gc(now)
+                return None
+            assembled.extend(part)
+            off += len(part)
+        if off != rec["end"]:
+            return None
+        del self._bufs[key]
+        hdr = bytearray(ip[:ihl])
+        total = ihl + len(assembled)
+        struct.pack_into("!H", hdr, 2, total)
+        struct.pack_into("!H", hdr, 6, 0)
+        return bytes(hdr) + bytes(assembled)
+
+    def _gc(self, now):
+        if now - self._last_gc < 1.0:
+            return
+        self._last_gc = now
+        dead = [k for k, v in self._bufs.items() if now - v["t"] > self.timeout]
+        for k in dead:
+            del self._bufs[k]
+
+
+def _strip_rtp(payload):
+    if not payload or len(payload) < 12 + 188:
+        return payload
+    if payload[0] == 0x47:
+        return payload
+    if (payload[0] >> 6) != 2:
+        return payload
+    cc = payload[0] & 0x0F
+    off = 12 + 4 * cc
+    if payload[1] & 0x10:  # extension
+        if off + 4 > len(payload):
+            return payload
+        ext_len = struct.unpack("!H", payload[off + 2 : off + 4])[0]
+        off += 4 + ext_len * 4
+    if off < len(payload) and payload[off] == 0x47:
+        return payload[off:]
+    return payload
+
+
+def _extract_ip(frame):
     if len(frame) < 14:
         return None
     ethertype = struct.unpack("!H", frame[12:14])[0]
@@ -184,30 +385,27 @@ def _parse_payload(frame, group, udp_port):
     ip = frame[off:]
     if len(ip) < 20:
         return None
-    vihl = ip[0]
-    version, ihl = vihl >> 4, (vihl & 0x0F) * 4
-    if version != 4 or ihl < 20 or len(ip) < ihl + 8:
+    if (ip[0] >> 4) != 4:
         return None
-    if ip[9] != 17:  # UDP
-        return None
+    return ip
 
-    # Reject IP fragments (need full UDP datagram)
-    frag_field = struct.unpack("!H", ip[6:8])[0]
-    frag_offset = frag_field & 0x1FFF
-    more_fragments = bool(frag_field & 0x2000)
-    if frag_offset != 0 or more_fragments:
-        return None
 
+def _udp_payload_from_ip(ip, group, udp_port):
+    if not ip or len(ip) < 20:
+        return None
+    ihl = (ip[0] & 0x0F) * 4
+    if ihl < 20 or len(ip) < ihl + 8:
+        return None
+    if ip[9] != 17:
+        return None
     total_len = struct.unpack("!H", ip[2:4])[0]
-    if total_len < ihl + 8 or len(ip) < total_len:
-        # Truncated capture — do not feed garbage into TS
+    if total_len < ihl + 8:
         return None
-
+    body_end = min(total_len, len(ip))
     dst = socket.inet_ntoa(ip[16:20])
     if dst != group:
         return None
-
-    udp = ip[ihl:total_len]
+    udp = ip[ihl:body_end]
     if len(udp) < 8:
         return None
     dport = struct.unpack("!H", udp[2:4])[0]
@@ -215,21 +413,37 @@ def _parse_payload(frame, group, udp_port):
         return None
     ulen = struct.unpack("!H", udp[4:6])[0]
     if ulen < 8 or len(udp) < ulen:
-        return None
-    payload = udp[8:ulen]
+        # use whatever we have if length is truncated after reassembly fail
+        payload = udp[8:]
+    else:
+        payload = udp[8:ulen]
+    payload = _strip_rtp(payload)
     if not payload:
         return None
-    # IPTV UDP 载荷通常是 N*188 且从 0x47 开始；若略有偏移，在报文内对齐
     if payload[0] != 0x47 and len(payload) >= 188 * 2:
         aligned = align_ts_sync(payload)
         if aligned and aligned[0] == 0x47:
             payload = aligned
-    # 截断到完整 TS 包，避免尾部半包污染下一 UDP（对 stdin 拼接尤其致命）
     if len(payload) >= 188:
         n = (len(payload) // 188) * 188
         if n > 0:
             payload = payload[:n]
     return payload if payload else None
+
+
+def _parse_payload(frame, group, udp_port, reasm=None):
+    ip = _extract_ip(frame)
+    if ip is None:
+        return None
+    if reasm is not None:
+        ip = reasm.feed(ip)
+        if ip is None:
+            return None
+    else:
+        frag_field = struct.unpack("!H", ip[6:8])[0]
+        if (frag_field & 0x1FFF) or (frag_field & 0x2000):
+            return None
+    return _udp_payload_from_ip(ip, group, udp_port)
 
 
 def _all_local_ports(hub):
@@ -249,9 +463,9 @@ def _capture_loop(hub):
     group = hub["group"]
     mport = hub["mport"]
     logger = hub.get("logger")
-    ring = hub.get("ring")
     raw = None
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    reasm = _IpReassembler()
     try:
         raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
         raw.bind((iface, 0))
@@ -260,13 +474,17 @@ def _capture_loop(hub):
         except Exception:
             pass
         try:
-            PACKET_MR_PROMISC = 1
             ifindex = socket.if_nametoindex(iface)
-            mreq = struct.pack("IHH8s", ifindex, PACKET_MR_PROMISC, 0, b"\x00" * 8)
-            raw.setsockopt(socket.SOL_PACKET, 1, mreq)  # PACKET_ADD_MEMBERSHIP=1
+            mreq = struct.pack("IHH8s", ifindex, 1, 0, b"\x00" * 8)  # PROMISC
+            raw.setsockopt(socket.SOL_PACKET, 1, mreq)
         except Exception as e:
             if logger:
                 logger.warning("promisc skip: %s" % e)
+        try:
+            _attach_bpf(raw, _bpf_udp_or_frag(group, mport), logger=logger)
+        except Exception as e:
+            if logger:
+                logger.warning("iface BPF attach failed: %s" % e)
         if logger:
             logger.info(
                 "iface capture thread on %s for %s:%s" % (iface, group, mport)
@@ -286,7 +504,7 @@ def _capture_loop(hub):
                     break
                 time.sleep(0.05)
                 continue
-            payload = _parse_payload(frame, group, mport)
+            payload = _parse_payload(frame, group, mport, reasm=reasm)
             if not payload:
                 n_skip += 1
                 continue
@@ -333,8 +551,8 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
     """
     Returns (monitor_url, thumb_url).
 
-    监测与截图使用不同的本机 UDP 口：UDP 按「数据报」边界递交，能保持
-    每包内的 188 字节 TS 对齐；若拼成 stdin 字节流，一次错位会整路 PES 错乱。
+    只分配监测 UDP 口。截图由主 FFmpeg 旁路写 latest.jpg，不再为每路
+    再开一个 thumb 口/解码器（dests 翻倍会把 AF_PACKET 拖垮）。
     """
     key = (iface, group, int(port))
     with _lock:
@@ -366,18 +584,11 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
         if consumer_id in hub["ports"]:
             item = hub["ports"][consumer_id]
             mon = item["mon"]
-            thumb = item.get("thumb") or mon
-            # 旧条目只有 mon：补开 thumb 口
-            if thumb == mon or "thumb" not in item:
-                thumb = _free_udp_port()
-                with hub["dest_lock"]:
-                    item["thumb"] = thumb
-            return (_listen_url(mon), _listen_url(thumb))
+            return (_listen_url(mon), _listen_url(mon))
 
         mon = _free_udp_port()
-        thumb = _free_udp_port()
         with hub["dest_lock"]:
-            hub["ports"][consumer_id] = {"mon": mon, "thumb": thumb}
+            hub["ports"][consumer_id] = {"mon": mon}
 
         if hub["thread"] is None or not hub["thread"].is_alive():
             hub["stop"] = False
@@ -394,10 +605,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture %s mon=@:%d thumb=@:%d consumers=%d"
-                % (consumer_id, mon, thumb, len(hub["ports"]))
+                "iface capture %s mon=@:%d consumers=%d"
+                % (consumer_id, mon, len(hub["ports"]))
             )
-        return (_listen_url(mon), _listen_url(thumb))
+        return (_listen_url(mon), _listen_url(mon))
 
 
 def release(iface, group, port, consumer_id, logger=None):
