@@ -1,0 +1,73 @@
+# VLAN20 全量节目（全部 enabled: false，请一套套启用）
+# 业务网卡 enp1s0f1；239.100.3.1 已填 program 106-110
+# 多节目同地址：启用前请确认 program，否则可能监测到默认节目
+# 使用: 备份后 cp config/channels_vlan20_all_disabled.yaml config/channels.yaml
+# Manager 建议用 root（网卡抓包需要权限）
+
+defaults:
+  # ---------- 规则检测（黑场 / 静帧 / 无伴音）----------
+  black_duration: 5.0          # 黑场持续多久才告警（秒），越大越不敏感
+  freeze_duration: 12.0        # 静帧持续多久才告警（秒），组播建议 8～15
+  freeze_noise: 0.02           # 静帧灵敏度，越大越钝（原 0.003 极易误报；建议 0.01～0.03）
+  silence_duration: 12.0       # 无伴音持续多久才告警（秒）
+  silence_threshold: -50.0     # 静音判定电平（dB），越负越不容易报无伴音
+  detect_black: true           # 是否检测黑场
+  detect_freeze: true          # 是否检测静帧
+  detect_silence: false        # 是否检测无伴音；有 iface 网卡抓包时建议先 false（丢包易误报）
+
+  # ---------- 告警确认 / 冷却（防抖）----------
+  alarm_confirm_sec: 3.0       # 检出后还要再持续该秒数且未恢复，才正式记告警
+  alarm_cooldown_sec: 90.0     # 同类告警冷却时间（秒），避免反复刷屏
+  stream_down_confirm: 2       # 连续断流/退出多少次才记「节目流中断」告警
+
+  # ---------- 截图 ----------
+  save_snapshot: true          # 告警时是否保存截图
+  snapshot_dir: ./snapshots    # 截图根目录（其下按频道 id 分子目录）
+  snapshot_max_per_channel: 100  # 每频道最多保留截图张数（不含 latest.jpg）
+  snapshot_prefer_latest: true # 告警截图优先用旁路 latest（足够新时）
+  latest_max_age_sec: 5.0      # 认为 latest.jpg「可用」的最大年龄（秒）
+
+  # ---------- 性能 / 旁路实时帧 ----------
+  detect_width: 480            # 规则检测前缩放最大宽度，0=不缩放；越小越省 CPU
+  frame_interval_sec: 2.0      # 旁路实时帧 latest.jpg 刷新间隔（秒）；0=关闭旁路
+  ai_async: true               # AI 分析走独立线程，避免堵住规则检测
+
+  # ---------- 收流 / 重连 / 网卡 ----------
+  iface: enp1s0f1              # 默认业务网卡；频道也可单独写 iface 覆盖
+  input_timeout_sec: 20.0      # UDP 无数据超时（秒），超时 FFmpeg 退出并重连
+  reconnect_delay: 5.0         # 断流后首次重连等待（秒）
+  reconnect_max_delay: 60.0    # 重连退避上限（秒）
+
+  # ---------- 日志 / 心跳 / 状态 ----------
+  log_dir: ./logs              # 日志与 events.jsonl、status 目录
+  heartbeat_interval: 5.0      # 写入 logs/status/<id>.json 的间隔（秒）
+  status_stale_sec: 30.0       # Web 判定心跳超时（黄灯）的秒数
+  status_db_interval_sec: 30.0 # 状态采样写入 SQLite 的间隔（秒）
+  events_max_bytes: 52428800   # events.jsonl 超过该大小则轮转（字节，默认约 50MB）
+  events_keep_files: 5         # 轮转后保留 events.jsonl.1 .. .N 的个数
+
+ai:
+  enabled: false               # 是否开启 AI 画面异常（马赛克/花屏）；先规则稳定再开
+  mode: auto                   # auto=有模型用 onnx 否则启发式；也可 onnx / heuristic
+  model_path: models/mosaic_detector.onnx  # ONNX 模型路径（相对工作目录）
+  interval_sec: 2.0            # AI 抽帧分析间隔（秒），越大越省 CPU
+  threshold: 0.55              # ONNX 异常分阈值，≥ 则告警
+  green_ratio_th: 0.35         # 启发式：绿色像素占比阈值
+  block_score_th: 0.12         # 启发式：块状/马赛克分数阈值
+
+channels:
+# 频道字段说明：
+# - id: 唯一 ID（日志/截图目录名）
+# - name: 显示名称
+# - url: 流地址，组播示例 udp://@239.100.3.1:5000
+# - iface: 业务网卡（可省略则用 defaults.iface）
+# - program: MPTS 节目号（十进制）；SPTS 可省略
+# - enabled: 是否监测
+# - 还可覆盖: black_duration / freeze_duration / detect_silence 等
+
+- id: gstv1
+  name: 甘肃卫视HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 106
+  enabled: false

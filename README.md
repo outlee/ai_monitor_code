@@ -320,6 +320,8 @@ python export_onnx.py --ckpt .../best.pt --out .../mosaic_detector.onnx
 |------|------|
 | [docs/DEPLOY.md](docs/DEPLOY.md) | 监测服务器部署（含 AI 依赖、systemd） |
 | [docs/LOCAL_DEPLOY_TRAIN.md](docs/LOCAL_DEPLOY_TRAIN.md) | **本地训练机**（仅训练，参考 12400F/16G/3050） |
+| [config/channels.yaml.example](config/channels.yaml.example) | **defaults / ai / 频道字段中文说明**（模板） |
+| [config/channels_vlan20_all_disabled.yaml](config/channels_vlan20_all_disabled.yaml) | VLAN20 全量节目（默认全不启用） |
 | [docs/TRAINING.md](docs/TRAINING.md) | 训练规范、样本、ONNX 约定、导入 |
 | [docs/TRAINING_AUTODL.md](docs/TRAINING_AUTODL.md) | AutoDL 从 0 租机到导出 |
 | [training/README.md](training/README.md) | 训练脚本命令速查 |
