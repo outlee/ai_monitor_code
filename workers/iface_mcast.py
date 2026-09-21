@@ -181,12 +181,13 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
             }
             _hubs[key] = hub
 
+        # FFmpeg 收流要用监听地址 udp://@:port（不要写 127.0.0.1，否则可能收不到）
+        def _listen_url(p):
+            return "udp://@:%d" % int(p)
+
         if consumer_id in hub["ports"]:
             item = hub["ports"][consumer_id]
-            return (
-                "udp://127.0.0.1:%d" % item["mon"],
-                "udp://127.0.0.1:%d" % item["thumb"],
-            )
+            return (_listen_url(item["mon"]), _listen_url(item["thumb"]))
 
         mon = _free_udp_port()
         thumb = _free_udp_port()
@@ -208,10 +209,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture %s mon=:%d thumb=:%d consumers=%d"
+                "iface capture %s mon=@:%d thumb=@:%d consumers=%d"
                 % (consumer_id, mon, thumb, len(hub["ports"]))
             )
-        return ("udp://127.0.0.1:%d" % mon, "udp://127.0.0.1:%d" % thumb)
+        return (_listen_url(mon), _listen_url(thumb))
 
 
 def release(iface, group, port, consumer_id, logger=None):

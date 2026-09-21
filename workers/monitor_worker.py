@@ -431,23 +431,10 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
-        cmd.extend(
-            [
-                "-i",
-                ingest,
-                "-filter_complex",
-                fc,
-                "-map",
-                "[vout]",
-                "-map",
-                "[aout]",
-                "-f",
-                "null",
-                "-",
-            ]
-        )
+        cmd.extend(["-i", ingest, "-filter_complex", fc])
+        # 先写 latest.jpg，再 null 检测（顺序影响部分 FFmpeg 是否写出图片）
         if self.frame_interval_sec > 0:
-            # 第二路必须显式 image2，否则很多环境下 latest.jpg 写不出来
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
             cmd.extend(
                 [
                     "-map",
@@ -457,11 +444,22 @@ class StreamMonitor:
                     "-update",
                     "1",
                     "-q:v",
-                    "4",
+                    "5",
                     "-y",
                     str(self.latest_frame_path),
                 ]
             )
+        cmd.extend(
+            [
+                "-map",
+                "[vout]",
+                "-map",
+                "[aout]",
+                "-f",
+                "null",
+                "-",
+            ]
+        )
         return cmd
 
     # ---------- 心跳状态 ----------
@@ -475,7 +473,15 @@ class StreamMonitor:
             "channel_name": self.name,
             "url": self.url,
             "ingest_url": self._ingest_url,
+            "thumb_url": getattr(self, "_thumb_url", None),
             "iface": self.iface,
+            "latest_jpg": str(self.latest_frame_path),
+            "latest_exists": bool(
+                self.latest_frame_path.is_file()
+                and self.latest_frame_path.stat().st_size > 0
+            )
+            if self.latest_frame_path
+            else False,
             "program": self.program,
             "enabled": self.enabled,
             "state": self._state,
