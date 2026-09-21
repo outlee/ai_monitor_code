@@ -1,0 +1,731 @@
+# 由《地市组播地址Vlan划分详细表》VLAN20 自动生成
+# 业务网卡: enp1s0f1
+# 说明:
+# 1) 已排除停播
+# 2) 239.100.3.1 五套甘肃高清已填 program 106-110
+# 3) 其它「多节目共用一个组播」的条目先 enabled: false，需探测 program 后再开
+# 4) 合并到正式 channels.yaml 前请备份原文件
+# 5) Manager 需 root（网卡抓包）
+
+defaults:
+  black_duration: 2.0
+  freeze_duration: 3.0
+  silence_duration: 5.0
+  silence_threshold: -45
+  save_snapshot: true
+  snapshot_dir: ./snapshots
+  log_dir: ./logs
+  reconnect_delay: 5.0
+  reconnect_max_delay: 60.0
+  input_timeout_sec: 20.0
+  heartbeat_interval: 5.0
+  status_stale_sec: 30.0
+  events_max_bytes: 52428800
+  events_keep_files: 5
+  snapshot_max_per_channel: 100
+  detect_width: 480
+  frame_interval_sec: 2.0
+  latest_max_age_sec: 5.0
+  snapshot_prefer_latest: true
+  ai_async: true
+  iface: enp1s0f1
+ai:
+  enabled: false
+  mode: auto
+  model_path: models/mosaic_detector.onnx
+  interval_sec: 2.0
+  threshold: 0.55
+  green_ratio_th: 0.35
+  block_score_th: 0.12
+channels:
+- id: ch_232_0_1_140_1
+  name: 安徽卫视高清频道
+  url: udp://@232.0.1.140:1140
+  iface: enp1s0f1
+  enabled: true
+- id: cctv1_2
+  name: CCTV1
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv2_3
+  name: CCTV2
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv17_4
+  name: CCTV17
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv10_5
+  name: CCTV10
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv11_6
+  name: CCTV11
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv12_7
+  name: CCTV12
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv15_8
+  name: CCTV15/音乐
+  url: udp://@239.100.1.1:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv13_9
+  name: CCTV13/新闻
+  url: udp://@239.100.1.2:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv14_10
+  name: CCTV14/少儿
+  url: udp://@239.100.1.2:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv4a_11
+  name: CCTV4A/中文国际频道（亚洲）
+  url: udp://@239.100.1.3:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv_news_12
+  name: CCTV NEWS英语新闻频道
+  url: udp://@239.100.1.3:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv_13
+  name: CCTV纪录片国际频道
+  url: udp://@239.100.1.3:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: 1_14
+  name: 中央教育1
+  url: udp://@239.100.1.4:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_5_15
+  name: 东南卫视
+  url: udp://@239.100.1.5:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_6_16
+  name: 湖南卫视
+  url: udp://@239.100.1.6:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_6_17
+  name: 金鹰卡通
+  url: udp://@239.100.1.6:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_7_18
+  name: 贵州卫视
+  url: udp://@239.100.1.7:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_8_19
+  name: 东方卫视
+  url: udp://@239.100.1.8:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_8_20
+  name: 炫动卡通
+  url: udp://@239.100.1.8:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_9_21
+  name: 广东卫视
+  url: udp://@239.100.1.9:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_9_22
+  name: 深圳卫视
+  url: udp://@239.100.1.9:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_10_23
+  name: 辽宁卫视
+  url: udp://@239.100.1.10:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_11_24
+  name: 江苏卫视
+  url: udp://@239.100.1.11:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_12_25
+  name: 湖北卫视
+  url: udp://@239.100.1.12:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_13_26
+  name: 安多卫视
+  url: udp://@239.100.1.13:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_13_27
+  name: 青海卫视
+  url: udp://@239.100.1.13:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_14_28
+  name: 内蒙古卫视
+  url: udp://@239.100.1.14:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_16_29
+  name: 浙江卫视
+  url: udp://@239.100.1.16:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_17_30
+  name: 山东卫视
+  url: udp://@239.100.1.17:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_18_31
+  name: 山西卫视
+  url: udp://@239.100.1.18:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_19_32
+  name: 河南卫视
+  url: udp://@239.100.1.19:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_20_33
+  name: 宁夏卫视
+  url: udp://@239.100.1.20:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_21_34
+  name: 陕西卫视
+  url: udp://@239.100.1.21:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_21_35
+  name: 农林卫视
+  url: udp://@239.100.1.21:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_22_36
+  name: 江西卫视
+  url: udp://@239.100.1.22:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_23_37
+  name: 四川康巴卫视
+  url: udp://@239.100.1.23:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_23_38
+  name: 四川卫视
+  url: udp://@239.100.1.23:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_24_39
+  name: 甘肃卫视
+  url: udp://@239.100.1.24:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_25_40
+  name: 安徽卫视
+  url: udp://@239.100.1.25:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_26_41
+  name: 天津卫视
+  url: udp://@239.100.1.26:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_27_42
+  name: 北京卫视
+  url: udp://@239.100.1.27:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_27_43
+  name: 卡酷卡通
+  url: udp://@239.100.1.27:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_28_44
+  name: 河北卫视
+  url: udp://@239.100.1.28:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_29_45
+  name: 黑龙江卫视
+  url: udp://@239.100.1.29:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_30_46
+  name: 吉林卫视
+  url: udp://@239.100.1.30:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_30_47
+  name: 延边卫视
+  url: udp://@239.100.1.30:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_31_48
+  name: 云南卫视
+  url: udp://@239.100.1.31:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_32_49
+  name: 旅游卫视
+  url: udp://@239.100.1.32:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_33_50
+  name: 西藏卫视
+  url: udp://@239.100.1.33:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_34_51
+  name: 兵团卫视
+  url: udp://@239.100.1.34:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_35_52
+  name: 新疆卫视
+  url: udp://@239.100.1.35:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_36_53
+  name: 广西卫视
+  url: udp://@239.100.1.36:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_37_54
+  name: 凤凰卫视资讯台
+  url: udp://@239.100.1.37:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_37_55
+  name: 凤凰卫视中文台
+  url: udp://@239.100.1.37:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_38_56
+  name: 法治天地
+  url: udp://@239.100.1.38:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_39_57
+  name: 东方财经
+  url: udp://@239.100.1.39:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_40_58
+  name: 国学频道
+  url: udp://@239.100.1.40:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_40_59
+  name: 环球奇观
+  url: udp://@239.100.1.40:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_40_60
+  name: 书画频道
+  url: udp://@239.100.1.40:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_41_61
+  name: 篮球频道
+  url: udp://@239.100.1.41:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_42_62
+  name: 女性时尚
+  url: udp://@239.100.1.42:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_42_63
+  name: 宝贝家
+  url: udp://@239.100.1.42:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: none_64
+  name: None
+  url: udp://@239.100.1.43:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_44_65
+  name: 中央新影中学生
+  url: udp://@239.100.1.44:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_44_66
+  name: 中央新影发现之旅
+  url: udp://@239.100.1.44:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_44_67
+  name: 中央新影老故事
+  url: udp://@239.100.1.44:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_45_68
+  name: 汽摩
+  url: udp://@239.100.1.45:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_46_69
+  name: 读书频道
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_70
+  name: 中华特产
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_71
+  name: 车迷频道
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_72
+  name: 优优宝贝
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_73
+  name: 环球旅游
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_74
+  name: 生态环境
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_75
+  name: 时代美食
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_46_76
+  name: 央广健康
+  url: udp://@239.100.1.46:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_47_77
+  name: 四海钓鱼
+  url: udp://@239.100.1.47:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_47_78
+  name: 家庭理财
+  url: udp://@239.100.1.47:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_48_79
+  name: 收藏天下
+  url: udp://@239.100.1.48:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_48_80
+  name: 财富天下
+  url: udp://@239.100.1.48:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cetv_2_81
+  name: CETV-2
+  url: udp://@239.100.1.49:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cetv_4_82
+  name: CETV-4
+  url: udp://@239.100.1.49:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_50_83
+  name: 中华美食
+  url: udp://@239.100.1.50:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_51_84
+  name: 幼儿教育
+  url: udp://@239.100.1.51:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_54_85
+  name: 湖南卫视高清频道
+  url: udp://@239.100.1.54:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_1_54_86
+  name: 湖南卫视高清频道
+  url: udp://@239.100.1.54:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: cctv3d_87
+  name: CCTV3D高清测试
+  url: udp://@239.100.1.57:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_83_88
+  name: 时尚购物
+  url: udp://@239.100.1.83:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_1_87_89
+  name: 星空卫视
+  url: udp://@239.100.1.87:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: v_90
+  name: [V]音乐台 中国频道
+  url: udp://@239.100.1.87:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_2_10_91
+  name: 庆阳
+  url: udp://@239.100.2.10:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_2_13_92
+  name: 临夏
+  url: udp://@239.100.2.13:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_93
+  name: 甘肃卫视HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 106
+  enabled: true
+- id: hd_94
+  name: 甘肃文化影视HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 107
+  enabled: true
+- id: hd_95
+  name: 甘肃公共应急HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 108
+  enabled: true
+- id: hd_96
+  name: 甘肃科教HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 109
+  enabled: true
+- id: hd_97
+  name: 甘肃少儿HD
+  url: udp://@239.100.3.1:5000
+  iface: enp1s0f1
+  program: 110
+  enabled: true
+- id: hd_98
+  name: 武术世界HD（华诚）
+  url: udp://@239.100.3.2:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_99
+  name: 文物宝库HD（华诚）
+  url: udp://@239.100.3.3:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_4_100
+  name: 先锋乒羽 新动漫（华诚）
+  url: udp://@239.100.3.4:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_5_101
+  name: 甘肃卫视
+  url: udp://@239.100.3.5:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_3_5_102
+  name: 甘肃文化影视
+  url: udp://@239.100.3.5:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_3_5_103
+  name: 甘肃公共应急
+  url: udp://@239.100.3.5:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_3_5_104
+  name: 甘肃科教
+  url: udp://@239.100.3.5:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: ch_239_100_3_5_105
+  name: 甘肃少儿
+  url: udp://@239.100.3.5:5000
+  iface: enp1s0f1
+  # 同组播多节目，请 ffprobe 后填写 program 再启用
+  enabled: false
+- id: hd_106
+  name: 贵州卫视HD
+  url: udp://@239.100.3.7:5000
+  iface: enp1s0f1
+  enabled: true
+- id: chc_hd_chc_sd_107
+  name: CHC家庭影院（HD）CHC家庭影院（SD）
+  url: udp://@239.100.3.9:5000
+  iface: enp1s0f1
+  enabled: true
+- id: chc_hd_chc_sd_108
+  name: CHC动作影院（HD）CHC动作影院（SD）
+  url: udp://@239.100.3.10:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_15_109
+  name: 辽宁高清
+  url: udp://@239.100.3.15:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_16_110
+  name: 海南高清
+  url: udp://@239.100.3.16:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_17_111
+  name: 上海东方高清
+  url: udp://@239.100.3.17:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_19_112
+  name: 传媒公司党教视频
+  url: udp://@239.100.3.19:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_113
+  name: 北京卫视HD
+  url: udp://@239.100.3.20:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_100_3_21_114
+  name: 纪实科教
+  url: udp://@239.100.3.21:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_115
+  name: 吉林HD
+  url: udp://@239.100.3.22:5000
+  iface: enp1s0f1
+  enabled: true
+- id: cctv_hd_116
+  name: CCTV-世界地理 HD
+  url: udp://@239.100.3.35:5000
+  iface: enp1s0f1
+  enabled: true
+- id: cctv_hd_117
+  name: CCTV-风云足球 HD
+  url: udp://@239.100.3.36:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_118
+  name: 兰州新闻综合 HD
+  url: udp://@239.100.3.37:5000
+  iface: enp1s0f1
+  enabled: true
+- id: 4k_119
+  name: 广东卫视4K(卫星信源）
+  url: udp://@239.100.3.52:5000
+  iface: enp1s0f1
+  enabled: true
+- id: 4k_120
+  name: 深圳卫视4K(卫星信源）
+  url: udp://@239.100.3.53:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_hd_hd_121
+  name: 新疆HD、宁夏HD、兵团HD
+  url: udp://@239.100.3.54:5000
+  iface: enp1s0f1
+  enabled: true
+- id: hd_122
+  name: 西藏HD
+  url: udp://@239.100.3.55:5000
+  iface: enp1s0f1
+  enabled: true
+- id: 4k_123
+  name: 浙江卫视4K
+  url: udp://@239.100.3.60:5000
+  iface: enp1s0f1
+  enabled: true
+- id: 4k_124
+  name: 山东卫视4K
+  url: udp://@239.100.3.61:5000
+  iface: enp1s0f1
+  enabled: true
+- id: ch_239_200_1_102_125
+  name: 中国气象频道
+  url: udp://@239.200.1.102:5000
+  iface: enp1s0f1
+  enabled: true
