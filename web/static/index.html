@@ -76,7 +76,7 @@
   <section class="panel dash-panel" id="view-dash">
     <div class="panel-head">
       <h2>频道大屏</h2>
-      <span class="hint">绿=正常 · 红=异常 · 黄=离线/重连 · 灰=禁用 · TTS 5分钟同类型抑制</span>
+      <span class="hint">绿正常/红异常/黄离线/灰禁用 · 画面=监测运行中的实时帧（非仅异常）· 点击可预览</span>
     </div>
     <div class="lamp-legend">
       <span><i class="dot green"></i>正常 <b id="sum-green">0</b></span>
@@ -287,7 +287,7 @@
     <span id="health">-</span>
   </footer>
 
-  <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+  <script src="/static/vendor/mpegts.min.js"></script>
 
   <div id="lightbox" class="lightbox hidden">
     <button class="lb-close" id="lb-close">×</button>

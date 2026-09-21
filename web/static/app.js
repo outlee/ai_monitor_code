@@ -625,7 +625,7 @@
       video.src = url;
       video.play().catch(() => {});
       if (hint) {
-        hint.textContent = "建议使用 Chrome；若无画面请检查 CDN/mpegts.js 是否加载";
+        hint.textContent = "建议使用 Chrome；请确认已加载 /static/vendor/mpegts.min.js";
       }
     }
   }
