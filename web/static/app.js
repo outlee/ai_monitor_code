@@ -568,10 +568,15 @@
   }
 
   let previewPlayer = null;
+  let previewThumbTimer = null;
 
   function closePreview() {
     const modal = $("#preview-modal");
     if (modal) modal.classList.add("hidden");
+    if (previewThumbTimer) {
+      clearInterval(previewThumbTimer);
+      previewThumbTimer = null;
+    }
     try {
       if (previewPlayer) {
         previewPlayer.pause();
@@ -587,7 +592,37 @@
         v.pause();
         v.removeAttribute("src");
         v.load();
+        v.style.display = "block";
       } catch (e) {}
+    }
+    const img = document.getElementById("preview-thumb");
+    if (img) img.style.display = "none";
+  }
+
+  function startThumbFallback(channelId, hint) {
+    const video = $("#preview-video");
+    if (!video) return;
+    // 用图片轮询代替直播（内网更稳）
+    let img = document.getElementById("preview-thumb");
+    if (!img) {
+      img = document.createElement("img");
+      img.id = "preview-thumb";
+      img.style.cssText = "width:100%;max-height:70vh;object-fit:contain;background:#000";
+      video.style.display = "none";
+      video.parentNode.insertBefore(img, video);
+    }
+    img.style.display = "block";
+    const tick = () => {
+      img.src =
+        "/api/snapshots/" +
+        encodeURIComponent(channelId) +
+        "/latest.jpg?t=" +
+        Date.now();
+    };
+    tick();
+    previewThumbTimer = setInterval(tick, 1000);
+    if (hint) {
+      hint.textContent = "当前为实时截图预览（每秒刷新）。直播播放失败时自动降级。";
     }
   }
 
@@ -598,35 +633,65 @@
     const hint = $("#preview-hint");
     if (!modal || !video) return;
     closePreview();
+    video.style.display = "block";
+    const old = document.getElementById("preview-thumb");
+    if (old) old.style.display = "none";
     if (title) title.textContent = "预览: " + (name || channelId);
     if (hint) {
       hint.textContent = "正在连接… 需监测进程在跑；关闭窗口即停止";
     }
     modal.classList.remove("hidden");
 
-    const url = "/api/preview/" + encodeURIComponent(channelId);
-    if (window.mpegts && mpegts.getFeatureList().mseLivePlayback) {
+    const url = "/api/preview/" + encodeURIComponent(channelId) + "?t=" + Date.now();
+
+    const fallback = (msg) => {
+      if (hint) hint.textContent = (msg || "直播预览失败") + "，改为截图预览…";
+      startThumbFallback(channelId, hint);
+    };
+
+    if (window.mpegts && mpegts.isSupported && mpegts.isSupported()) {
       try {
-        previewPlayer = mpegts.createPlayer({
-          type: "mse",
-          isLive: true,
-          url: url,
-        });
+        previewPlayer = mpegts.createPlayer(
+          {
+            type: "mpegts",
+            isLive: true,
+            hasAudio: true,
+            hasVideo: true,
+            url: url,
+          },
+          {
+            enableWorker: false,
+            stashInitialSize: 384,
+            liveBufferLatencyChasing: true,
+          }
+        );
         previewPlayer.attachMediaElement(video);
+        previewPlayer.on(mpegts.Events.ERROR, (type, detail, info) => {
+          console.warn("mpegts error", type, detail, info);
+          fallback("播放错误");
+        });
         previewPlayer.load();
-        previewPlayer.play().catch(() => {});
+        const p = previewPlayer.play();
+        if (p && p.catch) p.catch(() => fallback("自动播放被拦截"));
         if (hint) {
-          hint.textContent = "直播预览中。若黑屏请确认该路为 running 且已启用";
+          hint.textContent = "直播预览中。若长时间黑屏将自动改为截图预览";
         }
+        // 5 秒仍几乎无进度则降级截图
+        setTimeout(() => {
+          if (!previewPlayer) return;
+          try {
+            if (video.currentTime < 0.1 && video.readyState < 2) {
+              fallback("画面未出来");
+            }
+          } catch (e) {
+            fallback("预览异常");
+          }
+        }, 5000);
       } catch (e) {
-        if (hint) hint.textContent = "播放器启动失败: " + e.message;
+        fallback("播放器启动失败: " + e.message);
       }
     } else {
-      video.src = url;
-      video.play().catch(() => {});
-      if (hint) {
-        hint.textContent = "建议使用 Chrome；请确认已加载 /static/vendor/mpegts.min.js";
-      }
+      fallback("mpegts 播放器不可用");
     }
   }
 

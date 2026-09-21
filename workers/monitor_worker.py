@@ -190,6 +190,7 @@ class StreamMonitor:
         self._status_lock = threading.Lock()
         self._snapshot_inflight = False
         self._snapshot_lock = threading.Lock()
+        self._thumb_thread: Optional[threading.Thread] = None
         self._last_status_db_ts = 0.0
         self._status_db_interval = float(
             defaults.get("status_db_interval_sec", 30.0)
@@ -442,16 +443,17 @@ class StreamMonitor:
             ]
         )
         if self.frame_interval_sec > 0:
+            # 第二路必须显式 image2，否则很多环境下 latest.jpg 写不出来
             cmd.extend(
                 [
                     "-map",
                     "[vsnap]",
-                    "-vsync",
-                    "0",
-                    "-q:v",
-                    "4",
+                    "-f",
+                    "image2",
                     "-update",
                     "1",
+                    "-q:v",
+                    "4",
                     "-y",
                     str(self.latest_frame_path),
                 ]
@@ -515,6 +517,49 @@ class StreamMonitor:
     def _maybe_heartbeat(self):
         if _now_ts() - self._last_heartbeat_ts >= self.heartbeat_interval:
             self._write_status()
+
+    def _start_thumb_thread(self):
+        """旁路 latest 写失败时的兜底：定时抽关键帧覆盖 latest.jpg。"""
+        if self.frame_interval_sec <= 0:
+            return
+        if self._thumb_thread and self._thumb_thread.is_alive():
+            return
+
+        def _loop():
+            interval = max(float(self.frame_interval_sec), 2.0)
+            while self.running:
+                try:
+                    # 已有较新旁路帧则跳过
+                    age = self._latest_frame_age()
+                    if age is not None and age < interval * 1.5:
+                        time.sleep(1.0)
+                        continue
+                    if self._state != "running":
+                        time.sleep(1.0)
+                        continue
+                    tmp = self.snapshot_dir / "latest_tmp.jpg"
+                    if self._grab_frame_ffmpeg(tmp, quality=4):
+                        try:
+                            if tmp.stat().st_size >= 4 * 1024:
+                                tmp.replace(self.latest_frame_path)
+                        except OSError:
+                            pass
+                    try:
+                        if tmp.is_file():
+                            os.unlink(str(tmp))
+                    except OSError:
+                        pass
+                except Exception:
+                    pass
+                # interruptible sleep
+                end = time.time() + interval
+                while self.running and time.time() < end:
+                    time.sleep(0.5)
+
+        self._thumb_thread = threading.Thread(
+            target=_loop, name=f"thumb-{self.id}", daemon=True
+        )
+        self._thumb_thread.start()
 
     # ---------- 事件与轮转 ----------
 
@@ -1114,6 +1159,7 @@ class StreamMonitor:
         )
         self._write_status("running")
         self._start_ai_thread()
+        self._start_thumb_thread()
         run_started = _now_ts()
 
         assert self.process.stderr is not None
