@@ -641,8 +641,6 @@ class StreamMonitor:
         注意：不能把多包 TS 拼进 stdin——UDP 每包自带 188 对齐，拼流后一旦
         错位会整路 PES mismatch，表现为喂了上百 MB 仍无图最后 ffmpeg_exit。
         """
-        interval = max(float(self.frame_interval_sec), 2.0)
-        out_fps = max(1.0 / interval, 0.2)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         out = str(self.latest_frame_path)
         err_path = self.snapshot_dir / "thumb_ffmpeg.err"
@@ -652,15 +650,15 @@ class StreamMonitor:
             "ffmpeg",
             "-y",
             "-hide_banner",
+            "-nostats",
             "-loglevel",
             "warning",
             "-fflags",
             "+genpts+discardcorrupt+igndts",
             "-err_detect",
             "ignore_err",
-            "-use_wallclock_as_timestamps",
-            "1",
-            "-nostats",
+            "-skip_frame",
+            "nokey",
             "-probesize",
             "2M",
             "-analyzeduration",
@@ -680,8 +678,8 @@ class StreamMonitor:
                 "-an",
                 "-vf",
                 "scale=640:-2",
-                "-r",
-                "%.4f" % out_fps,
+                "-vsync",
+                "0",
                 "-f",
                 "image2",
                 "-update",
