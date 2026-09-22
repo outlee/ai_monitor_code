@@ -352,13 +352,8 @@ class StreamMonitor:
         extras = []
         if "timeout=" not in url:
             extras.append("timeout=%d" % timeout_us)
-        if "fifo_size=" not in url:
-            # ffmpeg udp fifo_size 单位是 188 字节包个数，默认 7*4096
-            extras.append("fifo_size=65536")
-        if "overrun_nonfatal=" not in url:
-            extras.append("overrun_nonfatal=1")
-        if "buffer_size=" not in url:
-            extras.append("buffer_size=4194304")
+        # 不要附加 fifo_size/buffer_size：部分 FFmpeg 会因此一直
+        # “Could not detect TS packet size”，解不出流、界面一直无信号。
         if not extras:
             return url
         sep = "&" if "?" in url else "?"
@@ -551,9 +546,14 @@ class StreamMonitor:
         return max(float(self.defaults.get("input_timeout_sec", 15.0)), 20.0)
 
     def _media_ok(self) -> bool:
-        if not self._last_media_ts:
-            return False
-        return (_now_ts() - self._last_media_ts) <= self._media_timeout_sec()
+        if self._last_media_ts and (
+            (_now_ts() - self._last_media_ts) <= self._media_timeout_sec()
+        ):
+            return True
+        age = self._latest_frame_age()
+        if age is not None and age <= self._media_timeout_sec():
+            return True
+        return False
 
     def _note_media(self):
         first = not self._last_media_ts
@@ -578,6 +578,10 @@ class StreamMonitor:
 
     def _check_no_signal(self):
         if self._state not in ("running", "starting"):
+            return
+        age = self._latest_frame_age()
+        if age is not None and age <= self._media_timeout_sec():
+            self._note_media()
             return
         if self._media_ok():
             return
@@ -1267,8 +1271,12 @@ class StreamMonitor:
         # 真正解到流的标志，不含 Packet corrupt / 打开失败
         if (
             "stream mapping" in lower
+            or "stream #" in lower
             or "video:" in lower
             or "audio:" in lower
+            or "h264" in lower
+            or "mpeg2video" in lower
+            or "hevc" in lower
             or "black_start" in lower
             or "freeze_start" in lower
             or "silence_start" in lower
@@ -1514,8 +1522,7 @@ class StreamMonitor:
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1,
+            bufsize=0,
         )
         self._last_media_ts = 0.0
         self._run_started_ts = _now_ts()
@@ -1529,11 +1536,20 @@ class StreamMonitor:
         err_q: "queue.Queue[Optional[str]]" = queue.Queue()
 
         def _drain_stderr():
+            buf = b""
             try:
-                for raw in iter(self.process.stderr.readline, ""):
-                    err_q.put(raw)
+                while True:
+                    chunk = self.process.stderr.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        err_q.put(raw.decode("utf-8", "replace"))
             except Exception:
                 pass
+            if buf:
+                err_q.put(buf.decode("utf-8", "replace"))
             err_q.put(None)
 
         drainer = threading.Thread(
