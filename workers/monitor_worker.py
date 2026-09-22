@@ -646,6 +646,11 @@ class StreamMonitor:
         err_path = self.snapshot_dir / "thumb_ffmpeg.err"
         src = self._thumb_udp_url()
 
+        if self.program is not None:
+            vin = "0:p:%d:v" % int(self.program)
+        else:
+            vin = "0:v"
+        fc = "[%s]scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]" % vin
         cmd = [
             "ffmpeg",
             "-y",
@@ -657,8 +662,6 @@ class StreamMonitor:
             "+genpts+discardcorrupt+igndts",
             "-err_detect",
             "ignore_err",
-            "-skip_frame",
-            "nokey",
             "-probesize",
             "2M",
             "-analyzeduration",
@@ -669,17 +672,13 @@ class StreamMonitor:
         cmd.extend(["-i", src])
         if self._thumb_use_max_error_rate:
             cmd.extend(["-max_error_rate", "1.0"])
-        if self.program is not None:
-            cmd.extend(["-map", "0:p:%d:v:0" % int(self.program)])
-        else:
-            cmd.extend(["-map", "0:v:0"])
         cmd.extend(
             [
+                "-filter_complex",
+                fc,
+                "-map",
+                "[vsnap]",
                 "-an",
-                "-vf",
-                "scale=640:-2",
-                "-vsync",
-                "0",
                 "-f",
                 "image2",
                 "-update",
