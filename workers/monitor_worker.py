@@ -385,6 +385,28 @@ class StreamMonitor:
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
+        use_side = self.frame_interval_sec > 0
+        every = max(int(round(float(self.frame_interval_sec) * 12.0)), 10)
+        snap = (
+            "select='not(mod(n\\,%d))',"
+            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
+            % every
+        )
+        if use_side:
+            if dw and dw > 0:
+                v = (
+                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
+                    f"[vs]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            else:
+                v = (
+                    f"[{vin}]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            return f"{v};{audio}"
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -436,9 +458,25 @@ class StreamMonitor:
                 "[aout]",
                 "-f",
                 "null",
-                "-",
+                "/dev/null",
             ]
         )
+        if self.frame_interval_sec > 0:
+            # stdout 走 mjpeg 管道，Python 拆 JPEG；不要用 image2 写文件（直播 TS 常写出 0 字节）
+            cmd.extend(
+                [
+                    "-map",
+                    "[vsnap]",
+                    "-an",
+                    "-c:v",
+                    "mjpeg",
+                    "-q:v",
+                    "5",
+                    "-f",
+                    "mjpeg",
+                    "pipe:1",
+                ]
+            )
         return cmd
 
     # ---------- 心跳状态 ----------
@@ -1079,6 +1117,64 @@ class StreamMonitor:
             time.sleep(0.03 * (attempt + 1))
         return None
 
+    def _write_latest_jpeg(self, data: bytes) -> None:
+        if not data or len(data) < 1024 or not self._is_complete_jpeg(data):
+            return
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.snapshot_dir / (".pipe_%s.tmp.jpg" % self.id)
+        try:
+            with self._latest_lock:
+                tmp.write_bytes(data)
+                os.replace(str(tmp), str(self.latest_frame_path))
+        except OSError as e:
+            self.logger.debug("写 latest.jpg 失败: %s" % e)
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return
+        self._note_media()
+
+    def _drain_mjpeg_stdout(self, proc: subprocess.Popen) -> None:
+        """从 FFmpeg stdout 的 mjpeg 流拆出完整 JPEG，覆盖 latest.jpg。"""
+        buf = bytearray()
+        logged = False
+        stdout = proc.stdout
+        if stdout is None:
+            return
+        try:
+            while self.running and proc.poll() is None:
+                chunk = stdout.read(16384)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                while True:
+                    start = buf.find(b"\xff\xd8")
+                    if start < 0:
+                        if len(buf) > 2 * 1024 * 1024:
+                            del buf[: len(buf) - 1024]
+                        break
+                    end = buf.find(b"\xff\xd9", start + 2)
+                    if end < 0:
+                        if start > 0:
+                            del buf[:start]
+                        break
+                    jpeg = bytes(buf[start : end + 2])
+                    del buf[: end + 2]
+                    self._write_latest_jpeg(jpeg)
+                    if not logged and len(jpeg) > 1024:
+                        self.logger.info(
+                            "[thumb] latest_ok size=%d via=mjpeg_pipe" % len(jpeg)
+                        )
+                        logged = True
+        except Exception as e:
+            self.logger.debug("mjpeg 管道结束: %s" % e)
+        try:
+            stdout.close()
+        except Exception:
+            pass
+
     def _copy_latest_frame(self, dest: Path) -> bool:
         """从旁路 latest.jpg 安全复制到 dest（完整 JPEG 才写入）。"""
         data = self._read_latest_jpeg_bytes()
@@ -1611,11 +1707,16 @@ class StreamMonitor:
         # 界面就会一直「无信号」。用 stdbuf 强制行缓冲。
         wrapped = list(cmd)
         if shutil.which("stdbuf"):
-            wrapped = ["stdbuf", "-oL", "-eL"] + cmd
+            # mjpeg 走 stdout 时不能对 stdout 做行缓冲
+            if self.frame_interval_sec > 0:
+                wrapped = ["stdbuf", "-o0", "-eL"] + cmd
+            else:
+                wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.logger.info("[ffmpeg] %s", " ".join(cmd))
+        use_mjpeg_pipe = self.frame_interval_sec > 0
         self.process = subprocess.Popen(
             wrapped,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if use_mjpeg_pipe else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
@@ -1626,6 +1727,14 @@ class StreamMonitor:
         self._start_thumb_thread()
         run_started = self._run_started_ts
         last_lines = deque(maxlen=12)
+
+        if use_mjpeg_pipe and self.process.stdout is not None:
+            threading.Thread(
+                target=self._drain_mjpeg_stdout,
+                args=(self.process,),
+                name="mjpeg-%s" % self.id,
+                daemon=True,
+            ).start()
 
         assert self.process.stderr is not None
         err_q: "queue.Queue[Optional[str]]" = queue.Queue()
