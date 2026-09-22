@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -336,18 +338,28 @@ class StreamMonitor:
         超时单位：微秒（FFmpeg udp 协议 timeout 选项）。
         """
         url = self._ensure_ingest_url()
-        if "timeout=" in url:
-            return url
         lower = url.lower()
         if not (lower.startswith("udp:") or lower.startswith("rtp:")):
             return url
         timeout_sec = float(self.defaults.get("input_timeout_sec", 15.0))
-        # 本机 fan-out（127.0.0.1 或 udp://@:port）探测需要更长时间
+        # 本机 fan-out 探测需要更长时间
         if "127.0.0.1" in url or "@:" in url:
-            timeout_sec = max(timeout_sec, 30.0)
+            timeout_sec = max(timeout_sec, 45.0)
         timeout_us = int(timeout_sec * 1_000_000)
+        extras = []
+        if "timeout=" not in url:
+            extras.append("timeout=%d" % timeout_us)
+        if "fifo_size=" not in url:
+            # ffmpeg udp fifo_size 单位是 188 字节包个数，默认 7*4096
+            extras.append("fifo_size=65536")
+        if "overrun_nonfatal=" not in url:
+            extras.append("overrun_nonfatal=1")
+        if "buffer_size=" not in url:
+            extras.append("buffer_size=4194304")
+        if not extras:
+            return url
         sep = "&" if "?" in url else "?"
-        return "%s%stimeout=%d" % (url, sep, timeout_us)
+        return url + sep + "&".join(extras)
 
     def _build_filter_complex(self) -> str:
         """
@@ -393,14 +405,15 @@ class StreamMonitor:
         cmd: List[str] = [
             "ffmpeg",
             "-hide_banner",
+            "-nostats",
             "-loglevel",
-            "level+info",
+            "info",
             "-fflags",
-            "+genpts+discardcorrupt",
+            "+genpts+discardcorrupt+igndts",
             "-err_detect",
             "ignore_err",
-            "-rw_timeout",
-            "15000000",
+            "-max_error_rate",
+            "1.0",
         ]
         if is_udp or self.program is not None:
             cmd.extend(
@@ -1384,33 +1397,51 @@ class StreamMonitor:
         self._start_ai_thread()
         self._start_thumb_thread()
         run_started = _now_ts()
+        last_lines = deque(maxlen=12)
 
         assert self.process.stderr is not None
-        while self.running and self.process.poll() is None:
-            # 稳定运行超过 60s 则清零断流计数，避免偶发一次就累计告警
+        err_q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _drain_stderr():
+            try:
+                for raw in iter(self.process.stderr.readline, ""):
+                    err_q.put(raw)
+            except Exception:
+                pass
+            err_q.put(None)
+
+        drainer = threading.Thread(
+            target=_drain_stderr, name="fferr-%s" % self.id, daemon=True
+        )
+        drainer.start()
+
+        while self.running:
             if self.reconnect_count and _now_ts() - run_started >= 60:
                 self.reconnect_count = 0
-            line = self.process.stderr.readline()
-            if line:
-                self._parse_ffmpeg_line(line)
-            else:
+            try:
+                line = err_q.get(timeout=0.5)
+            except queue.Empty:
+                if self.process.poll() is not None and err_q.empty():
+                    break
                 self._flush_pending_alarms()
+                self._maybe_run_ai_inline()
+                self._maybe_heartbeat()
+                continue
+            if line is None:
+                break
+            last_lines.append(line.rstrip())
+            self._parse_ffmpeg_line(line)
             self._maybe_run_ai_inline()
             self._maybe_heartbeat()
 
-        if self.process.stderr:
-            try:
-                for line in self.process.stderr:
-                    if not self.running:
-                        break
-                    if line:
-                        self._parse_ffmpeg_line(line)
-            except Exception:
-                pass
-
         rc = self.process.returncode if self.process else -1
         self.process = None
-        self.logger.info("FFmpeg 退出 code=%s state=%s" % (rc, self._state))
+        self._last_run_sec = _now_ts() - run_started
+        tail = " | ".join([x for x in last_lines if x])[-400:]
+        self.logger.info(
+            "FFmpeg 退出 code=%s lived=%.1fs state=%s %s"
+            % (rc, self._last_run_sec, self._state, tail)
+        )
         return rc if rc is not None else -1
 
     def run(self):
@@ -1422,6 +1453,7 @@ class StreamMonitor:
 
         self.running = True
         delay = self.reconnect_delay
+        self._last_run_sec = 0.0
         self.logger.info(f"监测线程启动: {self.name} ({self.url})")
         self._start_ai_thread()
 
@@ -1431,12 +1463,18 @@ class StreamMonitor:
             except Exception as e:
                 self.logger.error(f"监测异常: {e}")
                 rc = -1
+                self._last_run_sec = 0.0
 
             if not self.running:
                 break
 
             if rc in (-15, -9):
                 break
+
+            # 曾稳定跑过则把退避清零，避免「每 2 分钟闪断却要等 60 秒才重连」
+            if self._last_run_sec >= 45:
+                delay = self.reconnect_delay
+                self.reconnect_count = 0
 
             self.reconnect_count += 1
             self._active_alarms.clear()
