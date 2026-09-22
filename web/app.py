@@ -253,10 +253,11 @@ def _channel_stats(
                 info["status"] = "reconnecting"
             elif worker_state in ("stopped", "disabled"):
                 info["status"] = "offline"
-            elif worker_state == "starting" or not st.get("media_ok", False):
-                info["status"] = "no_signal"
-            elif set(info["active_alarms"] or []) <= {"no_signal"} and (
-                "no_signal" in (info["active_alarms"] or [])
+            elif worker_state == "starting" and not st.get("media_ok", False):
+                info["status"] = "starting"
+            elif not st.get("media_ok", False) or (
+                set(info["active_alarms"] or []) <= {"no_signal"}
+                and "no_signal" in (info["active_alarms"] or [])
             ):
                 info["status"] = "no_signal"
             elif info["active_alarms"]:
@@ -456,7 +457,7 @@ def api_dashboard():
             return "green"
         if st == "alarm":
             return "red"
-        if st in ("offline", "stale", "reconnecting", "no_signal"):
+        if st in ("offline", "stale", "reconnecting", "no_signal", "starting"):
             return "yellow"
         if st == "disabled":
             return "gray"
