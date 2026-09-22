@@ -363,10 +363,10 @@ class StreamMonitor:
 
     def _build_filter_complex(self) -> str:
         """
-        视频：可选 program 选轨 → 降采样 → 规则检测
-        音频：可选 silencedetect；关闭时音频直通，避免误报
+        视频：降采样 → 规则检测；可选按帧序号旁路 latest.jpg
+        音频：可选 silencedetect；关闭时直通
 
-        先保证能稳定监测。latest.jpg 旁路曾导致 FFmpeg 立刻退出、全台断流。
+        旁路用 select=mod(n)（按帧号，不看 PTS），避免 fps 滤镜在组播花 PTS 下不出图。
         """
         vin = self._v_label()
         ain = self._a_label()
@@ -387,6 +387,29 @@ class StreamMonitor:
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
+        use_side = self.frame_interval_sec > 0
+        every = max(int(round(float(self.frame_interval_sec) * 12.0)), 10)
+        snap = (
+            "fifo,select='not(mod(n\\,%d))',"
+            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
+            % every
+        )
+        if use_side:
+            if dw and dw > 0:
+                v = (
+                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
+                    f"[vs]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            else:
+                v = (
+                    f"[{vin}]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            return f"{v};{audio}"
+
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -397,7 +420,7 @@ class StreamMonitor:
         return f"{v};{audio}"
 
     def _build_ffmpeg_cmd(self) -> List[str]:
-        """单进程规则检测；MPTS 用 program 选节目。"""
+        """规则检测；frame_interval>0 时同一解码器旁路写 latest.jpg。"""
         fc = self._build_filter_complex()
         ingest = self._input_url_with_timeout()
         is_udp = ingest.lower().startswith("udp:")
@@ -426,12 +449,26 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
+        cmd.extend(["-i", ingest, "-filter_complex", fc])
+        if self.frame_interval_sec > 0:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            cmd.extend(
+                [
+                    "-map",
+                    "[vsnap]",
+                    "-an",
+                    "-f",
+                    "image2",
+                    "-update",
+                    "1",
+                    "-q:v",
+                    "5",
+                    "-y",
+                    str(self.latest_frame_path),
+                ]
+            )
         cmd.extend(
             [
-                "-i",
-                ingest,
-                "-filter_complex",
-                fc,
                 "-map",
                 "[vout]",
                 "-map",
@@ -1014,13 +1051,17 @@ class StreamMonitor:
             except OSError:
                 pass
 
-        # 旁路 latest 仅在非常新时用；否则后台抽关键帧（减少花屏）
+        # 实时 latest 够新则直接复制（黑场/静帧/AI）；无伴音也可留一张当时画面
         age = self._latest_frame_age()
+        max_age = max(float(self.frame_interval_sec) * 2.5, 3.0)
+        visual = event_type in ("black", "freeze") or str(event_type).startswith(
+            "ai_"
+        )
         prefer = (
             self.snapshot_prefer_latest
             and age is not None
-            and age <= 1.2
-            and event_type in ("black", "freeze")
+            and age <= max_age
+            and (visual or event_type == "silence")
         )
         if prefer and self._copy_latest_frame(out_path):
             try:
@@ -1032,14 +1073,25 @@ class StreamMonitor:
                 pass
             _unlink_quiet(out_path)
 
+        if not visual:
+            return None
+
         def _bg():
             with self._snapshot_lock:
                 if self._snapshot_inflight:
                     return
                 self._snapshot_inflight = True
             try:
-                # 稍等半秒再抽，降低告警瞬间坏帧概率
                 time.sleep(0.5)
+                if self._copy_latest_frame(out_path):
+                    try:
+                        if out_path.stat().st_size >= 8 * 1024:
+                            self.logger.info(f"截图已保存(旁路延迟): {out_path}")
+                            self._prune_snapshots()
+                            return
+                    except OSError:
+                        pass
+                    _unlink_quiet(out_path)
                 if self._grab_frame_ffmpeg(out_path, quality=3, keyframe_only=True):
                     try:
                         if out_path.stat().st_size < 8 * 1024:
@@ -1080,10 +1132,12 @@ class StreamMonitor:
             return
         self._active_alarms[alarm_key] = now
         self._cooldown_until[alarm_key] = now + self.alarm_cooldown_sec
+        if self.save_snapshot:
+            snap = self._take_snapshot(event["type"])
+            if snap:
+                event["snapshot"] = str(snap)
         self.logger.warning(json.dumps(event, ensure_ascii=False))
         self._save_event(event)
-        if self.save_snapshot:
-            self._take_snapshot(event["type"])
         self._write_status()
 
     def _flush_pending_alarms(self):
