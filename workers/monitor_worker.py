@@ -385,28 +385,6 @@ class StreamMonitor:
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
-        use_side = self.frame_interval_sec > 0
-        every = max(int(round(float(self.frame_interval_sec) * 12.0)), 10)
-        snap = (
-            "select='not(mod(n\\,%d))',"
-            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
-            % every
-        )
-        if use_side:
-            if dw and dw > 0:
-                v = (
-                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
-                    f"[vs]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            else:
-                v = (
-                    f"[{vin}]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            return f"{v};{audio}"
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -446,26 +424,12 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
-        cmd.extend(["-i", ingest, "-filter_complex", fc])
-        if self.frame_interval_sec > 0:
-            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            cmd.extend(
-                [
-                    "-map",
-                    "[vsnap]",
-                    "-an",
-                    "-f",
-                    "image2",
-                    "-update",
-                    "1",
-                    "-q:v",
-                    "5",
-                    "-y",
-                    str(self.latest_frame_path),
-                ]
-            )
         cmd.extend(
             [
+                "-i",
+                ingest,
+                "-filter_complex",
+                fc,
                 "-map",
                 "[vout]",
                 "-map",
@@ -667,11 +631,7 @@ class StreamMonitor:
         """截图专用本机 UDP（与监测分端口，保留数据报边界）。"""
         self._ensure_ingest_url()
         src = self._thumb_url or self._ingest_url or self.url
-        # 不要加短 timeout，否则长驻截图会被误杀；fifo 防抖
-        if src.lower().startswith("udp:"):
-            if "fifo_size=" not in src:
-                sep = "&" if "?" in src else "?"
-                src = "%s%sfifo_size=5000000&overrun_nonfatal=1" % (src, sep)
+        # 不要加 fifo_size（会把 TS 探测搞死）；也不要短 timeout
         return src
 
     def _start_live_thumb_ffmpeg(self):
@@ -700,10 +660,11 @@ class StreamMonitor:
             "ignore_err",
             "-use_wallclock_as_timestamps",
             "1",
+            "-nostats",
             "-probesize",
-            "8M",
+            "2M",
             "-analyzeduration",
-            "5M",
+            "2M",
         ]
         if src.lower().startswith("udp:"):
             cmd.extend(["-f", "mpegts"])
@@ -732,13 +693,15 @@ class StreamMonitor:
         )
 
         err_f = open(str(err_path), "w")
+        wrapped = list(cmd)
+        if shutil.which("stdbuf"):
+            wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.logger.info(
             "[thumb] start udp_live -> %s src=%s program=%s"
             % (out, src, self.program)
         )
-        # stderr 必须落到文件，PIPE 不读会堵死 FFmpeg
         proc = subprocess.Popen(
-            cmd,
+            wrapped,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=err_f,
@@ -841,14 +804,15 @@ class StreamMonitor:
                     continue
 
                 if self._capture_key:
-                    # 不再另起 udp_live：多路二次解码会把 AF_PACKET 拖垮（skip 远大于 pkts）
-                    if int(waited) % 15 == 0:
-                        self.logger.info(
-                            "[thumb] wait_main t=%.0fs (main ffmpeg JPEG only)"
-                            % waited
-                        )
-                    time.sleep(1.0)
-                    waited += 1.0
+                    try:
+                        self.logger.info("[thumb] start udp_live decoder")
+                        self._start_live_thumb_ffmpeg()
+                    except Exception as e:
+                        self.logger.warning("[thumb] udp_live_fail: %s" % e)
+                        self._stop_thumb_proc()
+                        time.sleep(3.0)
+                    waited = 0.0
+                    time.sleep(2.0)
                     continue
 
                 # 无 iface：退回周期性抽帧

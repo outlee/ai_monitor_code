@@ -578,8 +578,7 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
     """
     Returns (monitor_url, thumb_url).
 
-    只分配监测 UDP 口。截图由主 FFmpeg 旁路写 latest.jpg，不再为每路
-    再开一个 thumb 口/解码器（dests 翻倍会把 AF_PACKET 拖垮）。
+    监测与截图分两个本机 UDP 口，避免截图 FFmpeg 绑监测口抢包。
     """
     key = (iface, group, int(port))
     with _lock:
@@ -611,11 +610,17 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
         if consumer_id in hub["ports"]:
             item = hub["ports"][consumer_id]
             mon = item["mon"]
-            return (_listen_url(mon), _listen_url(mon))
+            thumb = item.get("thumb") or mon
+            if thumb == mon or "thumb" not in item:
+                thumb = _free_udp_port()
+                with hub["dest_lock"]:
+                    item["thumb"] = thumb
+            return (_listen_url(mon), _listen_url(thumb))
 
         mon = _free_udp_port()
+        thumb = _free_udp_port()
         with hub["dest_lock"]:
-            hub["ports"][consumer_id] = {"mon": mon}
+            hub["ports"][consumer_id] = {"mon": mon, "thumb": thumb}
 
         if hub["thread"] is None or not hub["thread"].is_alive():
             hub["stop"] = False
@@ -632,10 +637,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture %s mon=@:%d consumers=%d"
-                % (consumer_id, mon, len(hub["ports"]))
+                "iface capture %s mon=@:%d thumb=@:%d consumers=%d"
+                % (consumer_id, mon, thumb, len(hub["ports"]))
             )
-        return (_listen_url(mon), _listen_url(mon))
+        return (_listen_url(mon), _listen_url(thumb))
 
 
 def release(iface, group, port, consumer_id, logger=None):
