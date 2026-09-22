@@ -476,10 +476,23 @@ def _capture_loop(hub):
         try:
             ifindex = socket.if_nametoindex(iface)
             mreq = struct.pack("IHH8s", ifindex, 1, 0, b"\x00" * 8)  # PROMISC
-            raw.setsockopt(socket.SOL_PACKET, 1, mreq)
+            # CentOS 自带 Python 可能没有 socket.SOL_PACKET（值为 263）
+            sol_packet = getattr(socket, "SOL_PACKET", 263)
+            raw.setsockopt(sol_packet, 1, mreq)
         except Exception as e:
             if logger:
-                logger.warning("promisc skip: %s" % e)
+                logger.warning("packet promisc skip: %s" % e)
+        try:
+            import subprocess as _sp
+
+            _sp.call(
+                ["ip", "link", "set", "dev", iface, "promisc", "on"],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+            )
+        except Exception as e:
+            if logger:
+                logger.warning("ip promisc skip: %s" % e)
         # BPF 在部分网卡/VLAN 卸载场景会把组播全部滤掉 → 全频道断流。
         # 先不挂 BPF，仍靠用户态匹配 group:port（skip 会偏大，但能收到流）。
         if logger:
@@ -496,6 +509,22 @@ def _capture_loop(hub):
                 raw.settimeout(1.0)
                 frame = raw.recv(65535)
             except socket.timeout:
+                now = time.time()
+                if logger and now - last >= 30:
+                    with hub["dest_lock"]:
+                        nd = len(list(_all_local_ports(hub)))
+                    logger.info(
+                        "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d"
+                        % (
+                            group,
+                            mport,
+                            n,
+                            n / max(now - t0, 1e-6),
+                            nd,
+                            n_skip,
+                        )
+                    )
+                    last = now
                 continue
             except Exception:
                 if hub["stop"]:
