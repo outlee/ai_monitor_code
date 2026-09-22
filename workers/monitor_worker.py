@@ -386,12 +386,8 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        every = max(int(round(float(self.frame_interval_sec) * 12.0)), 10)
-        snap = (
-            "select='not(mod(n\\,%d))',"
-            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
-            % every
-        )
+        # 不在滤镜里 fps/select：组播 PTS 乱时不吐帧。全帧 scale 后由 Python 限速落盘。
+        snap = "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
         if use_side:
             if dw and dw > 0:
                 v = (
@@ -1140,6 +1136,8 @@ class StreamMonitor:
         """从 FFmpeg stdout 的 mjpeg 流拆出完整 JPEG，覆盖 latest.jpg。"""
         buf = bytearray()
         logged = False
+        last_save = 0.0
+        interval = max(float(self.frame_interval_sec), 1.0)
         stdout = proc.stdout
         if stdout is None:
             return
@@ -1162,7 +1160,11 @@ class StreamMonitor:
                         break
                     jpeg = bytes(buf[start : end + 2])
                     del buf[: end + 2]
+                    now = time.time()
+                    if now - last_save < interval:
+                        continue
                     self._write_latest_jpeg(jpeg)
+                    last_save = now
                     if not logged and len(jpeg) > 1024:
                         self.logger.info(
                             "[thumb] latest_ok size=%d via=mjpeg_pipe" % len(jpeg)
