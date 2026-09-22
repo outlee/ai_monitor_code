@@ -188,6 +188,9 @@ class StreamMonitor:
         self.reconnect_count = 0
         self._last_heartbeat_ts = 0.0
         self._last_ffmpeg_activity_ts = 0.0
+        self._last_media_ts = 0.0
+        self._run_started_ts = 0.0
+
         self._state = "init"
         self._active_alarms: Dict[str, float] = {}  # type -> start_ts
         self._status_lock = threading.Lock()
@@ -510,6 +513,8 @@ class StreamMonitor:
             "last_heartbeat": _now_str(),
             "last_heartbeat_ts": _now_ts(),
             "last_ffmpeg_activity_ts": self._last_ffmpeg_activity_ts or None,
+            "last_media_ts": self._last_media_ts or None,
+            "media_ok": self._media_ok(),
             "reconnect_count": self.reconnect_count,
             "active_alarms": list(self._active_alarms.keys()),
             "detect_width": self.detect_width,
@@ -542,7 +547,61 @@ class StreamMonitor:
         except OSError as e:
             self.logger.debug(f"写心跳失败: {e}")
 
+    def _media_timeout_sec(self) -> float:
+        return max(float(self.defaults.get("input_timeout_sec", 15.0)), 20.0)
+
+    def _media_ok(self) -> bool:
+        if not self._last_media_ts:
+            return False
+        return (_now_ts() - self._last_media_ts) <= self._media_timeout_sec()
+
+    def _note_media(self):
+        first = not self._last_media_ts
+        self._last_media_ts = _now_ts()
+        if "no_signal" in self._active_alarms:
+            start_ts = self._active_alarms.pop("no_signal", None)
+            ev = {
+                "type": "no_signal_end",
+                "phase": "end",
+                "channel_id": self.id,
+                "channel_name": self.name,
+                "message": "节目信号恢复",
+                "time": _now_str(),
+            }
+            if start_ts:
+                ev["duration"] = round(_now_ts() - start_ts, 3)
+            self.logger.info(json.dumps(ev, ensure_ascii=False))
+            self._save_event(ev)
+        if first or self._state == "starting":
+            self.logger.info("已解到音视频")
+            self._write_status("running")
+
+    def _check_no_signal(self):
+        if self._state not in ("running", "starting"):
+            return
+        if self._media_ok():
+            return
+        started = getattr(self, "_run_started_ts", 0.0) or _now_ts()
+        wait = _now_ts() - (self._last_media_ts or started)
+        if wait <= self._media_timeout_sec():
+            return
+        if "no_signal" in self._active_alarms:
+            return
+        self._active_alarms["no_signal"] = _now_ts()
+        ev = {
+            "type": "no_signal",
+            "phase": "start",
+            "channel_id": self.id,
+            "channel_name": self.name,
+            "message": "未解到节目流（网卡无载波或无组播数据）",
+            "time": _now_str(),
+        }
+        self.logger.warning(json.dumps(ev, ensure_ascii=False))
+        self._save_event(ev)
+        self._write_status()
+
     def _maybe_heartbeat(self):
+        self._check_no_signal()
         if _now_ts() - self._last_heartbeat_ts >= self.heartbeat_interval:
             self._write_status()
 
@@ -1205,6 +1264,17 @@ class StreamMonitor:
         self._last_ffmpeg_activity_ts = _now_ts()
         now = _now_str()
         lower = line.lower()
+        # 真正解到流的标志，不含 Packet corrupt / 打开失败
+        if (
+            "stream mapping" in lower
+            or "video:" in lower
+            or "audio:" in lower
+            or "black_start" in lower
+            or "freeze_start" in lower
+            or "silence_start" in lower
+            or lower.startswith("frame=")
+        ):
+            self._note_media()
 
         # 按类型检查；同一行可先后发出 start 与 end
         pairs = []
@@ -1447,10 +1517,12 @@ class StreamMonitor:
             universal_newlines=True,
             bufsize=1,
         )
-        self._write_status("running")
+        self._last_media_ts = 0.0
+        self._run_started_ts = _now_ts()
+        self._write_status("starting")
         self._start_ai_thread()
         self._start_thumb_thread()
-        run_started = _now_ts()
+        run_started = self._run_started_ts
         last_lines = deque(maxlen=12)
 
         assert self.process.stderr is not None

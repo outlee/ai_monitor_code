@@ -176,7 +176,7 @@ def _is_alarm_event_type(t: Optional[str]) -> bool:
         return False
     if t.endswith("_end"):
         return False
-    if t in ("stream_down",):
+    if t in ("stream_down", "no_signal"):
         return True
     if t.startswith("ai_"):
         return True
@@ -190,8 +190,9 @@ def _channel_stats(
 ) -> List[Dict]:
     """
     状态优先级：
-    disabled > offline/stale > reconnecting > alarm > ok > unknown
+    disabled > offline/stale > no_signal/reconnecting > alarm > ok > unknown
     心跳来自 logs/status/<id>.json（Worker 写入）。
+    「running」且未解到音视频时不得标为正常。
     """
     now = time.time()
     by_ch: Dict[str, Dict] = {}
@@ -254,9 +255,9 @@ def _channel_stats(
                 info["status"] = "offline"
             elif info["active_alarms"]:
                 info["status"] = "alarm"
-            elif worker_state in ("running", "starting"):
-                # 最近事件是开始类告警且尚未被 end 清掉 active 时已覆盖；
-                # 无 active 则视为正常
+            elif worker_state == "starting" or not st.get("media_ok", False):
+                info["status"] = "no_signal"
+            elif worker_state in ("running",):
                 info["status"] = "ok"
             else:
                 info["status"] = "unknown"
@@ -334,7 +335,9 @@ def api_overview():
     stats = _channel_stats(channels, events, stale_sec=stale_sec)
     alarm_count = sum(1 for s in stats if s["status"] == "alarm")
     offline_count = sum(
-        1 for s in stats if s["status"] in ("offline", "stale", "reconnecting")
+        1
+        for s in stats
+        if s["status"] in ("offline", "stale", "reconnecting", "no_signal")
     )
     enabled_count = sum(1 for c in channels if c.get("enabled", True))
 
@@ -449,7 +452,7 @@ def api_dashboard():
             return "green"
         if st == "alarm":
             return "red"
-        if st in ("offline", "stale", "reconnecting"):
+        if st in ("offline", "stale", "reconnecting", "no_signal"):
             return "yellow"
         if st == "disabled":
             return "gray"

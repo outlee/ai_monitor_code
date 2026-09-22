@@ -26,6 +26,8 @@
     freeze: "静帧",
     silence: "无伴音",
     stream_down: "断流",
+    no_signal: "无信号",
+    no_signal_end: "信号恢复",
     black_end: "黑场恢复",
     freeze_end: "静帧恢复",
     silence_end: "伴音恢复",
@@ -316,6 +318,8 @@
       offline: "离线",
       stale: "心跳超时",
       reconnecting: "重连中",
+      no_signal: "无信号",
+      starting: "探测中",
     };
     return map[status] || "未知";
   }
@@ -329,6 +333,8 @@
       offline: ["离线", "offline"],
       stale: ["心跳超时", "stale"],
       reconnecting: ["重连中", "reconnecting"],
+      no_signal: ["无信号", "reconnecting"],
+      starting: ["探测中", "reconnecting"],
     };
     const [text, cls] = map[status] || map.unknown;
     return `<span class="badge ${cls}">${text}</span>`;
