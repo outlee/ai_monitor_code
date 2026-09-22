@@ -18,6 +18,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import select
 import logging
 import os
 import queue
@@ -468,6 +469,10 @@ class StreamMonitor:
                     "mjpeg",
                     "-q:v",
                     "5",
+                    "-vsync",
+                    "0",
+                    "-flush_packets",
+                    "1",
                     "-f",
                     "mjpeg",
                     "pipe:1",
@@ -1137,16 +1142,40 @@ class StreamMonitor:
         buf = bytearray()
         logged = False
         last_save = 0.0
+        last_dbg = time.time()
         interval = max(float(self.frame_interval_sec), 1.0)
         stdout = proc.stdout
         if stdout is None:
+            self.logger.warning("[thumb] mjpeg stdout is None")
             return
+        got = 0
+        self.logger.info("[thumb] mjpeg drain started")
         try:
             while self.running and proc.poll() is None:
+                try:
+                    ready, _, _ = select.select([stdout], [], [], 2.0)
+                except (ValueError, OSError):
+                    break
+                if not ready:
+                    now = time.time()
+                    if now - last_dbg >= 15 and not logged:
+                        self.logger.info(
+                            "[thumb] mjpeg_pipe bytes=%d buf=%d (idle)"
+                            % (got, len(buf))
+                        )
+                        last_dbg = now
+                    continue
                 chunk = stdout.read(16384)
                 if not chunk:
                     break
+                got += len(chunk)
                 buf.extend(chunk)
+                now = time.time()
+                if now - last_dbg >= 15 and not logged:
+                    self.logger.info(
+                        "[thumb] mjpeg_pipe bytes=%d buf=%d" % (got, len(buf))
+                    )
+                    last_dbg = now
                 while True:
                     start = buf.find(b"\xff\xd8")
                     if start < 0:
