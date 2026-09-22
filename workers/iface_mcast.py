@@ -27,9 +27,8 @@ _hubs = {}
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 
-# Debug / fallback snapshot size
-_DEFAULT_RING_BYTES = 24 * 1024 * 1024
-# Per-thumb stdin queue cap (drop oldest when full)
+# ~2–4s of HD/MPTS for one-shot keyframe extract
+_DEFAULT_RING_BYTES = 8 * 1024 * 1024
 _DEFAULT_FEEDER_BYTES = 4 * 1024 * 1024
 
 
@@ -54,39 +53,35 @@ def align_ts_sync(data):
 
 
 class _TsRing(object):
-    """Thread-safe byte ring, trimmed on 188-byte TS boundaries when possible."""
+    """Packet deque ring; snapshot joins bytes. Avoids O(n) bytearray cuts."""
 
     def __init__(self, maxlen=_DEFAULT_RING_BYTES):
         self.maxlen = int(maxlen)
-        self._buf = bytearray()
+        self._q = collections.deque()
+        self._nbytes = 0
         self._lock = threading.Lock()
         self.packets = 0
-        self.bytes_in = 0
 
     def write(self, data):
         if not data:
             return
         with self._lock:
-            self._buf.extend(data)
+            self._q.append(data)
+            self._nbytes += len(data)
             self.packets += 1
-            self.bytes_in += len(data)
-            if len(self._buf) > self.maxlen:
-                excess = len(self._buf) - self.maxlen
-                cut = excess
-                aligned = (excess // 188) * 188
-                if aligned >= 188:
-                    cut = aligned
-                del self._buf[:cut]
+            while self._nbytes > self.maxlen and self._q:
+                old = self._q.popleft()
+                self._nbytes -= len(old)
 
     def snapshot(self, min_bytes=0):
         with self._lock:
-            if len(self._buf) < int(min_bytes):
+            if self._nbytes < int(min_bytes):
                 return None
-            return bytes(self._buf)
+            return b"".join(self._q)
 
     def size(self):
         with self._lock:
-            return len(self._buf)
+            return self._nbytes
 
 
 class TsFeeder(object):
@@ -513,8 +508,13 @@ def _capture_loop(hub):
                 if logger and now - last >= 30:
                     with hub["dest_lock"]:
                         nd = len(list(_all_local_ports(hub)))
+                    rsz = 0
+                    try:
+                        rsz = hub.get("ring").size() if hub.get("ring") else 0
+                    except Exception:
+                        pass
                     logger.info(
-                        "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d"
+                        "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
                         % (
                             group,
                             mport,
@@ -522,6 +522,7 @@ def _capture_loop(hub):
                             n / max(now - t0, 1e-6),
                             nd,
                             n_skip,
+                            int(rsz / 1024),
                         )
                     )
                     last = now
@@ -535,6 +536,12 @@ def _capture_loop(hub):
             if not payload:
                 n_skip += 1
                 continue
+            ring = hub.get("ring")
+            if ring is not None:
+                try:
+                    ring.write(payload)
+                except Exception:
+                    pass
             with hub["dest_lock"]:
                 dests = list(_all_local_ports(hub))
             for lp in dests:
@@ -545,8 +552,13 @@ def _capture_loop(hub):
             n += 1
             now = time.time()
             if logger and now - last >= 30:
+                rsz = 0
+                try:
+                    rsz = hub.get("ring").size() if hub.get("ring") else 0
+                except Exception:
+                    pass
                 logger.info(
-                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d"
+                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
                     % (
                         group,
                         mport,
@@ -554,6 +566,7 @@ def _capture_loop(hub):
                         n / max(now - t0, 1e-6),
                         len(dests),
                         n_skip,
+                        int(rsz / 1024),
                     )
                 )
                 last = now
@@ -578,8 +591,9 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
     """
     Returns (monitor_url, thumb_url).
 
-    监测与截图分两个本机 UDP 口，避免截图 FFmpeg 绑监测口抢包。
+    只分配监测 UDP 口。截图从 TS ring 落盘后一次性抽帧。
     """
+
     key = (iface, group, int(port))
     with _lock:
         hub = _hubs.get(key)
@@ -610,17 +624,11 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
         if consumer_id in hub["ports"]:
             item = hub["ports"][consumer_id]
             mon = item["mon"]
-            thumb = item.get("thumb") or mon
-            if thumb == mon or "thumb" not in item:
-                thumb = _free_udp_port()
-                with hub["dest_lock"]:
-                    item["thumb"] = thumb
-            return (_listen_url(mon), _listen_url(thumb))
+            return (_listen_url(mon), _listen_url(mon))
 
         mon = _free_udp_port()
-        thumb = _free_udp_port()
         with hub["dest_lock"]:
-            hub["ports"][consumer_id] = {"mon": mon, "thumb": thumb}
+            hub["ports"][consumer_id] = {"mon": mon}
 
         if hub["thread"] is None or not hub["thread"].is_alive():
             hub["stop"] = False
@@ -637,10 +645,10 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
         if logger:
             logger.info(
-                "iface capture %s mon=@:%d thumb=@:%d consumers=%d"
-                % (consumer_id, mon, thumb, len(hub["ports"]))
+                "iface capture %s mon=@:%d ring=on consumers=%d"
+                % (consumer_id, mon, len(hub["ports"]))
             )
-        return (_listen_url(mon), _listen_url(thumb))
+        return (_listen_url(mon), _listen_url(mon))
 
 
 def release(iface, group, port, consumer_id, logger=None):
