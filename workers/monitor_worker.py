@@ -385,6 +385,28 @@ class StreamMonitor:
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
+        use_side = self.frame_interval_sec > 0
+        every = max(int(round(float(self.frame_interval_sec) * 12.0)), 10)
+        snap = (
+            "select='not(mod(n\\,%d))',"
+            "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
+            % every
+        )
+        if use_side:
+            if dw and dw > 0:
+                v = (
+                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
+                    f"[vs]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            else:
+                v = (
+                    f"[{vin}]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            return f"{v};{audio}"
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -424,12 +446,26 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
+        cmd.extend(["-i", ingest, "-filter_complex", fc])
+        if self.frame_interval_sec > 0:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            cmd.extend(
+                [
+                    "-map",
+                    "[vsnap]",
+                    "-an",
+                    "-f",
+                    "image2",
+                    "-update",
+                    "1",
+                    "-q:v",
+                    "5",
+                    "-y",
+                    str(self.latest_frame_path),
+                ]
+            )
         cmd.extend(
             [
-                "-i",
-                ingest,
-                "-filter_complex",
-                fc,
                 "-map",
                 "[vout]",
                 "-map",
