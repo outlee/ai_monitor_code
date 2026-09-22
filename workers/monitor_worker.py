@@ -417,9 +417,9 @@ class StreamMonitor:
             cmd.extend(
                 [
                     "-probesize",
-                    "8M",
+                    "2M",
                     "-analyzeduration",
-                    "5M",
+                    "2M",
                 ]
             )
         if is_udp:
@@ -550,7 +550,9 @@ class StreamMonitor:
             return
         started = getattr(self, "_run_started_ts", 0.0) or _now_ts()
         wait = _now_ts() - (self._last_media_ts or started)
-        if wait <= self._media_timeout_sec():
+        # 启动探测 MPTS 可能需要较长时间，不要 20s 就标无信号
+        grace = 90.0 if self._state == "starting" else self._media_timeout_sec()
+        if wait <= grace:
             return
         if "no_signal" in self._active_alarms:
             return
@@ -1480,9 +1482,14 @@ class StreamMonitor:
             f"detect_width={self.detect_width} "
             f"frame_interval={self.frame_interval_sec}s"
         )
+        # 管道不是 TTY 时 glibc 会块缓冲 stderr，Stream 信息要等退出才刷出，
+        # 界面就会一直「无信号」。用 stdbuf 强制行缓冲。
+        wrapped = list(cmd)
+        if shutil.which("stdbuf"):
+            wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.logger.info("[ffmpeg] %s", " ".join(cmd))
         self.process = subprocess.Popen(
-            cmd,
+            wrapped,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
