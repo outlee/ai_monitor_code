@@ -253,10 +253,14 @@ def _channel_stats(
                 info["status"] = "reconnecting"
             elif worker_state in ("stopped", "disabled"):
                 info["status"] = "offline"
-            elif info["active_alarms"]:
-                info["status"] = "alarm"
             elif worker_state == "starting" or not st.get("media_ok", False):
                 info["status"] = "no_signal"
+            elif set(info["active_alarms"] or []) <= {"no_signal"} and (
+                "no_signal" in (info["active_alarms"] or [])
+            ):
+                info["status"] = "no_signal"
+            elif info["active_alarms"]:
+                info["status"] = "alarm"
             elif worker_state in ("running",):
                 info["status"] = "ok"
             else:
