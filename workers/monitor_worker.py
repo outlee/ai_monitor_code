@@ -553,6 +553,16 @@ class StreamMonitor:
         if age is not None and age <= self._media_timeout_sec():
             self._note_media()
             return
+        # 进程还在且持续有 demux 日志（Packet corrupt 也算在收 TS）
+        if (
+            self.process is not None
+            and self.process.poll() is None
+            and self._last_ffmpeg_activity_ts
+            and (_now_ts() - self._last_ffmpeg_activity_ts) < 15
+            and (_now_ts() - (self._run_started_ts or 0)) > 20
+        ):
+            self._note_media()
+            return
         started = getattr(self, "_run_started_ts", 0.0) or _now_ts()
         wait = _now_ts() - (self._last_media_ts or started)
         # 启动探测 MPTS 可能需要较长时间，不要 20s 就标无信号
@@ -1241,7 +1251,9 @@ class StreamMonitor:
         # 真正解到流的标志，不含 Packet corrupt / 打开失败
         if (
             "stream mapping" in lower
+            or "stream map" in lower
             or "stream #" in lower
+            or "input #0" in lower
             or "video:" in lower
             or "audio:" in lower
             or "h264" in lower
@@ -1250,6 +1262,8 @@ class StreamMonitor:
             or "black_start" in lower
             or "freeze_start" in lower
             or "silence_start" in lower
+            or "packet corrupt" in lower
+            or "mpegts" in lower
             or lower.startswith("frame=")
         ):
             self._note_media()
