@@ -666,13 +666,13 @@ class StreamMonitor:
             self.logger.warning("写 TS ring 失败: %s" % e)
             return False
 
-        maps = []
+        map_list = []
         if self.program is not None:
-            maps = ["-map", "0:p:%d:v:0" % int(self.program)]
-        else:
-            maps = ["-map", "0:v:0"]
+            map_list.append(["-map", "0:p:%d:v:0" % int(self.program)])
+            map_list.append(["-map", "0:p:%d:v" % int(self.program)])
+        map_list.append(["-map", "0:v:0"])
 
-        def _run(skip_key, ss):
+        def _run(maps, skip_key, ss):
             try:
                 if jpg_tmp.is_file():
                     jpg_tmp.unlink()
@@ -685,13 +685,13 @@ class StreamMonitor:
                 "-loglevel",
                 "error",
                 "-fflags",
-                "+genpts+discardcorrupt+igndts",
+                "+genpts+discardcorrupt",
                 "-err_detect",
                 "ignore_err",
                 "-probesize",
-                "4M",
+                "8M",
                 "-analyzeduration",
-                "2M",
+                "5M",
             ]
             if skip_key:
                 cmd.extend(["-skip_frame", "nokey"])
@@ -728,8 +728,13 @@ class StreamMonitor:
         last_err = ""
         ok = False
         try:
-            for skip_key, ss in ((True, "0.5"), (False, "0.8"), (False, None)):
-                ok, last_err = _run(skip_key, ss)
+            attempts = []
+            for maps in map_list:
+                attempts.append((maps, True, "0.8"))
+            attempts.append((map_list[-1], False, "1.2"))
+            attempts.append((map_list[-1], False, None))
+            for maps, skip_key, ss in attempts:
+                ok, last_err = _run(maps, skip_key, ss)
                 if ok:
                     break
             if ok:
@@ -739,9 +744,20 @@ class StreamMonitor:
                 "[thumb] ring_grab fail ring=%dKB program=%s %s"
                 % (int(len(data) / 1024), self.program, last_err or "no frame")
             )
+            try:
+                dbg = self.snapshot_dir / "debug_ring.ts"
+                if (not dbg.is_file()) or (
+                    time.time() - dbg.stat().st_mtime > 60
+                ):
+                    os.replace(str(ts_path), str(dbg))
+                    ts_path = None
+            except OSError:
+                pass
             return False
         finally:
             for p in (ts_path, jpg_tmp):
+                if p is None:
+                    continue
                 try:
                     if p.is_file():
                         p.unlink()
