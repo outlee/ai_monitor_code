@@ -390,7 +390,7 @@ class StreamMonitor:
         use_side = self.frame_interval_sec > 0
         every = max(int(round(float(self.frame_interval_sec) * 12.0)), 10)
         snap = (
-            "fifo,select='not(mod(n\\,%d))',"
+            "select='not(mod(n\\,%d))',"
             "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
             % every
         )
