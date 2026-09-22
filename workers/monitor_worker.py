@@ -509,8 +509,11 @@ class StreamMonitor:
         return max(float(self.defaults.get("input_timeout_sec", 15.0)), 20.0)
 
     def _media_ok(self) -> bool:
-        if self._last_media_ts and (
-            (_now_ts() - self._last_media_ts) <= self._media_timeout_sec()
+        # -nostats 时解到流后几乎不再打 Video: 行；只要进程还在且曾经解到过，就算有信号
+        if (
+            self._last_media_ts
+            and self.process is not None
+            and self.process.poll() is None
         ):
             return True
         age = self._latest_frame_age()
@@ -542,11 +545,13 @@ class StreamMonitor:
     def _check_no_signal(self):
         if self._state not in ("running", "starting"):
             return
+        if self._media_ok():
+            if "no_signal" in self._active_alarms:
+                self._note_media()
+            return
         age = self._latest_frame_age()
         if age is not None and age <= self._media_timeout_sec():
             self._note_media()
-            return
-        if self._media_ok():
             return
         started = getattr(self, "_run_started_ts", 0.0) or _now_ts()
         wait = _now_ts() - (self._last_media_ts or started)
