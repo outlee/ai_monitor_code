@@ -1069,7 +1069,6 @@ class StreamMonitor:
             "-q",
             "fdsrc",
             "fd=0",
-            "do-timestamp=true",
             "!",
             "tsdemux",
         ]
@@ -1085,10 +1084,6 @@ class StreamMonitor:
             "videoscale",
             "!",
             "video/x-raw,width=640,height=360",
-            "!",
-            "videorate",
-            "!",
-            "video/x-raw,framerate=1/4",
             "!",
             "jpegenc",
             "quality=80",
