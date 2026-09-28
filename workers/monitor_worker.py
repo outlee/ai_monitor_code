@@ -462,7 +462,7 @@ class StreamMonitor:
             ]
         )
         if self.frame_interval_sec > 0:
-            # stdout 走 mjpeg 管道，Python 拆 JPEG；不要用 image2 写文件（直播 TS 常写出 0 字节）
+            fifo = self._ensure_mjpeg_fifo()
             cmd.extend(
                 [
                     "-map",
@@ -478,7 +478,7 @@ class StreamMonitor:
                     "1",
                     "-f",
                     "mjpeg",
-                    "pipe:1",
+                    str(fifo),
                 ]
             )
         return cmd
@@ -1217,14 +1217,29 @@ class StreamMonitor:
         self._latest_valid = True
         self._note_media()
 
-    def _drain_mjpeg_stdout(self, proc: subprocess.Popen) -> None:
-        """从 FFmpeg stdout 的 mjpeg 流拆出完整 JPEG，覆盖 latest.jpg。"""
+    def _ensure_mjpeg_fifo(self) -> Path:
+        import stat as _stat
+
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        p = self.snapshot_dir / "live.mjpeg"
+        try:
+            if p.exists() and not _stat.S_ISFIFO(p.stat().st_mode):
+                p.unlink()
+        except OSError:
+            pass
+        if not p.exists():
+            os.mkfifo(str(p), 0o600)
+        return p
+
+    def _drain_mjpeg_stdout(self, proc: subprocess.Popen, stdout=None) -> None:
+        """从 FFmpeg mjpeg 流拆出完整 JPEG，覆盖 latest.jpg。"""
         buf = bytearray()
         logged = False
         last_save = 0.0
         last_dbg = time.time()
         interval = max(float(self.frame_interval_sec), 1.0)
-        stdout = proc.stdout
+        if stdout is None:
+            stdout = proc.stdout
         if stdout is None:
             self.logger.warning("[thumb] mjpeg stdout is None")
             return
@@ -1245,9 +1260,14 @@ class StreamMonitor:
                         )
                         last_dbg = now
                     continue
-                chunk = stdout.read(16384)
+                try:
+                    chunk = stdout.read(16384)
+                except OSError:
+                    chunk = b""
                 if not chunk:
-                    break
+                    if proc.poll() is not None:
+                        break
+                    continue
                 got += len(chunk)
                 buf.extend(chunk)
                 now = time.time()
@@ -1830,16 +1850,18 @@ class StreamMonitor:
         # 界面就会一直「无信号」。用 stdbuf 强制行缓冲。
         wrapped = list(cmd)
         if shutil.which("stdbuf"):
-            # mjpeg 走 stdout 时不能对 stdout 做行缓冲
-            if self.frame_interval_sec > 0:
-                wrapped = ["stdbuf", "-o0", "-eL"] + cmd
-            else:
-                wrapped = ["stdbuf", "-oL", "-eL"] + cmd
+            wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.logger.info("[ffmpeg] %s", " ".join(cmd))
         use_mjpeg_pipe = self.frame_interval_sec > 0
+        mjpeg_file = None
+        if use_mjpeg_pipe:
+            fifo = self._ensure_mjpeg_fifo()
+            # O_RDWR 打开 fifo 不会阻塞，且保证 ffmpeg 写端立刻成功
+            fd = os.open(str(fifo), os.O_RDWR | os.O_NONBLOCK)
+            mjpeg_file = os.fdopen(fd, "rb", 0)
         self.process = subprocess.Popen(
             wrapped,
-            stdout=subprocess.PIPE if use_mjpeg_pipe else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
@@ -1851,10 +1873,10 @@ class StreamMonitor:
         run_started = self._run_started_ts
         last_lines = deque(maxlen=12)
 
-        if use_mjpeg_pipe and self.process.stdout is not None:
+        if mjpeg_file is not None:
             threading.Thread(
                 target=self._drain_mjpeg_stdout,
-                args=(self.process,),
+                args=(self.process, mjpeg_file),
                 name="mjpeg-%s" % self.id,
                 daemon=True,
             ).start()
