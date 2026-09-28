@@ -51,6 +51,11 @@ try:
 except Exception:
     event_db = None  # type: ignore
 
+try:
+    from workers.frame_quality import path_looks_displayable as _thumb_ok
+except Exception:
+    _thumb_ok = None
+
 app = FastAPI(title="AI 节目监测", version="0.5.0")
 
 if event_db is not None:
@@ -475,25 +480,18 @@ def api_dashboard():
     for s in stats:
         thumb = None
         ch_dir = SNAPSHOT_DIR / s["id"]
-        latest = ch_dir / "latest.jpg"
-        if latest.is_file() and latest.stat().st_size > 1024:
-            thumb = f"/api/snapshots/{s['id']}/latest.jpg?t={int(latest.stat().st_mtime)}"
-        elif ch_dir.is_dir():
-            # 回退：最近一张告警截图
+        # 大屏只用通过绿/灰过滤的有效帧，不用告警花图回退
+        for fname in ("latest_ok.jpg", "latest.jpg"):
+            p = ch_dir / fname
             try:
-                cands = [
-                    p
-                    for p in ch_dir.glob("*.jpg")
-                    if p.name != "latest.jpg" and p.stat().st_size > 1024
-                ]
-                if cands:
-                    newest = max(cands, key=lambda p: p.stat().st_mtime)
-                    thumb = (
-                        f"/api/snapshots/{s['id']}/{newest.name}"
-                        f"?t={int(newest.stat().st_mtime)}"
-                    )
+                if not (p.is_file() and p.stat().st_size > 2048):
+                    continue
             except OSError:
-                pass
+                continue
+            if _thumb_ok is not None and not _thumb_ok(p):
+                continue
+            thumb = f"/api/snapshots/{s['id']}/{fname}?t={int(p.stat().st_mtime)}"
+            break
         cards.append(
             {
                 "id": s["id"],

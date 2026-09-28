@@ -181,6 +181,9 @@ class StreamMonitor:
         self.latest_frame_path = self.snapshot_dir / "latest.jpg"
         # 仅串行化本进程内读/拷路径；FFmpeg 写 latest 不持此锁，靠 JPEG 完整性重试防半帧
         self._latest_lock = threading.Lock()
+        self._latest_valid = False
+        self._last_bad_thumb_log = 0.0
+
 
         self.process: Optional[subprocess.Popen] = None
         self.running = False
@@ -496,10 +499,11 @@ class StreamMonitor:
             "latest_jpg": str(self.latest_frame_path),
             "latest_exists": bool(
                 self.latest_frame_path.is_file()
-                and self.latest_frame_path.stat().st_size > 0
+                and self.latest_frame_path.stat().st_size > 1024
             )
             if self.latest_frame_path
             else False,
+            "latest_valid": bool(getattr(self, "_latest_valid", False)),
             "program": self.program,
             "enabled": self.enabled,
             "state": self._state,
@@ -789,8 +793,24 @@ class StreamMonitor:
                 return False, "timeout"
             err = (r.stderr or b"").decode("utf-8", "replace").strip()
             last = err.splitlines()[-1][:200] if err else ""
-            ok = jpg_tmp.is_file() and jpg_tmp.stat().st_size > 1024
-            return ok, last
+            if not (jpg_tmp.is_file() and jpg_tmp.stat().st_size > 1024):
+                return False, last
+            try:
+                blob = jpg_tmp.read_bytes()
+            except OSError:
+                return False, last
+            try:
+                from frame_quality import jpeg_looks_displayable
+            except ImportError:
+                try:
+                    from workers.frame_quality import jpeg_looks_displayable
+                except ImportError:
+                    jpeg_looks_displayable = None
+            if jpeg_looks_displayable is not None:
+                good, reason = jpeg_looks_displayable(blob)
+                if not good:
+                    return False, reason or last
+            return True, last
 
         last_err = ""
         ok = False
@@ -805,7 +825,17 @@ class StreamMonitor:
                 if ok:
                     break
             if ok:
+                try:
+                    blob = jpg_tmp.read_bytes()
+                except OSError:
+                    blob = b""
                 os.replace(str(jpg_tmp), str(self.latest_frame_path))
+                jpg_tmp = None
+                try:
+                    (self.snapshot_dir / "latest_ok.jpg").write_bytes(blob)
+                except OSError:
+                    pass
+                self._latest_valid = True
                 return True
             self.logger.warning(
                 "[thumb] ring_grab fail ring=%dKB program=%s %s"
@@ -1149,12 +1179,33 @@ class StreamMonitor:
     def _write_latest_jpeg(self, data: bytes) -> None:
         if not data or len(data) < 1024 or not self._is_complete_jpeg(data):
             return
+        try:
+            from frame_quality import jpeg_looks_displayable
+        except ImportError:
+            try:
+                from workers.frame_quality import jpeg_looks_displayable
+            except ImportError:
+                jpeg_looks_displayable = None
+        if jpeg_looks_displayable is not None:
+            ok, reason = jpeg_looks_displayable(data)
+            if not ok:
+                now = time.time()
+                last = getattr(self, "_last_bad_thumb_log", 0.0)
+                if now - last >= 30:
+                    self.logger.info("[thumb] skip_%s size=%d (keep last good)" % (reason, len(data)))
+                    self._last_bad_thumb_log = now
+                return
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.snapshot_dir / (".pipe_%s.tmp.jpg" % self.id)
+        ok_path = self.snapshot_dir / "latest_ok.jpg"
         try:
             with self._latest_lock:
                 tmp.write_bytes(data)
                 os.replace(str(tmp), str(self.latest_frame_path))
+                try:
+                    ok_path.write_bytes(data)
+                except OSError:
+                    pass
         except OSError as e:
             self.logger.debug("写 latest.jpg 失败: %s" % e)
             try:
@@ -1163,6 +1214,7 @@ class StreamMonitor:
             except OSError:
                 pass
             return
+        self._latest_valid = True
         self._note_media()
 
     def _drain_mjpeg_stdout(self, proc: subprocess.Popen) -> None:
@@ -1239,6 +1291,18 @@ class StreamMonitor:
         data = self._read_latest_jpeg_bytes()
         if not data:
             return False
+        try:
+            from frame_quality import jpeg_looks_displayable
+        except ImportError:
+            try:
+                from workers.frame_quality import jpeg_looks_displayable
+            except ImportError:
+                jpeg_looks_displayable = None
+        if jpeg_looks_displayable is not None:
+            good, _reason = jpeg_looks_displayable(data)
+            if not good:
+                return False
+
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:
             with self._latest_lock:
