@@ -390,12 +390,8 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        # 固定 320x180 RGB；queue 防 split 堵死；setpts=N/TB 不依赖组播 PTS
-        snap = (
-            "queue=max-size-buffers=8:max-size-bytes=0,"
-            "scale=320:180:flags=fast_bilinear,format=rgb24,"
-            "setpts=N/TB[vsnap]"
-        )
+        # 固定 320x180 RGB；setpts=N/TB 不依赖组播 PTS（不用 queue，部分 FFmpeg 无此滤镜）
+        snap = "scale=320:180:flags=fast_bilinear,format=rgb24,setpts=N/TB[vsnap]"
         if use_side:
             if dw and dw > 0:
                 v = (
