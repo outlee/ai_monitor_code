@@ -682,18 +682,22 @@ class StreamMonitor:
                 jpg_tmp.unlink()
         except OSError:
             pass
-        demux = "tsdemux"
-        if self.program is not None:
-            demux = "tsdemux program-number=%d" % int(self.program)
         cmd = [
             gst,
             "-q",
             "filesrc",
             "location=%s" % ts_path,
             "!",
-            demux,
+            "tsdemux",
+        ]
+        if self.program is not None:
+            cmd.append("program-number=%d" % int(self.program))
+        cmd.extend(
+            [
             "!",
-            "decodebin",
+            "h264parse",
+            "!",
+            "avdec_h264",
             "!",
             "videoconvert",
             "!",
@@ -707,7 +711,8 @@ class StreamMonitor:
             "multifilesink",
             "location=%s" % jpg_tmp,
             "max-files=1",
-        ]
+            ]
+        )
         env = os.environ.copy()
         env["GST_DEBUG"] = "0"
         try:
@@ -857,7 +862,7 @@ class StreamMonitor:
         via = "gst"
         try:
             ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
-            if not ok:
+            if not ok and last_err == "no_gst":
                 via = "ffmpeg"
                 ok, last_err = _run(map_list[-1], False, None)
             if ok:
@@ -1233,23 +1238,16 @@ class StreamMonitor:
 
         def _loop():
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            interval = max(float(self.frame_interval_sec), 4.0)
+            interval = max(float(self.frame_interval_sec), 8.0)
             fail_streak = 0
             stagger = (hash(self.id) % 17) * 0.25
             if stagger > 0:
                 end = time.time() + stagger
                 while self.running and time.time() < end:
                     time.sleep(min(0.3, max(0.05, end - time.time())))
-            use_gst = bool(self._capture_key) and (
-                shutil.which("gst-launch-1.0") or os.path.isfile("/usr/bin/gst-launch-1.0")
-            )
             self.logger.info(
-                "[thumb] thread_run mode=%s interval=%.1fs -> %s"
-                % (
-                    "gst_live" if use_gst else "ffmpeg_grab",
-                    interval,
-                    self.latest_frame_path,
-                )
+                "[thumb] thread_run mode=gst_ring interval=%.1fs -> %s"
+                % (interval, self.latest_frame_path)
             )
             while self.running:
                 if self._state not in ("running", "starting"):
@@ -1257,16 +1255,14 @@ class StreamMonitor:
                     time.sleep(1.0)
                     continue
                 try:
-                    if use_gst:
-                        self._run_gst_live_thumb()
-                    elif self._capture_key:
+                    if self._capture_key:
                         self._refresh_latest_from_ring()
                     else:
                         self._grab_frame_ffmpeg(self.latest_frame_path)
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
                     fail_streak += 1
-                end = time.time() + (8.0 if use_gst else interval)
+                end = time.time() + interval
                 while self.running and time.time() < end:
                     time.sleep(min(0.5, max(0.05, end - time.time())))
 
