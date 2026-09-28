@@ -390,8 +390,15 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        # 固定 320x180 RGB；setpts=N/TB 不依赖组播 PTS（不用 queue，部分 FFmpeg 无此滤镜）
-        snap = "scale=320:180:flags=fast_bilinear,format=rgb24,setpts=N/TB[vsnap]"
+        # 截图支路必须沿用检测支路 PTS。setpts=N/TB 会从 0 起算，和 PCR
+        # 差几个数量级，FFmpeg 7 多路输出调度会把 [vsnap] 整路丢掉。
+        # select 按帧号抽（不看 PTS）；fifo/queue 滤镜本机静态包没有。
+        every = max(int(round(float(self.frame_interval_sec) * 25.0)), 1)
+        snap = (
+            "select=not(mod(n\\,%d)),"
+            "scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
+            % every
+        )
         if use_side:
             if dw and dw > 0:
                 v = (
@@ -424,6 +431,7 @@ class StreamMonitor:
 
         cmd: List[str] = [
             "ffmpeg",
+            "-y",
             "-hide_banner",
             "-nostats",
             "-loglevel",
@@ -456,6 +464,8 @@ class StreamMonitor:
                 "[vout]",
                 "-map",
                 "[aout]",
+                "-max_interleave_delta",
+                "0",
                 "-f",
                 "null",
                 "/dev/null",
@@ -468,12 +478,16 @@ class StreamMonitor:
                     "-map",
                     "[vsnap]",
                     "-an",
+                    "-fps_mode",
+                    "passthrough",
+                    "-max_interleave_delta",
+                    "0",
+                    "-flush_packets",
+                    "1",
                     "-f",
                     "rawvideo",
                     "-pix_fmt",
                     "rgb24",
-                    "-vsync",
-                    "0",
                     str(fifo),
                 ]
             )
@@ -982,7 +996,8 @@ class StreamMonitor:
 
     def _start_thumb_thread(self):
         """
-        刷新 latest.jpg：抓包 TS ring 落盘后一次性抽帧；无 iface 则直接 ffmpeg。
+        旁路 latest.jpg：优先等监测 FFmpeg 的 RGB 管道；
+        管道尚未出图时才慢速打 TS ring（ring 常因 CC 丢包解不出）。
         """
 
         if self.frame_interval_sec <= 0:
@@ -995,10 +1010,10 @@ class StreamMonitor:
             interval = max(float(self.frame_interval_sec), 2.0)
             fail_streak = 0
             logged_ok = False
-            mode = "ts_ring" if self._capture_key else "ffmpeg_grab"
+            last_ring = 0.0
             self.logger.info(
-                "[thumb] thread_run mode=%s interval=%.1fs -> %s"
-                % (mode, interval, self.latest_frame_path)
+                "[thumb] thread_run mode=live_pipe+ring_fallback interval=%.1fs -> %s"
+                % (interval, self.latest_frame_path)
             )
             while self.running:
                 if self._state not in ("running", "starting"):
@@ -1006,11 +1021,42 @@ class StreamMonitor:
                     time.sleep(1.0)
                     continue
 
-                ok = False
+                ok_path = self.snapshot_dir / "latest_ok.jpg"
+                live_ok = False
                 try:
-                    if self._capture_key:
+                    if (
+                        self._latest_valid
+                        and ok_path.is_file()
+                        and ok_path.stat().st_size > 2048
+                        and (_now_ts() - ok_path.stat().st_mtime) <= 30
+                    ):
+                        live_ok = True
+                except OSError:
+                    live_ok = False
+                if live_ok:
+                    fail_streak = 0
+                    if not logged_ok:
+                        try:
+                            sz = ok_path.stat().st_size
+                        except OSError:
+                            sz = 0
+                        self.logger.info(
+                            "[thumb] latest_ok size=%d via=live_pipe" % sz
+                        )
+                        logged_ok = True
+                    end = time.time() + interval
+                    while self.running and time.time() < end:
+                        time.sleep(min(0.5, max(0.05, end - time.time())))
+                    continue
+
+                # 直播管道尚未出图时才慢速打 ring；有 CC 丢包时 ring 经常解不出。
+                ok = False
+                now = time.time()
+                try:
+                    if self._capture_key and now - last_ring >= 20:
+                        last_ring = now
                         ok = self._refresh_latest_from_ring()
-                    if not ok:
+                    elif not self._capture_key:
                         ok = self._grab_frame_ffmpeg(self.latest_frame_path)
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
@@ -1022,16 +1068,15 @@ class StreamMonitor:
                             sz = self.latest_frame_path.stat().st_size
                         except OSError:
                             sz = 0
-                        self.logger.info("[thumb] latest_ok size=%d via=%s" % (sz, mode))
+                        self.logger.info("[thumb] latest_ok size=%d via=ring" % sz)
                         logged_ok = True
-                    # 成功后按间隔再刷
                     end = time.time() + interval
                     while self.running and time.time() < end:
                         time.sleep(min(0.5, max(0.05, end - time.time())))
                     continue
 
                 fail_streak += 1
-                if fail_streak <= 3 or fail_streak % 15 == 0:
+                if fail_streak <= 2 or fail_streak % 30 == 0:
                     self.logger.warning(
                         "实时截图刷新失败 streak=%d" % fail_streak
                     )
@@ -1248,6 +1293,10 @@ class StreamMonitor:
         logged = False
         last_save = 0.0
         last_dbg = time.time()
+        try:
+            fd = stdout.fileno()
+        except Exception:
+            fd = None
         self.logger.info("[thumb] raw drain started %dx%d" % (width, height))
         try:
             while self.running and proc.poll() is None:
@@ -1265,7 +1314,10 @@ class StreamMonitor:
                         last_dbg = now
                     continue
                 try:
-                    chunk = stdout.read(frame_len)
+                    if fd is not None:
+                        chunk = os.read(fd, 65536)
+                    else:
+                        chunk = stdout.read(65536)
                 except OSError:
                     chunk = b""
                 if not chunk:
@@ -1857,6 +1909,10 @@ class StreamMonitor:
             fifo = self._ensure_snap_fifo()
             # O_RDWR 打开 fifo 不会阻塞，且保证 ffmpeg 写端立刻成功
             fd = os.open(str(fifo), os.O_RDWR | os.O_NONBLOCK)
+            try:
+                fcntl.fcntl(fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 262144)
+            except (OSError, ValueError, AttributeError):
+                pass
             mjpeg_file = os.fdopen(fd, "rb", 0)
         self.process = subprocess.Popen(
             wrapped,
@@ -1865,6 +1921,7 @@ class StreamMonitor:
             bufsize=0,
         )
         self._last_media_ts = 0.0
+        self._latest_valid = False
         self._run_started_ts = _now_ts()
         self._write_status("starting")
         self._start_ai_thread()
