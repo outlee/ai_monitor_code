@@ -390,30 +390,24 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        # 截图支路沿用检测 PTS，不再 setpts=N/TB（时间轴从 0 起会被
-        # FFmpeg 7 多路调度丢掉）。也不用 select/fifo/queue（本机包没有
-        # fifo/queue；select 是 V->N，第二路输出可能一直不打开文件）。
-        snap = "scale=320:180:flags=fast_bilinear[vsnap]"
+        # 不再 split 第二路：这台 FFmpeg 7 对直播 mpegts 的 [vsnap]
+        # 从不打开输出 fd（FIFO/image2 都是 0 包），检测却是绿的。
+        # 检测滤镜是直通，单路接到 image2，解码有帧就一定能写出。
+        scale_in = (
+            f"scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
+            if dw and dw > 0
+            else ""
+        )
         if use_side:
-            if dw and dw > 0:
-                v = (
-                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
-                    f"[vs]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            else:
-                v = (
-                    f"[{vin}]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
+            every = max(int(round(float(self.frame_interval_sec) * 25.0)), 1)
+            v = (
+                f"[{vin}]{scale_in}{detect},"
+                f"select=not(mod(n\\,{every})),"
+                f"scale=320:180:flags=fast_bilinear[vsnap]"
+            )
             return f"{v};{audio}"
         if dw and dw > 0:
-            v = (
-                f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
-                f"{detect}[vout]"
-            )
+            v = f"[{vin}]{scale_in}{detect}[vout]"
         else:
             v = f"[{vin}]{detect}[vout]"
         return f"{v};{audio}"
@@ -451,36 +445,16 @@ class StreamMonitor:
             cmd.extend(["-f", "mpegts"])
         # 组播 PCR 乱跳时，用墙钟给输出 -r 1 一个单调时间轴，首帧才能出图。
         cmd.extend(["-use_wallclock_as_timestamps", "1"])
-        cmd.extend(
-            [
-                "-i",
-                ingest,
-                "-filter_complex",
-                fc,
-                "-map",
-                "[vout]",
-                "-map",
-                "[aout]",
-                "-max_interleave_delta",
-                "0",
-                "-f",
-                "null",
-                "/dev/null",
-            ]
-        )
+        cmd.extend(["-i", ingest, "-filter_complex", fc])
         if self.frame_interval_sec > 0:
-            # 第二路直接覆盖写 latest.jpg。FIFO/rawvideo 在这台 FFmpeg 7
-            # 上从未打开过 fd（监测仍走 null）。-r 1 在编码侧限 1fps，
-            # 检测滤镜仍按原帧率跑。
+            # 唯一视频输出：检测滤镜之后写 latest.jpg。
             cmd.extend(
                 [
                     "-map",
                     "[vsnap]",
                     "-an",
-                    "-r",
-                    "1",
                     "-fps_mode",
-                    "cfr",
+                    "passthrough",
                     "-q:v",
                     "5",
                     "-f",
@@ -490,6 +464,27 @@ class StreamMonitor:
                     "-flush_packets",
                     "1",
                     str(self.latest_frame_path),
+                    "-map",
+                    "[aout]",
+                    "-max_interleave_delta",
+                    "0",
+                    "-f",
+                    "null",
+                    "/dev/null",
+                ]
+            )
+        else:
+            cmd.extend(
+                [
+                    "-map",
+                    "[vout]",
+                    "-map",
+                    "[aout]",
+                    "-max_interleave_delta",
+                    "0",
+                    "-f",
+                    "null",
+                    "/dev/null",
                 ]
             )
         return cmd
