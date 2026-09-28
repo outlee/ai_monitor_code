@@ -17,7 +17,7 @@ defaults:
 
   # ---------- 告警确认 / 冷却（防抖）----------
   alarm_confirm_sec: 3.0       # 检出后还要再持续该秒数且未恢复，才正式记告警
-  freeze_confirm_sec: 5.0      # 静帧在 d= 之外再确认的秒数；真静帧仍会告警，抖动会被滤掉
+  freeze_confirm_sec: 12.0     # 静帧按墙钟再确认的秒数（与 freeze_duration 对齐）；FFmpeg d= 只作画面相似触发
   alarm_cooldown_sec: 90.0     # 同类告警冷却时间（秒），避免反复刷屏
   stream_down_confirm: 2       # 连续断流/退出多少次才记「节目流中断」告警
 

@@ -143,14 +143,17 @@ class StreamMonitor:
         )
         if self.alarm_confirm_sec < 5.0:
             self.alarm_confirm_sec = 5.0
-        # 静帧在 FFmpeg d= 之外再等几秒，滤掉 start/end 抖动；真静帧仍会在 d+confirm 后告警
+        # FFmpeg d= 不可信（PTS/补帧）。freezedetect 只作「画面很像」的触发，
+        # 真正静帧时长按墙钟 freeze_duration 确认，避免漏掉真静帧、也不把定镜头抖动打出去。
         self.freeze_confirm_sec = float(
-            defaults.get("freeze_confirm_sec", 5.0)
+            defaults.get("freeze_confirm_sec", self.freeze_duration)
         )
-        if self.freeze_confirm_sec < 3.0:
-            self.freeze_confirm_sec = 3.0
+        if self.freeze_confirm_sec < self.freeze_duration:
+            self.freeze_confirm_sec = self.freeze_duration
         # 解码器刚起来的重复帧不算静帧
         self.freeze_startup_ignore_sec = 20.0
+        # freezedetect 自身 d= 只作相似度触发，秒数由上面墙钟确认
+        self._freeze_detect_d = 2.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -393,15 +396,14 @@ class StreamMonitor:
         vin = self._v_label()
         ain = self._a_label()
         vparts = []
-        # 用墙钟重打 PTS。组播 PCR/PTS 跳变、B 帧重排、genpts/igndts
-        # 都会让 freezedetect 按流时间计时：墙钟几秒被判成冻了十几秒，
-        # freeze_end 的 duration 甚至只有 0.4s。输入侧 use_wallclock 会被解码器盖掉。
-        vparts.append("setpts=(RTCTIME-RTCSTART)/1000000/TB")
+        # 按帧号重打单调 PTS（25fps 广播）。不要用流 PTS / demux wallclock：
+        # PCR 跳变会让 freezedetect 瞬间 freeze_start，freeze_end 却只有 0.4～3s。
+        vparts.append("setpts=N/25/TB")
         if self.detect_black:
             vparts.append(f"blackdetect=d={self.black_duration}:pix_th=0.10")
         if self.detect_freeze:
             vparts.append(
-                f"freezedetect=n={self.freeze_noise}:d={self.freeze_duration}"
+                f"freezedetect=n={self.freeze_noise}:d={self._freeze_detect_d}"
             )
         detect = ",".join(vparts) if vparts else "null"
         if self.detect_silence:
@@ -1920,7 +1922,7 @@ class StreamMonitor:
         re.I,
     )
 
-    def _commit_alarm_start(self, alarm_key: str, event: Dict):
+    def _commit_alarm_start(self, alarm_key: str, event: Dict, started: Optional[float] = None):
         """真正落库的开始告警（已过确认期）。"""
         now = _now_ts()
         cool = self._cooldown_until.get(alarm_key, 0)
@@ -1930,7 +1932,7 @@ class StreamMonitor:
                 % (alarm_key, cool - now)
             )
             return
-        self._active_alarms[alarm_key] = now
+        self._active_alarms[alarm_key] = started if started else now
         self._cooldown_until[alarm_key] = now + self.alarm_cooldown_sec
         if self.save_snapshot:
             snap = self._take_snapshot(event["type"])
@@ -1956,7 +1958,7 @@ class StreamMonitor:
                 ):
                     continue
             if now - item["since"] >= need:
-                self._commit_alarm_start(key, item["event"])
+                self._commit_alarm_start(key, item["event"], started=item["since"])
                 done.append(key)
         for key in done:
             self._pending_alarms.pop(key, None)
@@ -2000,20 +2002,22 @@ class StreamMonitor:
             if alarm_key not in self._active_alarms:
                 return
             start_ts = self._active_alarms.pop(alarm_key, None)
-            if start_ts and "duration" not in event:
-                event["duration"] = round(_now_ts() - start_ts, 3)
+            wall = round(_now_ts() - start_ts, 3) if start_ts else None
+            if wall is not None:
+                # 静帧以墙钟为准；FFmpeg freeze_duration 仍可能是错误 PTS
+                if alarm_key == "freeze" or "duration" not in event:
+                    event["duration"] = wall
             dur = event.get("duration")
             if (
                 alarm_key == "freeze"
-                and dur is not None
-                and float(dur) < float(self.freeze_duration)
+                and wall is not None
+                and wall < float(self.freeze_duration)
             ):
                 event["message"] = "静帧误报已撤销（持续 %.1fs，不足 %.0fs）" % (
-                    float(dur),
+                    wall,
                     float(self.freeze_duration),
                 )
                 self.logger.info(json.dumps(event, ensure_ascii=False))
-                self._save_event(event)
                 self._write_status()
                 return
             self.logger.info(json.dumps(event, ensure_ascii=False))
