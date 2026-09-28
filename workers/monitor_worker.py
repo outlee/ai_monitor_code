@@ -1029,10 +1029,207 @@ class StreamMonitor:
                 self.logger.warning("[thumb] disable max_error_rate for retry")
         self._stop_thumb_proc()
 
+    def _run_gst_live_thumb(self) -> None:
+        """
+        抓包 hub 持续喂 tsdemux（先灌 ring 再跟直播包）。
+        有限 ring 文件抽不出 GOP；直播喂入才能等到关键帧。
+        """
+        gst = shutil.which("gst-launch-1.0") or "/usr/bin/gst-launch-1.0"
+        if not os.path.isfile(gst) or not self._capture_key:
+            return
+        try:
+            from iface_mcast import (
+                TsFeeder,
+                align_ts_sync,
+                register_feeder,
+                snapshot_ts,
+                unregister_feeder,
+            )
+        except ImportError:
+            try:
+                from workers.iface_mcast import (
+                    TsFeeder,
+                    align_ts_sync,
+                    register_feeder,
+                    snapshot_ts,
+                    unregister_feeder,
+                )
+            except ImportError:
+                return
+        iface, group, port, cid = self._capture_key
+        feeder_id = "%s-gst" % cid
+        feeder = TsFeeder()
+        if register_feeder(iface, group, port, feeder_id, feeder) is None:
+            return
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        out = str(self.latest_frame_path)
+        err_path = self.snapshot_dir / "thumb_gst.err"
+        demux = "tsdemux"
+        if self.program is not None:
+            demux = "tsdemux program-number=%d" % int(self.program)
+        cmd = [
+            gst,
+            "-q",
+            "fdsrc",
+            "fd=0",
+            "do-timestamp=true",
+            "!",
+            demux,
+            "!",
+            "decodebin",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "!",
+            "video/x-raw,width=640,height=360",
+            "!",
+            "videorate",
+            "!",
+            "video/x-raw,framerate=1/4",
+            "!",
+            "jpegenc",
+            "quality=80",
+            "!",
+            "multifilesink",
+            "location=%s" % out,
+            "max-files=1",
+        ]
+        err_f = open(str(err_path), "w")
+        env = os.environ.copy()
+        env["GST_DEBUG"] = "0"
+        self.logger.info(
+            "[thumb] start gst_live program=%s -> %s" % (self.program, out)
+        )
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=err_f,
+            env=env,
+        )
+        self._thumb_proc = proc
+        self._thumb_feeder = feeder
+        logged = False
+        last_mtime = 0.0
+        try:
+            if proc.stdin is not None:
+                try:
+                    fcntl.fcntl(
+                        proc.stdin.fileno(),
+                        getattr(fcntl, "F_SETPIPE_SZ", 1031),
+                        1 << 20,
+                    )
+                except (OSError, ValueError, AttributeError):
+                    pass
+            boot = snapshot_ts(iface, group, port, min_bytes=0)
+            if boot:
+                if len(boot) > 4 * 1024 * 1024:
+                    boot = boot[-4 * 1024 * 1024 :]
+                boot = align_ts_sync(boot)
+                off = 0
+                while off < len(boot) and proc.poll() is None:
+                    chunk = boot[off : off + 256 * 1024]
+                    proc.stdin.write(chunk)
+                    off += len(chunk)
+                try:
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+            while (
+                self.running
+                and self._state in ("running", "starting")
+                and proc.poll() is None
+            ):
+                batch = feeder.get_batch(timeout=0.5)
+                if batch:
+                    try:
+                        proc.stdin.write(batch)
+                    except Exception:
+                        break
+                try:
+                    if self.latest_frame_path.is_file():
+                        st = self.latest_frame_path.stat()
+                        if st.st_size > 2048 and st.st_mtime != last_mtime:
+                            last_mtime = st.st_mtime
+                            blob = self.latest_frame_path.read_bytes()
+                            if self._promote_jpeg_bytes(blob) and not logged:
+                                self.logger.info(
+                                    "[thumb] latest_ok size=%d via=gst_live"
+                                    % len(blob)
+                                )
+                                logged = True
+                except OSError:
+                    pass
+        finally:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            unregister_feeder(iface, group, port, feeder_id)
+            self._thumb_feeder = None
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            self._thumb_proc = None
+            try:
+                err_f.close()
+            except Exception:
+                pass
+            if not logged:
+                try:
+                    tail = err_path.read_text()[-240:]
+                except Exception:
+                    tail = ""
+                self.logger.warning(
+                    "[thumb] gst_live end rc=%s %s"
+                    % (proc.poll(), tail.replace("\n", " ")[:200])
+                )
+
+    def _promote_jpeg_bytes(self, data):
+        if not data or not self._is_complete_jpeg(data):
+            return False
+        try:
+            from frame_quality import jpeg_looks_displayable
+        except ImportError:
+            try:
+                from workers.frame_quality import jpeg_looks_displayable
+            except ImportError:
+                jpeg_looks_displayable = None
+        if jpeg_looks_displayable is not None:
+            good, reason = jpeg_looks_displayable(data)
+            if not good:
+                now = time.time()
+                last = getattr(self, "_last_bad_thumb_log", 0.0)
+                if now - last >= 30:
+                    self.logger.info(
+                        "[thumb] skip_%s size=%d (keep last good)"
+                        % (reason, len(data))
+                    )
+                    self._last_bad_thumb_log = now
+                return False
+        ok_path = self.snapshot_dir / "latest_ok.jpg"
+        tmp = self.snapshot_dir / (".ok_%s.tmp.jpg" % self.id)
+        try:
+            with self._latest_lock:
+                tmp.write_bytes(data)
+                os.replace(str(tmp), str(ok_path))
+        except OSError:
+            return False
+        self._latest_valid = True
+        self._note_media()
+        return True
+
     def _start_thumb_thread(self):
         """
-        旁路 latest.jpg：优先等监测 FFmpeg 的 RGB 管道；
-        管道尚未出图时才慢速打 TS ring（ring 常因 CC 丢包解不出）。
+        截图：iface 抓包喂 GStreamer tsdemux；无 iface 则独立 ffmpeg 抽一帧。
         """
 
         if self.frame_interval_sec <= 0:
@@ -1044,48 +1241,38 @@ class StreamMonitor:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
             interval = max(float(self.frame_interval_sec), 4.0)
             fail_streak = 0
-            logged_ok = False
-            # 错开各频道首抽，避免一启动 24 路同时 gst
-            stagger = (hash(self.id) % 17) * 0.3
+            stagger = (hash(self.id) % 17) * 0.25
             if stagger > 0:
                 end = time.time() + stagger
                 while self.running and time.time() < end:
-                    time.sleep(min(0.3, end - time.time()))
+                    time.sleep(min(0.3, max(0.05, end - time.time())))
+            use_gst = bool(self._capture_key) and (
+                shutil.which("gst-launch-1.0") or os.path.isfile("/usr/bin/gst-launch-1.0")
+            )
             self.logger.info(
-                "[thumb] thread_run mode=gst_ring interval=%.1fs -> %s"
-                % (interval, self.latest_frame_path)
+                "[thumb] thread_run mode=%s interval=%.1fs -> %s"
+                % (
+                    "gst_live" if use_gst else "ffmpeg_grab",
+                    interval,
+                    self.latest_frame_path,
+                )
             )
             while self.running:
                 if self._state not in ("running", "starting"):
                     self._stop_thumb_proc()
                     time.sleep(1.0)
                     continue
-
-                ok = False
                 try:
-                    if self._capture_key:
-                        ok = self._refresh_latest_from_ring()
+                    if use_gst:
+                        self._run_gst_live_thumb()
+                    elif self._capture_key:
+                        self._refresh_latest_from_ring()
                     else:
-                        ok = self._grab_frame_ffmpeg(self.latest_frame_path)
+                        self._grab_frame_ffmpeg(self.latest_frame_path)
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
-                    ok = False
-                if ok:
-                    fail_streak = 0
-                    if not logged_ok:
-                        try:
-                            sz = self.latest_frame_path.stat().st_size
-                        except OSError:
-                            sz = 0
-                        self.logger.info("[thumb] latest_ok size=%d via=gst_ring" % sz)
-                        logged_ok = True
-                else:
                     fail_streak += 1
-                    if fail_streak <= 2 or fail_streak % 20 == 0:
-                        self.logger.warning(
-                            "实时截图刷新失败 streak=%d" % fail_streak
-                        )
-                end = time.time() + interval
+                end = time.time() + (2.0 if use_gst else interval)
                 while self.running and time.time() < end:
                     time.sleep(min(0.5, max(0.05, end - time.time())))
 

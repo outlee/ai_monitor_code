@@ -571,9 +571,15 @@ def _capture_loop(hub):
                     pass
             with hub["dest_lock"]:
                 dests = list(_all_local_ports(hub))
+                feeders = list((hub.get("feeders") or {}).values())
             for lp in dests:
                 try:
                     out.sendto(payload, ("127.0.0.1", lp))
+                except Exception:
+                    pass
+            for feeder in feeders:
+                try:
+                    feeder.put(payload)
                 except Exception:
                     pass
             n += 1
