@@ -389,26 +389,9 @@ class StreamMonitor:
             audio = f"[{ain}]volume=1[aout]"
 
         dw = self.detect_width
-        use_side = self.frame_interval_sec > 0
-        # 检测必须走 null 口才会真正拉帧（只接 rawvideo 时 CPU≈0、frame=0）。
-        # 截图走 split 的 [vsnap] → pipe:1（进程里已经打开，避免磁盘
-        # image2/FIFO 懒打开死锁）。
-        snap = "scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
-        if use_side:
-            if dw and dw > 0:
-                v = (
-                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
-                    f"[vs]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            else:
-                v = (
-                    f"[{vin}]split=2[vd][vf];"
-                    f"[vd]{detect}[vout];"
-                    f"[vf]{snap}"
-                )
-            return f"{v};{audio}"
+        # 监测只走 null。同一张图上再挂 FIFO/image2/pipe:1 时，这台
+        # FFmpeg 7 对直播 mpegts 的第二路从不写出（fd 都不打开），
+        # 还可能把拉帧拖成 frame=0。截图改走 TS ring 慢速兜底。
         if dw and dw > 0:
             v = (
                 f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
@@ -459,32 +442,11 @@ class StreamMonitor:
                 "[vout]",
                 "-map",
                 "[aout]",
-                "-max_interleave_delta",
-                "0",
                 "-f",
                 "null",
                 "/dev/null",
             ]
         )
-        if self.frame_interval_sec > 0:
-            cmd.extend(
-                [
-                    "-map",
-                    "[vsnap]",
-                    "-an",
-                    "-fps_mode",
-                    "passthrough",
-                    "-max_interleave_delta",
-                    "0",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    "-flush_packets",
-                    "1",
-                    "pipe:1",
-                ]
-            )
         return cmd
 
     # ---------- 心跳状态 ----------
@@ -1950,14 +1912,14 @@ class StreamMonitor:
             f"detect_width={self.detect_width} "
             f"frame_interval={self.frame_interval_sec}s"
         )
-        # stdout 是 RGB，不能套 stdbuf -oL；stderr 仍要行缓冲才能边跑边「已解到」。
+        # 管道不是 TTY 时 glibc 会块缓冲 stderr，Stream 信息要等退出才刷出。
         wrapped = list(cmd)
         if shutil.which("stdbuf"):
-            wrapped = ["stdbuf", "-eL"] + cmd
+            wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.logger.info("[ffmpeg] %s", " ".join(cmd))
         self.process = subprocess.Popen(
             wrapped,
-            stdout=subprocess.PIPE if self.frame_interval_sec > 0 else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
@@ -1969,19 +1931,6 @@ class StreamMonitor:
         self._start_thumb_thread()
         run_started = self._run_started_ts
         last_lines = deque(maxlen=12)
-
-        if self.frame_interval_sec > 0 and self.process.stdout is not None:
-            try:
-                fd = self.process.stdout.fileno()
-                fcntl.fcntl(fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 262144)
-            except (OSError, ValueError, AttributeError):
-                pass
-            threading.Thread(
-                target=self._drain_raw_frames,
-                args=(self.process, self.process.stdout),
-                name="rawsnap-%s" % self.id,
-                daemon=True,
-            ).start()
 
         assert self.process.stderr is not None
         err_q: "queue.Queue[Optional[str]]" = queue.Queue()
