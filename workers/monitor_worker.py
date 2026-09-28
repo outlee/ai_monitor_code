@@ -1070,6 +1070,12 @@ class StreamMonitor:
             "fdsrc",
             "fd=0",
             "!",
+            "queue",
+            "leaky=downstream",
+            "max-size-bytes=4194304",
+            "max-size-buffers=0",
+            "max-size-time=0",
+            "!",
             "tsdemux",
         ]
         if self.program is not None:
@@ -1077,7 +1083,9 @@ class StreamMonitor:
         cmd.extend(
             [
             "!",
-            "decodebin",
+            "h264parse",
+            "!",
+            "avdec_h264",
             "!",
             "videoconvert",
             "!",
@@ -1120,20 +1128,8 @@ class StreamMonitor:
                     )
                 except (OSError, ValueError, AttributeError):
                     pass
-            boot = snapshot_ts(iface, group, port, min_bytes=0)
-            if boot:
-                if len(boot) > 4 * 1024 * 1024:
-                    boot = boot[-4 * 1024 * 1024 :]
-                boot = align_ts_sync(boot)
-                off = 0
-                while off < len(boot) and proc.poll() is None:
-                    chunk = boot[off : off + 256 * 1024]
-                    proc.stdin.write(chunk)
-                    off += len(chunk)
-                try:
-                    proc.stdin.flush()
-                except Exception:
-                    pass
+            # 不灌 ring：短窗口 CC 缺口会让 tsdemux 卡在 preroll。
+            # 直播包持续写入，等完整 GOP（与监测 FFmpeg 一样）。
             while (
                 self.running
                 and self._state in ("running", "starting")
