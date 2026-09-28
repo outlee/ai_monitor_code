@@ -782,7 +782,7 @@ class StreamMonitor:
                         return False, "gst_busy"
                     time.sleep(0.25)
             with _gst_thumb_sem:
-                for kind in ("h264", "mpeg2", "decode"):
+                for kind in ("h264", "decode"):
                     try:
                         if jpg_tmp.is_file():
                             jpg_tmp.unlink()
@@ -881,7 +881,7 @@ class StreamMonitor:
                 "-loglevel",
                 "error",
                 "-fflags",
-                "+genpts+discardcorrupt",
+                "+genpts+igndts",
                 "-err_detect",
                 "ignore_err",
                 "-probesize",
@@ -941,10 +941,12 @@ class StreamMonitor:
         ok = False
         via = "gst"
         try:
-            ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
+            # 收包满了以后 ffmpeg 抽 1 帧更省 CPU；gst 作 H.264 兜底
+            ok, last_err = _run(map_list[-1], False, None)
+            via = "ffmpeg"
             if not ok:
-                via = "ffmpeg"
-                ok, last_err = _run(map_list[-1], False, None)
+                via = "gst"
+                ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
             if ok:
                 try:
                     blob = jpg_tmp.read_bytes()
