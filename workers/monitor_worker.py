@@ -403,7 +403,7 @@ class StreamMonitor:
             v = (
                 f"[{vin}]{scale_in}{detect},"
                 f"select=not(mod(n\\,{every})),"
-                f"scale=320:180:flags=fast_bilinear[vsnap]"
+                f"scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
             )
             return f"{v};{audio}"
         if dw and dw > 0:
@@ -447,7 +447,8 @@ class StreamMonitor:
         cmd.extend(["-use_wallclock_as_timestamps", "1"])
         cmd.extend(["-i", ingest, "-filter_complex", fc])
         if self.frame_interval_sec > 0:
-            # 唯一视频输出：检测滤镜之后写 latest.jpg。
+            # 视频写到 pipe:1（进程一启动 fd 就在）。image2/FIFO 文件是
+            # 懒打开：没有第一包就不 open，不 open 就没有第一包。
             cmd.extend(
                 [
                     "-map",
@@ -455,15 +456,13 @@ class StreamMonitor:
                     "-an",
                     "-fps_mode",
                     "passthrough",
-                    "-q:v",
-                    "5",
                     "-f",
-                    "image2",
-                    "-update",
-                    "1",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
                     "-flush_packets",
                     "1",
-                    str(self.latest_frame_path),
+                    "pipe:1",
                     "-map",
                     "[aout]",
                     "-max_interleave_delta",
@@ -1952,15 +1951,14 @@ class StreamMonitor:
             f"detect_width={self.detect_width} "
             f"frame_interval={self.frame_interval_sec}s"
         )
-        # 管道不是 TTY 时 glibc 会块缓冲 stderr，Stream 信息要等退出才刷出，
-        # 界面就会一直「无信号」。用 stdbuf 强制行缓冲。
+        # stderr 用 stdbuf -eL 行缓冲；stdout 是 RGB 二进制，绝不能 -oL。
         wrapped = list(cmd)
         if shutil.which("stdbuf"):
-            wrapped = ["stdbuf", "-oL", "-eL"] + cmd
+            wrapped = ["stdbuf", "-eL"] + cmd
         self.logger.info("[ffmpeg] %s", " ".join(cmd))
         self.process = subprocess.Popen(
             wrapped,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if self.frame_interval_sec > 0 else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
@@ -1973,11 +1971,16 @@ class StreamMonitor:
         run_started = self._run_started_ts
         last_lines = deque(maxlen=12)
 
-        if self.frame_interval_sec > 0:
+        if self.frame_interval_sec > 0 and self.process.stdout is not None:
+            try:
+                fd = self.process.stdout.fileno()
+                fcntl.fcntl(fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 262144)
+            except (OSError, ValueError, AttributeError):
+                pass
             threading.Thread(
-                target=self._watch_latest_file,
-                args=(self.process,),
-                name="jpgwatch-%s" % self.id,
+                target=self._drain_raw_frames,
+                args=(self.process, self.process.stdout),
+                name="rawsnap-%s" % self.id,
                 daemon=True,
             ).start()
 
