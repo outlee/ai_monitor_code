@@ -422,6 +422,10 @@ class StreamMonitor:
             "ignore_err",
             "-max_error_rate",
             "1.0",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
         ]
         if is_udp or self.program is not None:
             cmd.extend(
