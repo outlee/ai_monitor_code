@@ -28,7 +28,74 @@ def jpeg_looks_displayable(data, min_bytes=2048):
     return _judge_rgb(buf, w, h)
 
 
+def rgb_to_jpeg(rgb, width, height, quality=80):
+    """RGB24 bytes -> JPEG bytes, or None."""
+    if not rgb or width <= 0 or height <= 0:
+        return None
+    need = int(width) * int(height) * 3
+    if len(rgb) < need:
+        return None
+    rgb = rgb[:need]
+    try:
+        import cv2
+        import numpy as np
+
+        img = np.frombuffer(rgb, dtype=np.uint8).reshape((height, width, 3))
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode(
+            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+        )
+        if ok:
+            return bytes(buf)
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        import io
+
+        im = Image.frombytes("RGB", (int(width), int(height)), rgb)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=int(quality))
+        return buf.getvalue()
+    except Exception:
+        pass
+    header = ("P6\n%d %d\n255\n" % (int(width), int(height))).encode("ascii")
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "-i",
+                "pipe:0",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "5",
+                "-f",
+                "image2",
+                "pipe:1",
+            ],
+            input=header + rgb,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        out = r.stdout or b""
+        if out[:2] == b"\xff\xd8" and len(out) > 1024:
+            return out
+    except Exception:
+        pass
+    return None
+
+
 def path_looks_displayable(path):
+
     p = Path(path)
     try:
         st = p.stat()

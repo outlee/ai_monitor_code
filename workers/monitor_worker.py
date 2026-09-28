@@ -390,8 +390,12 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        # 不在滤镜里 fps/select：组播 PTS 乱时不吐帧。全帧 scale 后由 Python 限速落盘。
-        snap = "scale=w='min(iw\\,640)':h=-2:flags=fast_bilinear[vsnap]"
+        # 固定 320x180 RGB；queue 防 split 堵死；setpts=N/TB 不依赖组播 PTS
+        snap = (
+            "queue=max-size-buffers=8:max-size-bytes=0,"
+            "scale=320:180:flags=fast_bilinear,format=rgb24,"
+            "setpts=N/TB[vsnap]"
+        )
         if use_side:
             if dw and dw > 0:
                 v = (
@@ -462,22 +466,18 @@ class StreamMonitor:
             ]
         )
         if self.frame_interval_sec > 0:
-            fifo = self._ensure_mjpeg_fifo()
+            fifo = self._ensure_snap_fifo()
             cmd.extend(
                 [
                     "-map",
                     "[vsnap]",
                     "-an",
-                    "-c:v",
-                    "mjpeg",
-                    "-q:v",
-                    "5",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
                     "-vsync",
                     "0",
-                    "-flush_packets",
-                    "1",
-                    "-f",
-                    "mjpeg",
                     str(fifo),
                 ]
             )
@@ -1217,11 +1217,11 @@ class StreamMonitor:
         self._latest_valid = True
         self._note_media()
 
-    def _ensure_mjpeg_fifo(self) -> Path:
+    def _ensure_snap_fifo(self) -> Path:
         import stat as _stat
 
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        p = self.snapshot_dir / "live.mjpeg"
+        p = self.snapshot_dir / "live.rgb"
         try:
             if p.exists() and not _stat.S_ISFIFO(p.stat().st_mode):
                 p.unlink()
@@ -1231,20 +1231,28 @@ class StreamMonitor:
             os.mkfifo(str(p), 0o600)
         return p
 
-    def _drain_mjpeg_stdout(self, proc: subprocess.Popen, stdout=None) -> None:
-        """从 FFmpeg mjpeg 流拆出完整 JPEG，覆盖 latest.jpg。"""
-        buf = bytearray()
-        logged = False
-        last_save = 0.0
-        last_dbg = time.time()
+    def _drain_raw_frames(self, proc: subprocess.Popen, stdout=None) -> None:
+        """读固定尺寸 RGB24 帧，转 JPEG 后做绿/灰过滤再写入 latest.jpg。"""
+        width, height = 320, 180
+        frame_len = width * height * 3
         interval = max(float(self.frame_interval_sec), 1.0)
         if stdout is None:
             stdout = proc.stdout
         if stdout is None:
-            self.logger.warning("[thumb] mjpeg stdout is None")
+            self.logger.warning("[thumb] raw fifo is None")
             return
+        try:
+            from frame_quality import rgb_to_jpeg
+        except ImportError:
+            from workers.frame_quality import rgb_to_jpeg
+
+        buf = bytearray()
         got = 0
-        self.logger.info("[thumb] mjpeg drain started")
+        frames = 0
+        logged = False
+        last_save = 0.0
+        last_dbg = time.time()
+        self.logger.info("[thumb] raw drain started %dx%d" % (width, height))
         try:
             while self.running and proc.poll() is None:
                 try:
@@ -1255,13 +1263,13 @@ class StreamMonitor:
                     now = time.time()
                     if now - last_dbg >= 15 and not logged:
                         self.logger.info(
-                            "[thumb] mjpeg_pipe bytes=%d buf=%d (idle)"
-                            % (got, len(buf))
+                            "[thumb] raw_pipe bytes=%d frames=%d buf=%d (idle)"
+                            % (got, frames, len(buf))
                         )
                         last_dbg = now
                     continue
                 try:
-                    chunk = stdout.read(16384)
+                    chunk = stdout.read(frame_len)
                 except OSError:
                     chunk = b""
                 if not chunk:
@@ -1270,37 +1278,32 @@ class StreamMonitor:
                     continue
                 got += len(chunk)
                 buf.extend(chunk)
-                now = time.time()
-                if now - last_dbg >= 15 and not logged:
-                    self.logger.info(
-                        "[thumb] mjpeg_pipe bytes=%d buf=%d" % (got, len(buf))
-                    )
-                    last_dbg = now
-                while True:
-                    start = buf.find(b"\xff\xd8")
-                    if start < 0:
-                        if len(buf) > 2 * 1024 * 1024:
-                            del buf[: len(buf) - 1024]
-                        break
-                    end = buf.find(b"\xff\xd9", start + 2)
-                    if end < 0:
-                        if start > 0:
-                            del buf[:start]
-                        break
-                    jpeg = bytes(buf[start : end + 2])
-                    del buf[: end + 2]
+                while len(buf) >= frame_len:
+                    raw = bytes(buf[:frame_len])
+                    del buf[:frame_len]
+                    frames += 1
                     now = time.time()
                     if now - last_save < interval:
                         continue
+                    jpeg = rgb_to_jpeg(raw, width, height, quality=80)
+                    if not jpeg:
+                        continue
                     self._write_latest_jpeg(jpeg)
                     last_save = now
-                    if not logged and len(jpeg) > 1024:
+                    if not logged:
                         self.logger.info(
-                            "[thumb] latest_ok size=%d via=mjpeg_pipe" % len(jpeg)
+                            "[thumb] latest_ok size=%d via=raw_pipe" % len(jpeg)
                         )
                         logged = True
+                now = time.time()
+                if now - last_dbg >= 15 and not logged:
+                    self.logger.info(
+                        "[thumb] raw_pipe bytes=%d frames=%d buf=%d"
+                        % (got, frames, len(buf))
+                    )
+                    last_dbg = now
         except Exception as e:
-            self.logger.debug("mjpeg 管道结束: %s" % e)
+            self.logger.debug("raw 管道结束: %s" % e)
         try:
             stdout.close()
         except Exception:
@@ -1855,7 +1858,7 @@ class StreamMonitor:
         use_mjpeg_pipe = self.frame_interval_sec > 0
         mjpeg_file = None
         if use_mjpeg_pipe:
-            fifo = self._ensure_mjpeg_fifo()
+            fifo = self._ensure_snap_fifo()
             # O_RDWR 打开 fifo 不会阻塞，且保证 ffmpeg 写端立刻成功
             fd = os.open(str(fifo), os.O_RDWR | os.O_NONBLOCK)
             mjpeg_file = os.fdopen(fd, "rb", 0)
@@ -1875,9 +1878,9 @@ class StreamMonitor:
 
         if mjpeg_file is not None:
             threading.Thread(
-                target=self._drain_mjpeg_stdout,
+                target=self._drain_raw_frames,
                 args=(self.process, mjpeg_file),
-                name="mjpeg-%s" % self.id,
+                name="rawsnap-%s" % self.id,
                 daemon=True,
             ).start()
 
