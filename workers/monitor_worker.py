@@ -942,7 +942,7 @@ class StreamMonitor:
         via = "gst"
         try:
             ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
-            if not ok and last_err == "no_gst":
+            if not ok:
                 via = "ffmpeg"
                 ok, last_err = _run(map_list[-1], False, None)
             if ok:
