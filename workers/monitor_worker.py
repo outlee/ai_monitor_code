@@ -426,6 +426,8 @@ class StreamMonitor:
             "1",
             "-filter_threads",
             "1",
+            "-skip_loop_filter",
+            "all",
         ]
         if is_udp or self.program is not None:
             cmd.extend(
