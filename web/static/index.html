@@ -113,29 +113,8 @@
     </div>
 
     <div class="panel-head" style="margin-top:16px" id="events-anchor">
-      <h2>告警 / 事件</h2>
-      <span class="hint">支持筛选、搜索、翻页</span>
-    </div>
-    <div class="event-toolbar">
-      <input type="search" id="ev-q" placeholder="搜索节目名/ID/类型/内容" />
-      <select id="ev-type">
-        <option value="">全部类型</option>
-        <option value="black">黑场</option>
-        <option value="freeze">静帧</option>
-        <option value="silence">无伴音</option>
-        <option value="stream_down">断流</option>
-        <option value="ai_mosaic">花屏/马赛克(AI)</option>
-      </select>
-      <select id="ev-hours">
-        <option value="24">近 24 小时</option>
-        <option value="6">近 6 小时</option>
-        <option value="72">近 3 天</option>
-        <option value="">全部</option>
-      </select>
-      <button type="button" class="btn" id="ev-search">查询</button>
-      <button type="button" class="btn" id="ev-prev">上一页</button>
-      <button type="button" class="btn" id="ev-next">下一页</button>
-      <span class="hint" id="ev-page-info">-</span>
+      <h2>未恢复告警</h2>
+      <span class="hint">仅显示当前仍在持续的异常 · 完整日志在「管理 → 最近事件」</span>
     </div>
     <div class="event-list" id="event-list-dash">
       <div class="empty">加载中…</div>
@@ -257,7 +236,28 @@
     <section class="panel" id="manage-events-hint">
       <div class="panel-head">
         <h2>最近事件</h2>
-        <span class="hint">完整列表请到「大屏」下方告警区筛选翻页</span>
+        <span class="hint">完整事件日志 · 支持筛选、搜索、翻页</span>
+      </div>
+      <div class="event-toolbar">
+        <input type="search" id="ev-q" placeholder="搜索节目名/ID/类型/内容" />
+        <select id="ev-type">
+          <option value="">全部类型</option>
+          <option value="black">黑场</option>
+          <option value="freeze">静帧</option>
+          <option value="silence">无伴音</option>
+          <option value="stream_down">断流</option>
+          <option value="ai_mosaic">花屏/马赛克(AI)</option>
+        </select>
+        <select id="ev-hours">
+          <option value="24">近 24 小时</option>
+          <option value="6">近 6 小时</option>
+          <option value="72">近 3 天</option>
+          <option value="">全部</option>
+        </select>
+        <button type="button" class="btn" id="ev-search">查询</button>
+        <button type="button" class="btn" id="ev-prev">上一页</button>
+        <button type="button" class="btn" id="ev-next">下一页</button>
+        <span class="hint" id="ev-page-info">-</span>
       </div>
       <div class="event-list" id="event-list">
         <div class="empty">加载中…</div>

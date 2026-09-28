@@ -45,6 +45,7 @@ SNAPSHOT_DIR = ROOT / "snapshots"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _config_lock = threading.Lock()
+_nic_traffic_prev = {}  # name -> (ts, rx_bytes, tx_bytes)
 
 try:
     import event_db
@@ -775,6 +776,13 @@ def api_system_perf():
     except OSError:
         pass
     captures = _capture_hubs_from_status()
+    nics = _nic_status_list()
+    mon_kbps = 0.0
+    for h in captures:
+        try:
+            mon_kbps += float(h.get("bitrate_kbps") or 0)
+        except (TypeError, ValueError):
+            pass
     return {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "cpu_percent": cpu_est,
@@ -787,8 +795,8 @@ def api_system_perf():
             "used_percent": round(100.0 * mem_used / mem_total, 1) if mem_total else None,
         },
         "disk": disk,
-        "nics": _nic_status_list(),
-        "captures": captures,
+        "nics": nics,
+        "monitor_bitrate_kbps": round(mon_kbps, 1),
     }
 
 
@@ -1039,6 +1047,22 @@ def _nic_status_list() -> List[Dict[str, Any]]:
         except (TypeError, ValueError):
             pass
         up = oper == "up" and carrier is not False
+        rx_kbps = tx_kbps = None
+        try:
+            rx_b = int(_read_sys_net(name, "statistics/rx_bytes") or 0)
+            tx_b = int(_read_sys_net(name, "statistics/tx_bytes") or 0)
+        except ValueError:
+            rx_b = tx_b = 0
+        now = time.time()
+        prev = _nic_traffic_prev.get(name)
+        if prev and now > prev[0] + 0.2:
+            dt = now - prev[0]
+            rx_kbps = round((rx_b - prev[1]) * 8.0 / dt / 1000.0, 1)
+            tx_kbps = round((tx_b - prev[2]) * 8.0 / dt / 1000.0, 1)
+        _nic_traffic_prev[name] = (now, rx_b, tx_b)
+        occ = None
+        if speed_mbps and rx_kbps is not None and speed_mbps > 0:
+            occ = round(min(100.0, 100.0 * (rx_kbps / 1000.0) / float(speed_mbps)), 2)
         nics.append(
             {
                 "name": name,
@@ -1047,6 +1071,9 @@ def _nic_status_list() -> List[Dict[str, Any]]:
                 "carrier": carrier,
                 "speed_mbps": speed_mbps,
                 "up": up,
+                "rx_kbps": rx_kbps,
+                "tx_kbps": tx_kbps,
+                "occupancy_percent": occ,
             }
         )
     return nics

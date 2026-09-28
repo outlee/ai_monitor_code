@@ -574,6 +574,28 @@
       }
     }
 
+    const evBox = $("#event-list-dash");
+    if (evBox) {
+      const open = [];
+      all.forEach((c) => {
+        const tags = (c.active_alarms || []).filter(Boolean);
+        tags.forEach((t) => {
+          open.push({
+            type: t,
+            channel_id: c.id,
+            channel_name: c.name || c.id,
+            message: "未恢复",
+            time: dash.time || "",
+          });
+        });
+      });
+      if (!open.length) {
+        evBox.innerHTML = `<div class="empty">当前没有未恢复的告警</div>`;
+      } else {
+        evBox.innerHTML = open.map(renderEventItem).join("");
+      }
+    }
+
     const okHead = $("#ok-strip-head");
     if (okHead) {
       okHead.style.display = all.length ? "" : "none";
@@ -809,13 +831,7 @@
       });
     }
 
-    const list = $("#event-list");
-    const events = (data.recent_events || []).slice(0, 8);
-    if (!events.length) {
-      list.innerHTML = `<div class="empty">暂无事件</div>`;
-    } else {
-      list.innerHTML = events.map(renderEventItem).join("");
-    }
+    loadEventsPage().catch(() => {});
   }
 
   function renderEventItem(ev) {
@@ -836,7 +852,7 @@
   }
 
   async function loadEventsPage() {
-    const box = $("#event-list-dash");
+    const box = $("#event-list");
     if (!box) return;
     const q = ($("#ev-q") && $("#ev-q").value.trim()) || "";
     const typ = ($("#ev-type") && $("#ev-type").value) || "";
@@ -996,18 +1012,17 @@
           const sp = n.speed_mbps ? n.speed_mbps + "Mb/s" : "";
           const ip = n.ipv4 ? n.ipv4 : "无IP";
           const mark = n.up ? "●" : "○";
-          return `${mark} ${n.name} ${car} ${sp} ${ip}`.replace(/\s+/g, " ").trim();
+          const rx = fmtBitrate(n.rx_kbps);
+          const occ =
+            n.occupancy_percent != null ? Number(n.occupancy_percent).toFixed(1) + "%" : "";
+          const flow = rx ? "实时 " + rx : "";
+          const use = occ ? "占用 " + occ : "";
+          return `${mark} ${n.name} ${car} ${sp} ${ip} ${flow} ${use}`
+            .replace(/\s+/g, " ")
+            .trim();
         })
         .join("<br/>");
-      const capLines = (p.captures || [])
-        .map((h) => {
-          const br = fmtBitrate(h.bitrate_kbps) || "-";
-          const rate = h.pkt_rate != null ? Number(h.pkt_rate).toFixed(0) + " pkt/s" : "-";
-          return `${h.iface || "-"} ${h.group}:${h.port} ${br} ${rate} dests=${
-            h.dests != null ? h.dests : "-"
-          }`;
-        })
-        .join("<br/>");
+      const monBr = fmtBitrate(p.monitor_bitrate_kbps);
       box.innerHTML = `
         CPU 估算 <b>${cpu}</b>（核数 ${cores}）· 负载 <b>${load1}</b> / ${load5}<br/>
         内存 <b>${memPct}</b>（${fmtBytes(p.memory && p.memory.used_bytes)} / ${fmtBytes(
@@ -1016,8 +1031,9 @@
         磁盘 <b>${diskPct}</b>（已用 ${fmtBytes(p.disk && p.disk.used_bytes)} · 剩余 ${fmtBytes(
         p.disk && p.disk.free_bytes
       )}）<br/>
-        <div class="perf-net"><b>网卡</b><br/>${nicLines || "-"}</div>
-        <div class="perf-net"><b>组播抓包</b><br/>${capLines || "暂无（需监测进程心跳）"}</div>
+        <div class="perf-net"><b>网络</b> 监测码流 <b>${monBr || "-"}</b><br/>${
+        nicLines || "-"
+      }</div>
         <span style="font-size:11px">更新于 ${escapeHtml(p.time || "")}</span>
       `;
     } catch (e) {
@@ -1280,9 +1296,10 @@
         const table = document.querySelector(".table-wrap");
         if (table) table.scrollIntoView({ behavior: "smooth" });
       } else if (go === "events") {
-        setView("dash");
-        const a = $("#events-anchor");
+        setView("manage");
+        const a = $("#manage-events-hint");
         if (a) a.scrollIntoView({ behavior: "smooth" });
+        loadEventsPage().catch(() => {});
       } else if (go === "storage") {
         setView("manage");
         const a = $("#storage-anchor");

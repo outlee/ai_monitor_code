@@ -140,6 +140,12 @@ class StreamMonitor:
         )
         if self.alarm_confirm_sec < 5.0:
             self.alarm_confirm_sec = 5.0
+        # 静帧单独加长确认：误报多在 start 后 10～23 秒内 freeze_end
+        self.freeze_confirm_sec = float(
+            defaults.get("freeze_confirm_sec", 25.0)
+        )
+        if self.freeze_confirm_sec < 20.0:
+            self.freeze_confirm_sec = 20.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -1936,7 +1942,7 @@ class StreamMonitor:
         for key, item in list(self._pending_alarms.items()):
             need = self.alarm_confirm_sec
             if key == "freeze":
-                need = max(need, 12.0)
+                need = max(need, float(self.freeze_confirm_sec))
                 if self._run_started_ts and now - self._run_started_ts < 45.0:
                     continue
             if now - item["since"] >= need:
@@ -1965,9 +1971,12 @@ class StreamMonitor:
                     "event": event,
                     "since": _now_ts(),
                 }
+                wait_s = self.alarm_confirm_sec
+                if alarm_key == "freeze":
+                    wait_s = max(wait_s, float(self.freeze_confirm_sec))
                 self.logger.info(
                     "待确认告警 %s（%.1fs 内若恢复则不计）"
-                    % (alarm_key, self.alarm_confirm_sec)
+                    % (alarm_key, wait_s)
                 )
             return
 
