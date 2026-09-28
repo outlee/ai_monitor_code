@@ -1937,6 +1937,8 @@ class StreamMonitor:
             need = self.alarm_confirm_sec
             if key == "freeze":
                 need = max(need, 12.0)
+                if self._run_started_ts and now - self._run_started_ts < 45.0:
+                    continue
             if now - item["since"] >= need:
                 self._commit_alarm_start(key, item["event"])
                 done.append(key)
@@ -1953,6 +1955,9 @@ class StreamMonitor:
     ):
         # 开始：先进入确认队列，避免组播抖动/瞬间误报
         if is_start and alarm_key:
+            if alarm_key == "freeze" and self._run_started_ts:
+                if _now_ts() - self._run_started_ts < 45.0:
+                    return
             if alarm_key in self._active_alarms:
                 return
             if alarm_key not in self._pending_alarms:
