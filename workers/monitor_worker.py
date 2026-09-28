@@ -867,6 +867,8 @@ class StreamMonitor:
             map_list.append(["-map", "0:p:%d:v:0" % int(self.program)])
             map_list.append(["-map", "0:p:%d:v" % int(self.program)])
         map_list.append(["-map", "0:v:0"])
+        map_list.append(["-map", "0:v:1"])
+        map_list.append([])
 
         def _run(maps, skip_key, ss):
             try:
@@ -900,8 +902,6 @@ class StreamMonitor:
                     "-an",
                     "-frames:v",
                     "1",
-                    "-vf",
-                    "scale=640:-2",
                     "-q:v",
                     "5",
                     str(jpg_tmp),
@@ -942,8 +942,12 @@ class StreamMonitor:
         via = "gst"
         try:
             # 收包满了以后 ffmpeg 抽 1 帧更省 CPU；gst 作 H.264 兜底
-            ok, last_err = _run(map_list[-1], False, None)
+            # 东方卫视等 MPEG-2 常有 0x0 占位流，0:v:0 抽不出，需试 v:1
             via = "ffmpeg"
+            for maps in map_list:
+                ok, last_err = _run(maps, False, None)
+                if ok:
+                    break
             if not ok:
                 via = "gst"
                 ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
