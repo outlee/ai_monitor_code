@@ -132,6 +132,15 @@ ffmpeg -filters 2>/dev/null | grep -E 'blackdetect|freezedetect|silencedetect'
 # 应能看到上述三个滤镜
 ```
 
+大屏截图不走监测 FFmpeg，而用抓包 TS ring + GStreamer `tsdemux`。CentOS 7 示例：
+
+```bash
+sudo yum install -y gstreamer1-plugins-bad-free epel-release
+sudo rpm -Uvh https://download1.rpmfusion.org/free/el/rpmfusion-free-release-7.noarch.rpm
+sudo yum install -y gstreamer1-libav
+gst-inspect-1.0 tsdemux >/dev/null && gst-inspect-1.0 avdec_h264 >/dev/null && echo gst_ok
+```
+
 ### 4.3 基础 Python 包（监测必须）
 
 ```bash

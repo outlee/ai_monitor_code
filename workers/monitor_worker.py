@@ -58,6 +58,8 @@ except Exception:
 
 # 全局事件文件写锁（多线程；进程间另用 fcntl）
 _event_lock = threading.Lock()
+# 每进程同时只解 1 路过期 TS，6 个 worker 最多 6 路 gst
+_gst_thumb_sem = threading.Semaphore(1)
 
 
 def _now_str() -> str:
@@ -670,9 +672,81 @@ class StreamMonitor:
         src = self._thumb_url or self._ingest_url or self.url
         return src
 
+    def _gst_grab_jpeg(self, ts_path: Path, jpg_tmp: Path):
+        """tsdemux + decodebin 从 TS 文件抽 1 帧 JPEG。返回 (ok, err)."""
+        gst = shutil.which("gst-launch-1.0")
+        if not gst:
+            return False, "no_gst"
+        try:
+            if jpg_tmp.is_file():
+                jpg_tmp.unlink()
+        except OSError:
+            pass
+        demux = "tsdemux"
+        if self.program is not None:
+            demux = "tsdemux program-number=%d" % int(self.program)
+        cmd = [
+            gst,
+            "-q",
+            "filesrc",
+            "location=%s" % ts_path,
+            "!",
+            demux,
+            "!",
+            "decodebin",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "!",
+            "video/x-raw,width=640,height=360",
+            "!",
+            "jpegenc",
+            "quality=80",
+            "!",
+            "multifilesink",
+            "location=%s" % jpg_tmp,
+            "max-files=1",
+        ]
+        env = os.environ.copy()
+        env["GST_DEBUG"] = "0"
+        try:
+            with _gst_thumb_sem:
+                r = subprocess.run(
+                    cmd,
+                    timeout=18,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+        except subprocess.TimeoutExpired:
+            return False, "gst_timeout"
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        last = err.splitlines()[-1][:180] if err else ""
+        if not (jpg_tmp.is_file() and jpg_tmp.stat().st_size > 2048):
+            return False, last or ("gst_rc=%s" % r.returncode)
+        try:
+            blob = jpg_tmp.read_bytes()
+        except OSError:
+            return False, last or "gst_read"
+        if not self._is_complete_jpeg(blob):
+            return False, "gst_not_jpeg"
+        try:
+            from frame_quality import jpeg_looks_displayable
+        except ImportError:
+            try:
+                from workers.frame_quality import jpeg_looks_displayable
+            except ImportError:
+                jpeg_looks_displayable = None
+        if jpeg_looks_displayable is not None:
+            good, reason = jpeg_looks_displayable(blob)
+            if not good:
+                return False, reason or last
+        return True, last
+
     def _refresh_latest_from_ring(self) -> bool:
         """
-        从抓包 TS 环形缓冲落盘，再一次性抽关键帧写入 latest.jpg。
+        从抓包 TS 环形缓冲落盘，再用 GStreamer tsdemux 抽一帧。
         监测 FFmpeg 不参与出图。
         """
         if not self._capture_key:
@@ -688,7 +762,7 @@ class StreamMonitor:
             iface, group, port, _cid = self._capture_key
         except Exception:
             return False
-        data = snapshot_ts(iface, group, port, min_bytes=400 * 1024)
+        data = snapshot_ts(iface, group, port, min_bytes=1500 * 1024)
         if not data:
             return False
         data = align_ts_sync(data)
@@ -780,16 +854,12 @@ class StreamMonitor:
 
         last_err = ""
         ok = False
+        via = "gst"
         try:
-            attempts = []
-            for maps in map_list:
-                attempts.append((maps, True, "0.8"))
-            attempts.append((map_list[-1], False, "1.2"))
-            attempts.append((map_list[-1], False, None))
-            for maps, skip_key, ss in attempts:
-                ok, last_err = _run(maps, skip_key, ss)
-                if ok:
-                    break
+            ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
+            if not ok:
+                via = "ffmpeg"
+                ok, last_err = _run(map_list[-1], False, None)
             if ok:
                 try:
                     blob = jpg_tmp.read_bytes()
@@ -802,6 +872,15 @@ class StreamMonitor:
                 except OSError:
                     pass
                 self._latest_valid = True
+                self._note_media()
+                now = time.time()
+                last = getattr(self, "_last_gst_ok_log", 0.0)
+                if now - last >= 30:
+                    self.logger.info(
+                        "[thumb] latest_ok size=%d via=%s ring=%dKB"
+                        % (len(blob), via, int(len(data) / 1024))
+                    )
+                    self._last_gst_ok_log = now
                 return True
             self.logger.warning(
                 "[thumb] ring_grab fail ring=%dKB program=%s %s"
@@ -963,12 +1042,17 @@ class StreamMonitor:
 
         def _loop():
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            interval = max(float(self.frame_interval_sec), 2.0)
+            interval = max(float(self.frame_interval_sec), 4.0)
             fail_streak = 0
             logged_ok = False
-            last_ring = 0.0
+            # 错开各频道首抽，避免一启动 24 路同时 gst
+            stagger = (hash(self.id) % 17) * 0.3
+            if stagger > 0:
+                end = time.time() + stagger
+                while self.running and time.time() < end:
+                    time.sleep(min(0.3, end - time.time()))
             self.logger.info(
-                "[thumb] thread_run mode=live_pipe+ring_fallback interval=%.1fs -> %s"
+                "[thumb] thread_run mode=gst_ring interval=%.1fs -> %s"
                 % (interval, self.latest_frame_path)
             )
             while self.running:
@@ -977,42 +1061,11 @@ class StreamMonitor:
                     time.sleep(1.0)
                     continue
 
-                ok_path = self.snapshot_dir / "latest_ok.jpg"
-                live_ok = False
-                try:
-                    if (
-                        self._latest_valid
-                        and ok_path.is_file()
-                        and ok_path.stat().st_size > 2048
-                        and (_now_ts() - ok_path.stat().st_mtime) <= 30
-                    ):
-                        live_ok = True
-                except OSError:
-                    live_ok = False
-                if live_ok:
-                    fail_streak = 0
-                    if not logged_ok:
-                        try:
-                            sz = ok_path.stat().st_size
-                        except OSError:
-                            sz = 0
-                        self.logger.info(
-                            "[thumb] latest_ok size=%d via=live_pipe" % sz
-                        )
-                        logged_ok = True
-                    end = time.time() + interval
-                    while self.running and time.time() < end:
-                        time.sleep(min(0.5, max(0.05, end - time.time())))
-                    continue
-
-                # 直播管道尚未出图时才慢速打 ring；有 CC 丢包时 ring 经常解不出。
                 ok = False
-                now = time.time()
                 try:
-                    if self._capture_key and now - last_ring >= 20:
-                        last_ring = now
+                    if self._capture_key:
                         ok = self._refresh_latest_from_ring()
-                    elif not self._capture_key:
+                    else:
                         ok = self._grab_frame_ffmpeg(self.latest_frame_path)
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
@@ -1024,18 +1077,14 @@ class StreamMonitor:
                             sz = self.latest_frame_path.stat().st_size
                         except OSError:
                             sz = 0
-                        self.logger.info("[thumb] latest_ok size=%d via=ring" % sz)
+                        self.logger.info("[thumb] latest_ok size=%d via=gst_ring" % sz)
                         logged_ok = True
-                    end = time.time() + interval
-                    while self.running and time.time() < end:
-                        time.sleep(min(0.5, max(0.05, end - time.time())))
-                    continue
-
-                fail_streak += 1
-                if fail_streak <= 2 or fail_streak % 30 == 0:
-                    self.logger.warning(
-                        "实时截图刷新失败 streak=%d" % fail_streak
-                    )
+                else:
+                    fail_streak += 1
+                    if fail_streak <= 2 or fail_streak % 20 == 0:
+                        self.logger.warning(
+                            "实时截图刷新失败 streak=%d" % fail_streak
+                        )
                 end = time.time() + interval
                 while self.running and time.time() < end:
                     time.sleep(min(0.5, max(0.05, end - time.time())))

@@ -27,8 +27,8 @@ _hubs = {}
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
 
-# ~2–4s of HD/MPTS for one-shot keyframe extract
-_DEFAULT_RING_BYTES = 8 * 1024 * 1024
+# ~6s of ~5Mbps MPTS；8MB 只有约 1.5s，tsdemux 抽不出完整 GOP
+_DEFAULT_RING_BYTES = 32 * 1024 * 1024
 _DEFAULT_FEEDER_BYTES = 4 * 1024 * 1024
 
 
