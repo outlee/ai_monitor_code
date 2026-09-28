@@ -7,8 +7,8 @@
 defaults:
   # ---------- 规则检测（黑场 / 静帧 / 无伴音）----------
   black_duration: 5.0          # 黑场持续多久才告警（秒），越大越不敏感
-  freeze_duration: 12.0        # 静帧持续多久才告警（秒），组播建议 8～15
-  freeze_noise: 0.02           # 静帧灵敏度，越大越钝（原 0.003 极易误报；建议 0.01～0.03）
+  freeze_duration: 12.0        # 静帧持续多久才告警（秒），组播建议 12～15
+  freeze_noise: 0.003          # freezedetect n；越大越容易把微动判成静帧，不要超过 0.01
   silence_duration: 12.0       # 无伴音持续多久才告警（秒）
   silence_threshold: -50.0     # 静音判定电平（dB），越负越不容易报无伴音
   detect_black: true           # 是否检测黑场

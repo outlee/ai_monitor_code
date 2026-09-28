@@ -105,15 +105,18 @@ class StreamMonitor:
         self.freeze_duration = float(
             channel.get("freeze_duration", defaults.get("freeze_duration", 12.0))
         )
-        # 组播 PTS 乱跳时，过短会把短暂停顿打成静帧
+        # 短于 12s 容易把片头静画、镜头定住打成故障
         if self.freeze_duration < 12.0:
             self.freeze_duration = 12.0
-        # freezedetect 噪声阈值，越大越不敏感
+        # freezedetect n：平均绝对差 / 256。FFmpeg 默认 0.001。
+        # 越大越容易把微动画面判成静帧（0.08 ≈ 20 灰阶，电视剧定镜头必误报）。
         self.freeze_noise = float(
-            channel.get("freeze_noise", defaults.get("freeze_noise", 0.08))
+            channel.get("freeze_noise", defaults.get("freeze_noise", 0.003))
         )
-        if self.freeze_noise < 0.08:
-            self.freeze_noise = 0.08
+        if self.freeze_noise < 0.001:
+            self.freeze_noise = 0.001
+        if self.freeze_noise > 0.01:
+            self.freeze_noise = 0.01
         self.silence_duration = float(
             channel.get("silence_duration", defaults.get("silence_duration", 12.0))
         )
@@ -140,12 +143,14 @@ class StreamMonitor:
         )
         if self.alarm_confirm_sec < 5.0:
             self.alarm_confirm_sec = 5.0
-        # 静帧单独加长确认：误报多在 start 后 10～23 秒内 freeze_end
+        # 静帧在 FFmpeg d= 之外再等几秒，滤掉 start/end 抖动；真静帧仍会在 d+confirm 后告警
         self.freeze_confirm_sec = float(
-            defaults.get("freeze_confirm_sec", 25.0)
+            defaults.get("freeze_confirm_sec", 5.0)
         )
-        if self.freeze_confirm_sec < 20.0:
-            self.freeze_confirm_sec = 20.0
+        if self.freeze_confirm_sec < 3.0:
+            self.freeze_confirm_sec = 3.0
+        # 解码器刚起来的重复帧不算静帧
+        self.freeze_startup_ignore_sec = 20.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -388,6 +393,10 @@ class StreamMonitor:
         vin = self._v_label()
         ain = self._a_label()
         vparts = []
+        # 用墙钟重打 PTS。组播 PCR/PTS 跳变、B 帧重排、genpts/igndts
+        # 都会让 freezedetect 按流时间计时：墙钟几秒被判成冻了十几秒，
+        # freeze_end 的 duration 甚至只有 0.4s。输入侧 use_wallclock 会被解码器盖掉。
+        vparts.append("setpts=(RTCTIME-RTCSTART)/1000000/TB")
         if self.detect_black:
             vparts.append(f"blackdetect=d={self.black_duration}:pix_th=0.10")
         if self.detect_freeze:
@@ -430,7 +439,7 @@ class StreamMonitor:
             "-loglevel",
             "info",
             "-fflags",
-            "+genpts+discardcorrupt+igndts",
+            "+genpts+discardcorrupt",
             "-err_detect",
             "ignore_err",
             "-max_error_rate",
@@ -451,8 +460,6 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
-        # 静帧/黑场按时墙计时，避免组播 PTS 停住几秒就被判成冻了 10 秒
-        cmd.extend(["-use_wallclock_as_timestamps", "1"])
         cmd.extend(
             [
                 "-i",
@@ -1943,7 +1950,10 @@ class StreamMonitor:
             need = self.alarm_confirm_sec
             if key == "freeze":
                 need = max(need, float(self.freeze_confirm_sec))
-                if self._run_started_ts and now - self._run_started_ts < 45.0:
+                if (
+                    self._run_started_ts
+                    and now - self._run_started_ts < self.freeze_startup_ignore_sec
+                ):
                     continue
             if now - item["since"] >= need:
                 self._commit_alarm_start(key, item["event"])
@@ -1962,7 +1972,7 @@ class StreamMonitor:
         # 开始：先进入确认队列，避免组播抖动/瞬间误报
         if is_start and alarm_key:
             if alarm_key == "freeze" and self._run_started_ts:
-                if _now_ts() - self._run_started_ts < 45.0:
+                if _now_ts() - self._run_started_ts < self.freeze_startup_ignore_sec:
                     return
             if alarm_key in self._active_alarms:
                 return

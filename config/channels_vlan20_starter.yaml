@@ -13,7 +13,7 @@
 defaults:
   black_duration: 2.0
   freeze_duration: 12.0
-  freeze_noise: 0.02
+  freeze_noise: 0.003
   silence_duration: 12.0
   silence_threshold: -50
   detect_silence: false
