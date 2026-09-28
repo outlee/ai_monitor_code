@@ -1064,9 +1064,6 @@ class StreamMonitor:
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         out = str(self.latest_frame_path)
         err_path = self.snapshot_dir / "thumb_gst.err"
-        demux = "tsdemux"
-        if self.program is not None:
-            demux = "tsdemux program-number=%d" % int(self.program)
         cmd = [
             gst,
             "-q",
@@ -1074,7 +1071,12 @@ class StreamMonitor:
             "fd=0",
             "do-timestamp=true",
             "!",
-            demux,
+            "tsdemux",
+        ]
+        if self.program is not None:
+            cmd.append("program-number=%d" % int(self.program))
+        cmd.extend(
+            [
             "!",
             "decodebin",
             "!",
@@ -1094,7 +1096,8 @@ class StreamMonitor:
             "multifilesink",
             "location=%s" % out,
             "max-files=1",
-        ]
+            ]
+        )
         err_f = open(str(err_path), "w")
         env = os.environ.copy()
         env["GST_DEBUG"] = "0"
@@ -1272,7 +1275,7 @@ class StreamMonitor:
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
                     fail_streak += 1
-                end = time.time() + (2.0 if use_gst else interval)
+                end = time.time() + (8.0 if use_gst else interval)
                 while self.running and time.time() < end:
                     time.sleep(min(0.5, max(0.05, end - time.time())))
 
