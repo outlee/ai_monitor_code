@@ -497,32 +497,59 @@ def _capture_loop(hub):
             )
         n = 0
         n_skip = 0
+        nbytes = 0
         t0 = time.time()
         last = t0
+        win_t = t0
+        win_n = 0
+        win_b = 0
+
+        def _publish(now, dests):
+            rsz = 0
+            try:
+                rsz = hub.get("ring").size() if hub.get("ring") else 0
+            except Exception:
+                pass
+            dt = max(now - win_t, 1e-6)
+            hub["stats"] = {
+                "iface": iface,
+                "group": group,
+                "mport": mport,
+                "pkts": n,
+                "skip": n_skip,
+                "bytes": nbytes,
+                "pkt_rate": round(win_n / dt, 1),
+                "bitrate_kbps": round(win_b * 8.0 / dt / 1000.0, 1),
+                "dests": dests,
+                "ring_kb": int(rsz / 1024),
+                "updated_ts": now,
+            }
+
         while not hub["stop"]:
             try:
                 raw.settimeout(1.0)
                 frame = raw.recv(65535)
             except socket.timeout:
                 now = time.time()
+                with hub["dest_lock"]:
+                    nd = len(list(_all_local_ports(hub)))
+                if now - win_t >= 1.0:
+                    _publish(now, nd)
+                    win_n = 0
+                    win_b = 0
+                    win_t = now
                 if logger and now - last >= 30:
-                    with hub["dest_lock"]:
-                        nd = len(list(_all_local_ports(hub)))
-                    rsz = 0
-                    try:
-                        rsz = hub.get("ring").size() if hub.get("ring") else 0
-                    except Exception:
-                        pass
+                    st = hub.get("stats") or {}
                     logger.info(
                         "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
                         % (
                             group,
                             mport,
                             n,
-                            n / max(now - t0, 1e-6),
+                            float(st.get("pkt_rate") or 0),
                             nd,
                             n_skip,
-                            int(rsz / 1024),
+                            int(st.get("ring_kb") or 0),
                         )
                     )
                     last = now
@@ -550,23 +577,27 @@ def _capture_loop(hub):
                 except Exception:
                     pass
             n += 1
+            nbytes += len(payload)
+            win_n += 1
+            win_b += len(payload)
             now = time.time()
+            if now - win_t >= 2.0:
+                _publish(now, len(dests))
+                win_n = 0
+                win_b = 0
+                win_t = now
             if logger and now - last >= 30:
-                rsz = 0
-                try:
-                    rsz = hub.get("ring").size() if hub.get("ring") else 0
-                except Exception:
-                    pass
+                st = hub.get("stats") or {}
                 logger.info(
                     "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
                     % (
                         group,
                         mport,
                         n,
-                        n / max(now - t0, 1e-6),
+                        float(st.get("pkt_rate") or n / max(now - t0, 1e-6)),
                         len(dests),
                         n_skip,
-                        int(rsz / 1024),
+                        int(st.get("ring_kb") or 0),
                     )
                 )
                 last = now
@@ -738,6 +769,17 @@ def ring_size(iface, group, port):
         if not hub or hub.get("ring") is None:
             return 0
         return hub["ring"].size()
+
+
+def hub_stats(iface, group, port):
+    """Return a copy of live capture stats for this multicast, or {}."""
+    key = (iface, group, int(port))
+    with _lock:
+        hub = _hubs.get(key)
+        if not hub:
+            return {}
+        st = hub.get("stats") or {}
+        return dict(st)
 
 
 def resolve_ffmpeg_url(work_dir, url, iface, consumer_id, logger=None):

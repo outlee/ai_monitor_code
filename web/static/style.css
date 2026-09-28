@@ -151,7 +151,10 @@ body {
   overflow: hidden; text-overflow: ellipsis;
 }
 .ch-card .ch-id { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.ch-card .ch-rate { font-size: 11px; color: #93c5fd; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .ch-card .ch-meta { font-size: 11px; color: var(--muted); margin-top: 6px; min-height: 28px; }
+.perf-net { margin-top: 8px; font-size: 12px; line-height: 1.5; color: var(--text); }
+.perf-net b { color: var(--muted); font-weight: 600; }
 
 .event-toolbar {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;

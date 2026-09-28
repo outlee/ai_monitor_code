@@ -521,6 +521,15 @@ class StreamMonitor:
             else None,
             "ai_async": self.ai_async,
         }
+        cap = self._capture_stats()
+        if cap:
+            payload["pkt_rate"] = cap.get("pkt_rate")
+            payload["bitrate_kbps"] = cap.get("bitrate_kbps")
+            payload["capture_skip"] = cap.get("skip")
+            payload["capture_dests"] = cap.get("dests")
+            payload["capture_ring_kb"] = cap.get("ring_kb")
+            payload["capture_group"] = cap.get("group")
+            payload["capture_port"] = cap.get("mport")
         if extra:
             payload.update(extra)
         path = self.status_dir / f"{self.id}.json"
@@ -543,6 +552,25 @@ class StreamMonitor:
                     pass
         except OSError as e:
             self.logger.debug(f"写心跳失败: {e}")
+
+    def _capture_stats(self):
+        if not self._capture_key:
+            return {}
+        try:
+            from iface_mcast import hub_stats
+        except ImportError:
+            try:
+                from workers.iface_mcast import hub_stats
+            except ImportError:
+                return {}
+        try:
+            iface, group, port, _cid = self._capture_key
+        except Exception:
+            return {}
+        try:
+            return hub_stats(iface, group, port) or {}
+        except Exception:
+            return {}
 
     def _media_timeout_sec(self) -> float:
         return max(float(self.defaults.get("input_timeout_sec", 15.0)), 20.0)

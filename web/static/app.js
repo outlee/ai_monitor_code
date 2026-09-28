@@ -494,12 +494,31 @@
     $("#import-modal").classList.add("hidden");
   }
 
+  function fmtBitrate(kbps) {
+    if (kbps == null || kbps === "" || Number.isNaN(Number(kbps))) return "";
+    const v = Number(kbps);
+    if (v >= 1000) return (v / 1000).toFixed(1) + " Mbps";
+    if (v > 0) return Math.round(v) + " kbps";
+    return "0";
+  }
+
+  function streamLabel(c) {
+    const parts = [];
+    const br = fmtBitrate(c.bitrate_kbps);
+    if (br) parts.push(br);
+    if (c.pkt_rate != null && c.pkt_rate !== "") {
+      parts.push(Number(c.pkt_rate).toFixed(0) + " pkt/s");
+    }
+    return parts.join(" · ");
+  }
+
   function channelCardHtml(c, large) {
     const alarms = formatAlarmTags(c.active_alarms, c.last_type);
     const prog =
       c.program !== undefined && c.program !== null && c.program !== ""
         ? "P" + c.program
         : "";
+    const stream = streamLabel(c);
     const thumb = c.thumb_url
       ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
@@ -511,6 +530,7 @@
       <div class="ch-body">
         <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
         <div class="ch-id">${escapeHtml(c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
+        <div class="ch-rate">${stream ? escapeHtml(stream) : "码流 —"}</div>
         <div class="ch-meta">${escapeHtml(statusText(c.status))} · ${escapeHtml(alarms)}</div>
       </div>
     </div>`;
@@ -695,7 +715,7 @@
     });
 
     if (!channels.length) {
-      tbody.innerHTML = `<tr><td colspan="10" class="empty">暂无频道，点击「新增」或「导入」</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="11" class="empty">暂无频道，点击「新增」或「导入」</td></tr>`;
     } else {
       tbody.innerHTML = channels
         .map(
@@ -712,6 +732,11 @@
           <td>${
             c.program !== undefined && c.program !== null && c.program !== ""
               ? escapeHtml(c.program)
+              : "<span style=\"color:var(--muted)\">-</span>"
+          }</td>
+          <td class="ch-br">${
+            streamLabel(c)
+              ? escapeHtml(streamLabel(c))
               : "<span style=\"color:var(--muted)\">-</span>"
           }</td>
           <td>${
@@ -964,6 +989,25 @@
       const load1 = p.loadavg && p.loadavg["1"] != null ? Number(p.loadavg["1"]).toFixed(2) : "-";
       const load5 = p.loadavg && p.loadavg["5"] != null ? Number(p.loadavg["5"]).toFixed(2) : "-";
       const cores = p.cpu_cores != null ? p.cpu_cores : "-";
+      const nicLines = (p.nics || [])
+        .map((n) => {
+          const car =
+            n.carrier === true ? "有载波" : n.carrier === false ? "无载波" : n.operstate || "-";
+          const sp = n.speed_mbps ? n.speed_mbps + "Mb/s" : "";
+          const ip = n.ipv4 ? n.ipv4 : "无IP";
+          const mark = n.up ? "●" : "○";
+          return `${mark} ${n.name} ${car} ${sp} ${ip}`.replace(/\s+/g, " ").trim();
+        })
+        .join("<br/>");
+      const capLines = (p.captures || [])
+        .map((h) => {
+          const br = fmtBitrate(h.bitrate_kbps) || "-";
+          const rate = h.pkt_rate != null ? Number(h.pkt_rate).toFixed(0) + " pkt/s" : "-";
+          return `${h.iface || "-"} ${h.group}:${h.port} ${br} ${rate} dests=${
+            h.dests != null ? h.dests : "-"
+          }`;
+        })
+        .join("<br/>");
       box.innerHTML = `
         CPU 估算 <b>${cpu}</b>（核数 ${cores}）· 负载 <b>${load1}</b> / ${load5}<br/>
         内存 <b>${memPct}</b>（${fmtBytes(p.memory && p.memory.used_bytes)} / ${fmtBytes(
@@ -972,6 +1016,8 @@
         磁盘 <b>${diskPct}</b>（已用 ${fmtBytes(p.disk && p.disk.used_bytes)} · 剩余 ${fmtBytes(
         p.disk && p.disk.free_bytes
       )}）<br/>
+        <div class="perf-net"><b>网卡</b><br/>${nicLines || "-"}</div>
+        <div class="perf-net"><b>组播抓包</b><br/>${capLines || "暂无（需监测进程心跳）"}</div>
         <span style="font-size:11px">更新于 ${escapeHtml(p.time || "")}</span>
       `;
     } catch (e) {

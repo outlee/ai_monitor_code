@@ -239,7 +239,15 @@ def _channel_stats(
             info["state"] = st.get("state")
             info["active_alarms"] = st.get("active_alarms") or []
             info["reconnect_count"] = st.get("reconnect_count") or 0
+            info["pkt_rate"] = st.get("pkt_rate")
+            info["bitrate_kbps"] = st.get("bitrate_kbps")
+            info["capture_skip"] = st.get("capture_skip")
+            info["capture_dests"] = st.get("capture_dests")
+            info["capture_ring_kb"] = st.get("capture_ring_kb")
+            if st.get("iface"):
+                info["iface"] = st.get("iface")
             hb_ts = st.get("last_heartbeat_ts")
+
             try:
                 hb_ts_f = float(hb_ts) if hb_ts is not None else 0.0
             except (TypeError, ValueError):
@@ -498,8 +506,12 @@ def api_dashboard():
                 "program": s.get("program"),
                 "enabled": s.get("enabled", True),
                 "thumb_url": thumb,
+                "pkt_rate": s.get("pkt_rate"),
+                "bitrate_kbps": s.get("bitrate_kbps"),
+                "iface": s.get("iface"),
             }
         )
+
 
     # 大屏只展示正在监测的频道；禁用的只出现在管理页
     cards = [c for c in cards if c.get("enabled", True)]
@@ -764,6 +776,7 @@ def api_system_perf():
         }
     except OSError:
         pass
+    captures = _capture_hubs_from_status()
     return {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "cpu_percent": cpu_est,
@@ -776,6 +789,8 @@ def api_system_perf():
             "used_percent": round(100.0 * mem_used / mem_total, 1) if mem_total else None,
         },
         "disk": disk,
+        "nics": _nic_status_list(),
+        "captures": captures,
     }
 
 
@@ -993,7 +1008,93 @@ def _normalize_channel(raw: Dict[str, Any], require_all: bool = True) -> Dict[st
     return out
 
 
+def _read_sys_net(name: str, field: str) -> str:
+    p = Path("/sys/class/net") / name / field
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _nic_status_list() -> List[Dict[str, Any]]:
+    """网卡载波 / 速率，供管理页网络状况。"""
+    nics: List[Dict[str, Any]] = []
+    by_ip = {n["name"]: n.get("ipv4") or "" for n in _list_nics()}
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return _list_nics()
+    for name in names:
+        if name == "lo" or name.startswith("lo:"):
+            continue
+        oper = _read_sys_net(name, "operstate")
+        carrier_s = _read_sys_net(name, "carrier")
+        speed_s = _read_sys_net(name, "speed")
+        carrier = None
+        if carrier_s in ("0", "1"):
+            carrier = carrier_s == "1"
+        speed_mbps = None
+        try:
+            sp = int(speed_s)
+            if sp > 0:
+                speed_mbps = sp
+        except (TypeError, ValueError):
+            pass
+        up = oper == "up" and carrier is not False
+        nics.append(
+            {
+                "name": name,
+                "ipv4": by_ip.get(name, ""),
+                "operstate": oper or "unknown",
+                "carrier": carrier,
+                "speed_mbps": speed_mbps,
+                "up": up,
+            }
+        )
+    return nics
+
+
+def _capture_hubs_from_status() -> List[Dict[str, Any]]:
+    """从各频道心跳汇总抓包（同一组播只保留一条）。"""
+    hubs: Dict[str, Dict[str, Any]] = {}
+    if not STATUS_DIR.is_dir():
+        return []
+    for p in STATUS_DIR.glob("*.json"):
+        if p.name.endswith("_manager.json"):
+            continue
+        try:
+            st = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        iface = st.get("iface") or ""
+        group = st.get("capture_group") or ""
+        port = st.get("capture_port")
+        if not group:
+            continue
+        key = "%s:%s:%s" % (iface, group, port)
+        age = None
+        ts = st.get("last_heartbeat_ts")
+        try:
+            if ts is not None:
+                age = round(time.time() - float(ts), 1)
+        except (TypeError, ValueError):
+            pass
+        hubs[key] = {
+            "iface": iface,
+            "group": group,
+            "port": port,
+            "pkt_rate": st.get("pkt_rate"),
+            "bitrate_kbps": st.get("bitrate_kbps"),
+            "skip": st.get("capture_skip"),
+            "dests": st.get("capture_dests"),
+            "ring_kb": st.get("capture_ring_kb"),
+            "age_sec": age,
+        }
+    return sorted(hubs.values(), key=lambda x: (x.get("iface") or "", x.get("group") or ""))
+
+
 def _list_nics() -> List[Dict[str, Any]]:
+
     """列出本机网卡（排除 lo），供频道管理下拉选择。"""
     nics: List[Dict[str, Any]] = []
     try:
