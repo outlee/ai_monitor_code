@@ -76,13 +76,23 @@
   <section class="panel dash-panel" id="view-dash">
     <div class="panel-head">
       <h2>频道大屏</h2>
-      <span class="hint">绿正常/红异常/黄离线/灰禁用 · 画面=监测运行中的实时帧（非仅异常）· 点击可预览</span>
+      <span class="hint">仅显示已启用监测的频道 · 异常置顶 · 点击放大预览</span>
     </div>
     <div class="lamp-legend">
       <span><i class="dot green"></i>正常 <b id="sum-green">0</b></span>
       <span><i class="dot red"></i>异常 <b id="sum-red">0</b></span>
-      <span><i class="dot yellow"></i>离线/重连 <b id="sum-yellow">0</b></span>
-      <span><i class="dot gray"></i>禁用 <b id="sum-gray">0</b></span>
+      <span><i class="dot yellow"></i>离线/无信号 <b id="sum-yellow">0</b></span>
+    </div>
+    <div id="alarm-strip" class="alarm-strip hidden">
+      <div class="panel-head alarm-strip-head">
+        <h2>异常节目</h2>
+        <span class="hint">置顶放大 · 点击全屏预览</span>
+      </div>
+      <div class="alarm-grid" id="alarm-grid"></div>
+    </div>
+    <div class="panel-head" id="ok-strip-head">
+      <h2>监测中</h2>
+      <span class="hint">正常频道</span>
     </div>
     <div class="channel-grid" id="channel-grid">
       <div class="empty">加载中…</div>

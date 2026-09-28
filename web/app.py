@@ -501,6 +501,16 @@ def api_dashboard():
             }
         )
 
+    # 大屏只展示正在监测的频道；禁用的只出现在管理页
+    cards = [c for c in cards if c.get("enabled", True)]
+    lamp_rank = {"red": 0, "yellow": 1, "green": 2, "gray": 3}
+    cards.sort(
+        key=lambda c: (
+            lamp_rank.get(c.get("lamp") or "", 9),
+            (c.get("name") or c.get("id") or ""),
+        )
+    )
+
     hist = None
     if event_db is not None:
         try:

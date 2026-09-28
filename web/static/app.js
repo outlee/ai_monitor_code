@@ -494,6 +494,41 @@
     $("#import-modal").classList.add("hidden");
   }
 
+  function channelCardHtml(c, large) {
+    const alarms = formatAlarmTags(c.active_alarms, c.last_type);
+    const prog =
+      c.program !== undefined && c.program !== null && c.program !== ""
+        ? "P" + c.program
+        : "";
+    const thumb = c.thumb_url
+      ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
+      : `<div class="ch-thumb placeholder">暂无画面</div>`;
+    const cls = large ? "ch-card ch-card-lg" : "ch-card";
+    return `<div class="${cls} lamp-${escapeHtml(c.lamp || "gray")}" data-id="${escapeHtml(
+      c.id
+    )}" title="${escapeHtml(c.name || c.id)}">
+      ${thumb}
+      <div class="ch-body">
+        <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
+        <div class="ch-id">${escapeHtml(c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
+        <div class="ch-meta">${escapeHtml(statusText(c.status))} · ${escapeHtml(alarms)}</div>
+      </div>
+    </div>`;
+  }
+
+  function bindChannelCardClicks(root) {
+    if (!root) return;
+    root.querySelectorAll(".ch-card").forEach((el) => {
+      el.addEventListener("click", () => {
+        const id = el.dataset.id;
+        const name =
+          (el.querySelector(".ch-name") && el.querySelector(".ch-name").textContent) ||
+          id;
+        openPreview(id, name);
+      });
+    });
+  }
+
   function renderDashboard(dash) {
     if (!dash) return;
     const sum = dash.summary || {};
@@ -502,43 +537,39 @@
     if ($("#sum-yellow")) $("#sum-yellow").textContent = sum.yellow ?? 0;
     if ($("#sum-gray")) $("#sum-gray").textContent = sum.gray ?? 0;
 
+    const all = (dash.cards || []).filter((c) => c.enabled !== false);
+    const bad = all.filter((c) => c.lamp === "red" || c.lamp === "yellow");
+    const ok = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
+
+    const strip = $("#alarm-strip");
+    const alarmGrid = $("#alarm-grid");
+    if (strip && alarmGrid) {
+      if (!bad.length) {
+        strip.classList.add("hidden");
+        alarmGrid.innerHTML = "";
+      } else {
+        strip.classList.remove("hidden");
+        alarmGrid.innerHTML = bad.map((c) => channelCardHtml(c, true)).join("");
+        bindChannelCardClicks(alarmGrid);
+      }
+    }
+
+    const okHead = $("#ok-strip-head");
+    if (okHead) {
+      okHead.style.display = all.length ? "" : "none";
+      const hint = okHead.querySelector(".hint");
+      if (hint) hint.textContent = bad.length ? "正常频道" : "已启用监测的频道";
+    }
+
     const grid = $("#channel-grid");
     if (grid) {
-      const cards = dash.cards || [];
-      if (!cards.length) {
-        grid.innerHTML = `<div class="empty">暂无频道</div>`;
+      if (!all.length) {
+        grid.innerHTML = `<div class="empty">暂无已启用的监测频道</div>`;
+      } else if (!ok.length) {
+        grid.innerHTML = `<div class="empty">当前没有正常频道</div>`;
       } else {
-        grid.innerHTML = cards
-          .map((c) => {
-            const alarms = formatAlarmTags(c.active_alarms, c.last_type);
-            const prog =
-              c.program !== undefined && c.program !== null && c.program !== ""
-                ? "P" + c.program
-                : "";
-            const thumb = c.thumb_url
-              ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
-              : `<div class="ch-thumb placeholder">暂无画面</div>`;
-            return `<div class="ch-card lamp-${escapeHtml(c.lamp || "gray")}" data-id="${escapeHtml(
-              c.id
-            )}" title="${escapeHtml(c.name || c.id)}">
-              ${thumb}
-              <div class="ch-body">
-                <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
-                <div class="ch-id">${escapeHtml(c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
-                <div class="ch-meta">${escapeHtml(statusText(c.status))} · ${escapeHtml(alarms)}</div>
-              </div>
-            </div>`;
-          })
-          .join("");
-        grid.querySelectorAll(".ch-card").forEach((el) => {
-          el.addEventListener("click", () => {
-            const id = el.dataset.id;
-            const name =
-              (el.querySelector(".ch-name") && el.querySelector(".ch-name").textContent) ||
-              id;
-            openPreview(id, name);
-          });
-        });
+        grid.innerHTML = ok.map((c) => channelCardHtml(c, false)).join("");
+        bindChannelCardClicks(grid);
       }
     }
 

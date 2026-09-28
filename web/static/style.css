@@ -100,6 +100,22 @@ body {
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 10px;
 }
+.alarm-strip {
+  margin: 0 0 16px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+.alarm-strip.hidden { display: none; }
+.alarm-strip-head { border-bottom: 0; padding-left: 0; padding-right: 0; }
+.alarm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+.ch-card.ch-card-lg { min-height: 200px; }
+.ch-card.ch-card-lg .ch-thumb { aspect-ratio: 16 / 9; min-height: 120px; }
+.ch-card.ch-card-lg .ch-name { font-size: 16px; }
+.ch-card.ch-card-lg .ch-meta { font-size: 13px; color: var(--text); }
 .card.clickable { cursor: pointer; }
 .card.clickable:hover { border-color: var(--accent); }
 
@@ -159,7 +175,10 @@ body {
 .hist-wrap {
   display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
 }
-@media (max-width: 800px) { .hist-wrap { grid-template-columns: 1fr; } }
+@media (max-width: 800px) {
+  .hist-wrap { grid-template-columns: 1fr; }
+  .alarm-grid { grid-template-columns: 1fr; }
+}
 .mini-h { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
 .hist-list { list-style: none; font-size: 13px; max-height: 200px; overflow: auto; }
 .hist-list li {
