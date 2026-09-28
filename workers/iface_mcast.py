@@ -3,13 +3,12 @@
 """
 In-process multicast capture hub (CentOS7 / Python 3.6).
 
-One AF_PACKET reader per (iface, group, port). Each consumer gets one
-localhost UDP port for the monitor FFmpeg.
+One AF_PACKET reader per NIC in this process (not per group). Kernel BPF
+keeps only subscribed multicast; userspace fans out to localhost UDP.
 
 Also maintains:
   - a TS ring (debug / fallback snapshot)
   - per-consumer feeders that continuously receive the same TS bytes
-    for a long-running thumb FFmpeg reading from stdin (keeps SPS/PPS)
 """
 
 from __future__ import print_function
@@ -21,8 +20,11 @@ import struct
 import threading
 import time
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _hubs = {}
+_capturers = {}  # iface -> {stop, thread, gen, logger}
+
+SO_DETACH_FILTER = 27
 
 ETH_P_ALL = 0x0003
 ETH_P_IP = 0x0800
@@ -202,52 +204,68 @@ def _assemble_bpf(ops):
     return out
 
 
-def _bpf_udp_or_frag(group, port):
-    """Accept IPv4 UDP to group:port, plus IP fragments to group (for reassembly)."""
-    dst = _ip4_to_int(group)
-    port = int(port)
-    return _assemble_bpf(
+def _bpf_dst_ips(ip_ints):
+    """Accept IPv4 UDP (or fragments) to any of dest IPs. Untagged + VLAN."""
+    ips = []
+    seen = set()
+    for x in ip_ints:
+        x = int(x) & 0xFFFFFFFF
+        if x not in seen:
+            seen.add(x)
+            ips.append(x)
+    if not ips:
+        return _assemble_bpf([("ret", 0)])
+
+    def _ip_chain(prefix, chk):
+        ops = []
+        for i, ip in enumerate(ips):
+            nxt = "%s_%d" % (prefix, i + 1) if i + 1 < len(ips) else "drop"
+            ops.append(("jeq", ip, chk, nxt))
+            if i + 1 < len(ips):
+                ops.append(("label", "%s_%d" % (prefix, i + 1)))
+        return ops
+
+    ops = [
+        ("ldh", 12),
+        ("jeq", 0x8100, "vlan", "untag"),
+        ("label", "untag"),
+        ("ldh", 12),
+        ("jeq", 0x0800, "ip4", "drop"),
+        ("label", "ip4"),
+        ("ld", 30),
+    ]
+    ops.extend(_ip_chain("n", "chk4"))
+    ops.extend(
         [
-            ("ldh", 12),
-            ("jeq", 0x8100, "vlan", "untag"),
-            ("label", "untag"),
-            ("ldh", 12),
-            ("jeq", 0x0800, "ip4", "drop"),
-            ("label", "ip4"),
-            ("ld", 30),
-            ("jeq", dst, "frag4", "drop"),
-            ("label", "frag4"),
+            ("label", "chk4"),
             ("ldh", 20),
-            ("jset", 0x1FFF, "accept", "proto4"),
-            ("label", "proto4"),
+            ("jset", 0x1FFF, "accept", "p4"),
+            ("label", "p4"),
             ("ldb", 23),
-            ("jeq", 17, "udp4", "drop"),
-            ("label", "udp4"),
-            ("ldxb_msh", 14),
-            ("ldh_ind", 16),
-            ("jeq", port, "accept", "drop"),
+            ("jeq", 17, "accept", "drop"),
             ("label", "vlan"),
             ("ldh", 16),
             ("jeq", 0x0800, "ip4v", "drop"),
             ("label", "ip4v"),
             ("ld", 34),
-            ("jeq", dst, "fragv", "drop"),
-            ("label", "fragv"),
+        ]
+    )
+    ops.extend(_ip_chain("v", "chkv"))
+    ops.extend(
+        [
+            ("label", "chkv"),
             ("ldh", 24),
-            ("jset", 0x1FFF, "accept", "protov"),
-            ("label", "protov"),
+            ("jset", 0x1FFF, "accept", "pv"),
+            ("label", "pv"),
             ("ldb", 27),
-            ("jeq", 17, "udpv", "drop"),
-            ("label", "udpv"),
-            ("ldxb_msh", 18),
-            ("ldh_ind", 20),
-            ("jeq", port, "accept", "drop"),
+            ("jeq", 17, "accept", "drop"),
             ("label", "accept"),
-            ("ret", 0x40000),
+            ("ret", 65535),
             ("label", "drop"),
             ("ret", 0),
         ]
     )
+    return _assemble_bpf(ops)
 
 
 def _attach_bpf(sock, insns, logger=None):
@@ -453,25 +471,124 @@ def _all_local_ports(hub):
     return ports
 
 
-def _capture_loop(hub):
-    iface = hub["iface"]
-    group = hub["group"]
-    mport = hub["mport"]
-    logger = hub.get("logger")
+def _raise_rmem_max(nbytes=128 * 1024 * 1024):
+    """SO_RCVBUF 被 rmem_max(~208KB) 卡住时，16MB 形同虚设。"""
+    path = "/proc/sys/net/core/rmem_max"
+    try:
+        cur = int(open(path, "r").read().strip())
+    except Exception:
+        return
+    if cur >= int(nbytes):
+        return
+    try:
+        open(path, "w").write("%d\n" % int(nbytes))
+    except Exception:
+        pass
+
+
+def _hub_map_for_iface(iface):
+    """(dst_ip_bytes, udp_port) -> hub"""
+    mapping = {}
+    ips = []
+    with _lock:
+        items = list(_hubs.items())
+    for (iff, group, port), hub in items:
+        if iff != iface:
+            continue
+        try:
+            dst = socket.inet_aton(group)
+        except Exception:
+            continue
+        mapping[(dst, int(port))] = hub
+        ips.append(_ip4_to_int(group))
+    return mapping, ips
+
+
+def _deliver(hub, payload, out_sock):
+    ring = hub.get("ring")
+    if ring is not None:
+        try:
+            ring.write(payload)
+        except Exception:
+            pass
+    with hub["dest_lock"]:
+        dests = list(_all_local_ports(hub))
+        feeders = list((hub.get("feeders") or {}).values())
+    for lp in dests:
+        try:
+            out_sock.sendto(payload, ("127.0.0.1", lp))
+        except Exception:
+            pass
+    for feeder in feeders:
+        try:
+            feeder.put(payload)
+        except Exception:
+            pass
+    st = hub.get("_win")
+    if st is None:
+        st = {"n": 0, "b": 0, "t": time.time(), "pkts": 0, "bytes": 0}
+        hub["_win"] = st
+    st["n"] += 1
+    st["b"] += len(payload)
+    st["pkts"] += 1
+    st["bytes"] += len(payload)
+    now = time.time()
+    if now - st["t"] >= 1.0:
+        dt = max(now - st["t"], 1e-6)
+        rsz = 0
+        try:
+            rsz = hub.get("ring").size() if hub.get("ring") else 0
+        except Exception:
+            pass
+        with hub["dest_lock"]:
+            nd = len(list(_all_local_ports(hub)))
+        hub["stats"] = {
+            "iface": hub.get("iface"),
+            "group": hub.get("group"),
+            "mport": hub.get("mport"),
+            "pkts": st["pkts"],
+            "skip": 0,
+            "bytes": st["bytes"],
+            "pkt_rate": round(st["n"] / dt, 1),
+            "bitrate_kbps": round(st["b"] * 8.0 / dt / 1000.0, 1),
+            "dests": nd,
+            "ring_kb": int(rsz / 1024),
+            "updated_ts": now,
+        }
+        st["n"] = 0
+        st["b"] = 0
+        st["t"] = now
+    return True
+
+
+def _apply_bpf(raw, ips, logger=None):
+    if not ips:
+        try:
+            raw.setsockopt(socket.SOL_SOCKET, SO_DETACH_FILTER, 0)
+        except Exception:
+            pass
+        return False
+    _attach_bpf(raw, _bpf_dst_ips(ips), logger=logger)
+    return True
+
+
+def _iface_loop(iface, cap):
+    logger = cap.get("logger")
     raw = None
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     reasm = _IpReassembler()
+    bpf_on = False
     try:
+        _raise_rmem_max()
         raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
         raw.bind((iface, 0))
         try:
-            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024 * 1024)
         except Exception:
             pass
         try:
             ifindex = socket.if_nametoindex(iface)
-            mreq = struct.pack("IHH8s", ifindex, 1, 0, b"\x00" * 8)  # PROMISC
-            # CentOS 自带 Python 可能没有 socket.SOL_PACKET（值为 263）
+            mreq = struct.pack("IHH8s", ifindex, 1, 0, b"\x00" * 8)
             sol_packet = getattr(socket, "SOL_PACKET", 263)
             raw.setsockopt(sol_packet, 1, mreq)
         except Exception as e:
@@ -488,128 +605,121 @@ def _capture_loop(hub):
         except Exception as e:
             if logger:
                 logger.warning("ip promisc skip: %s" % e)
-        # BPF 在部分网卡/VLAN 卸载场景会把组播全部滤掉 → 全频道断流。
-        # 先不挂 BPF，仍靠用户态匹配 group:port（skip 会偏大，但能收到流）。
+        raw.settimeout(1.0)
+        mapping, ips = _hub_map_for_iface(iface)
+        last_gen = cap.get("gen", 0)
+        try:
+            bpf_on = _apply_bpf(raw, ips, logger)
+        except Exception as e:
+            bpf_on = False
+            if logger:
+                logger.warning("bpf attach fail, userspace match: %s" % e)
         if logger:
             logger.info(
-                "iface capture thread on %s for %s:%s bpf=off"
-                % (iface, group, mport)
+                "iface capture %s groups=%d bpf=%s"
+                % (iface, len(ips), "on" if bpf_on else "off")
             )
-        n = 0
+        n_match = 0
         n_skip = 0
-        nbytes = 0
         t0 = time.time()
-        last = t0
-        win_t = t0
-        win_n = 0
-        win_b = 0
+        last_log = t0
+        last_match = t0
+        bpf_since = t0
 
-        def _publish(now, dests):
-            rsz = 0
+        while not cap["stop"]:
+            gen = cap.get("gen", 0)
+            if gen != last_gen:
+                mapping, ips = _hub_map_for_iface(iface)
+                last_gen = gen
+                try:
+                    bpf_on = _apply_bpf(raw, ips, logger)
+                    bpf_since = time.time()
+                    last_match = bpf_since
+                    if logger:
+                        logger.info(
+                            "iface capture %s bpf reload groups=%d bpf=%s"
+                            % (iface, len(ips), "on" if bpf_on else "off")
+                        )
+                except Exception as e:
+                    bpf_on = False
+                    if logger:
+                        logger.warning("bpf reload fail: %s" % e)
             try:
-                rsz = hub.get("ring").size() if hub.get("ring") else 0
-            except Exception:
-                pass
-            dt = max(now - win_t, 1e-6)
-            hub["stats"] = {
-                "iface": iface,
-                "group": group,
-                "mport": mport,
-                "pkts": n,
-                "skip": n_skip,
-                "bytes": nbytes,
-                "pkt_rate": round(win_n / dt, 1),
-                "bitrate_kbps": round(win_b * 8.0 / dt / 1000.0, 1),
-                "dests": dests,
-                "ring_kb": int(rsz / 1024),
-                "updated_ts": now,
-            }
-
-        while not hub["stop"]:
-            try:
-                raw.settimeout(1.0)
-                frame = raw.recv(65535)
+                frame = raw.recv(2048)
             except socket.timeout:
                 now = time.time()
-                with hub["dest_lock"]:
-                    nd = len(list(_all_local_ports(hub)))
-                if now - win_t >= 1.0:
-                    _publish(now, nd)
-                    win_n = 0
-                    win_b = 0
-                    win_t = now
-                if logger and now - last >= 30:
-                    st = hub.get("stats") or {}
+                if bpf_on and n_match == 0 and now - bpf_since >= 8.0:
+                    try:
+                        raw.setsockopt(socket.SOL_SOCKET, SO_DETACH_FILTER, 0)
+                    except Exception:
+                        pass
+                    bpf_on = False
+                    if logger:
+                        logger.warning(
+                            "iface capture %s bpf=off fallback (0 match in 8s)"
+                            % iface
+                        )
+                if logger and now - last_log >= 30:
                     logger.info(
-                        "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
+                        "iface capture %s bpf=%s match=%d skip=%d groups=%d"
                         % (
-                            group,
-                            mport,
-                            n,
-                            float(st.get("pkt_rate") or 0),
-                            nd,
+                            iface,
+                            "on" if bpf_on else "off",
+                            n_match,
                             n_skip,
-                            int(st.get("ring_kb") or 0),
+                            len(mapping),
                         )
                     )
-                    last = now
+                    last_log = now
+                    for hub in mapping.values():
+                        st = hub.get("stats") or {}
+                        logger.info(
+                            "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
+                            % (
+                                hub.get("group"),
+                                hub.get("mport"),
+                                int(st.get("pkts") or 0),
+                                float(st.get("pkt_rate") or 0),
+                                int(st.get("dests") or 0),
+                                n_skip,
+                                int(st.get("ring_kb") or 0),
+                            )
+                        )
                 continue
             except Exception:
-                if hub["stop"]:
+                if cap["stop"]:
                     break
                 time.sleep(0.05)
                 continue
-            payload = _parse_payload(frame, group, mport, reasm=reasm)
+
+            ip = _extract_ip(frame)
+            if ip is None:
+                n_skip += 1
+                continue
+            if reasm is not None:
+                ip = reasm.feed(ip)
+                if ip is None:
+                    continue
+            ihl = (ip[0] & 0x0F) * 4
+            if ihl < 20 or len(ip) < ihl + 8:
+                n_skip += 1
+                continue
+            dst = ip[16:20]
+            dport = struct.unpack("!H", ip[ihl + 2 : ihl + 4])[0]
+            hub = mapping.get((dst, dport))
+            if hub is None:
+                n_skip += 1
+                continue
+            payload = _udp_payload_from_ip(ip, hub["group"], hub["mport"])
             if not payload:
                 n_skip += 1
                 continue
-            ring = hub.get("ring")
-            if ring is not None:
-                try:
-                    ring.write(payload)
-                except Exception:
-                    pass
-            with hub["dest_lock"]:
-                dests = list(_all_local_ports(hub))
-                feeders = list((hub.get("feeders") or {}).values())
-            for lp in dests:
-                try:
-                    out.sendto(payload, ("127.0.0.1", lp))
-                except Exception:
-                    pass
-            for feeder in feeders:
-                try:
-                    feeder.put(payload)
-                except Exception:
-                    pass
-            n += 1
-            nbytes += len(payload)
-            win_n += 1
-            win_b += len(payload)
-            now = time.time()
-            if now - win_t >= 2.0:
-                _publish(now, len(dests))
-                win_n = 0
-                win_b = 0
-                win_t = now
-            if logger and now - last >= 30:
-                st = hub.get("stats") or {}
-                logger.info(
-                    "iface capture %s:%s pkts=%d rate=%.1f dests=%d skip=%d ring=%dKB"
-                    % (
-                        group,
-                        mport,
-                        n,
-                        float(st.get("pkt_rate") or n / max(now - t0, 1e-6)),
-                        len(dests),
-                        n_skip,
-                        int(st.get("ring_kb") or 0),
-                    )
-                )
-                last = now
+            _deliver(hub, payload, out)
+            n_match += 1
+            last_match = time.time()
     except Exception as e:
         if logger:
-            logger.error("iface capture thread error: %s" % e)
+            logger.error("iface capture thread error %s: %s" % (iface, e))
     finally:
         try:
             out.close()
@@ -621,7 +731,53 @@ def _capture_loop(hub):
             except Exception:
                 pass
         if logger:
-            logger.info("iface capture thread stopped %s:%s" % (group, mport))
+            logger.info("iface capture thread stopped %s" % iface)
+
+
+def _ensure_capturer(iface, logger=None):
+    with _lock:
+        cap = _capturers.get(iface)
+        if cap is not None and cap.get("thread") is not None and cap["thread"].is_alive():
+            cap["gen"] = int(cap.get("gen") or 0) + 1
+            if logger:
+                cap["logger"] = logger
+            return cap
+        cap = {
+            "stop": False,
+            "thread": None,
+            "gen": 1,
+            "logger": logger,
+        }
+        _capturers[iface] = cap
+        t = threading.Thread(
+            target=_iface_loop,
+            args=(iface, cap),
+            name="mcap-%s" % iface,
+            daemon=True,
+        )
+        cap["thread"] = t
+        t.start()
+    time.sleep(0.2)
+    return cap
+
+
+def _maybe_stop_capturer(iface, logger=None):
+    with _lock:
+        still = any(k[0] == iface for k in _hubs)
+        if still:
+            cap = _capturers.get(iface)
+            if cap is not None:
+                cap["gen"] = int(cap.get("gen") or 0) + 1
+            return
+        cap = _capturers.pop(iface, None)
+    if cap is None:
+        return
+    cap["stop"] = True
+    t = cap.get("thread")
+    if t is not None and t.is_alive():
+        t.join(timeout=3)
+    if logger:
+        logger.info("stopped iface capturer %s" % iface)
 
 
 def acquire(work_dir, iface, group, port, consumer_id, logger=None):
@@ -643,8 +799,6 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
                 "ports": {},
                 "feeders": {},
                 "dest_lock": threading.Lock(),
-                "stop": False,
-                "thread": None,
                 "logger": logger,
                 "ring": _TsRing(_DEFAULT_RING_BYTES),
             }
@@ -667,18 +821,7 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
         with hub["dest_lock"]:
             hub["ports"][consumer_id] = {"mon": mon}
 
-        if hub["thread"] is None or not hub["thread"].is_alive():
-            hub["stop"] = False
-            hub["logger"] = logger or hub.get("logger")
-            t = threading.Thread(
-                target=_capture_loop,
-                args=(hub,),
-                name="mcap-%s-%s" % (iface, group),
-                daemon=True,
-            )
-            hub["thread"] = t
-            t.start()
-            time.sleep(0.3)
+        _ensure_capturer(iface, logger or hub.get("logger"))
 
         if logger:
             logger.info(
@@ -690,6 +833,7 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
 
 def release(iface, group, port, consumer_id, logger=None):
     key = (iface, group, int(port))
+    empty = False
     with _lock:
         hub = _hubs.get(key)
         if not hub:
@@ -705,10 +849,6 @@ def release(iface, group, port, consumer_id, logger=None):
             except Exception:
                 pass
         if empty:
-            hub["stop"] = True
-            t = hub.get("thread")
-            if t and t.is_alive():
-                t.join(timeout=3)
             del _hubs[key]
             if logger:
                 logger.info("stopped iface capture %s" % (key,))
@@ -717,6 +857,8 @@ def release(iface, group, port, consumer_id, logger=None):
                 "iface capture release %s remaining=%d"
                 % (consumer_id, len(hub["ports"]))
             )
+    if empty:
+        _maybe_stop_capturer(iface, logger)
 
 
 def register_feeder(iface, group, port, consumer_id, feeder=None, logger=None):
