@@ -105,15 +105,15 @@ class StreamMonitor:
         self.freeze_duration = float(
             channel.get("freeze_duration", defaults.get("freeze_duration", 12.0))
         )
-        # 组播丢包/skip_loop_filter 后帧差变小，过短会误报静帧
-        if self.freeze_duration < 10.0:
-            self.freeze_duration = 10.0
-        # freezedetect 噪声阈值，越大越不敏感（组播环境建议 >= 0.05）
+        # 组播 PTS 乱跳时，过短会把短暂停顿打成静帧
+        if self.freeze_duration < 12.0:
+            self.freeze_duration = 12.0
+        # freezedetect 噪声阈值，越大越不敏感
         self.freeze_noise = float(
-            channel.get("freeze_noise", defaults.get("freeze_noise", 0.05))
+            channel.get("freeze_noise", defaults.get("freeze_noise", 0.08))
         )
-        if self.freeze_noise < 0.05:
-            self.freeze_noise = 0.05
+        if self.freeze_noise < 0.08:
+            self.freeze_noise = 0.08
         self.silence_duration = float(
             channel.get("silence_duration", defaults.get("silence_duration", 12.0))
         )
@@ -433,8 +433,6 @@ class StreamMonitor:
             "1",
             "-filter_threads",
             "1",
-            "-skip_loop_filter",
-            "all",
         ]
         if is_udp or self.program is not None:
             cmd.extend(
@@ -447,6 +445,8 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
+        # 静帧/黑场按时墙计时，避免组播 PTS 停住几秒就被判成冻了 10 秒
+        cmd.extend(["-use_wallclock_as_timestamps", "1"])
         cmd.extend(
             [
                 "-i",
@@ -1936,7 +1936,7 @@ class StreamMonitor:
         for key, item in list(self._pending_alarms.items()):
             need = self.alarm_confirm_sec
             if key == "freeze":
-                need = max(need, 6.0)
+                need = max(need, 12.0)
             if now - item["since"] >= need:
                 self._commit_alarm_start(key, item["event"])
                 done.append(key)
@@ -1978,6 +1978,20 @@ class StreamMonitor:
             start_ts = self._active_alarms.pop(alarm_key, None)
             if start_ts and "duration" not in event:
                 event["duration"] = round(_now_ts() - start_ts, 3)
+            dur = event.get("duration")
+            if (
+                alarm_key == "freeze"
+                and dur is not None
+                and float(dur) < float(self.freeze_duration)
+            ):
+                event["message"] = "静帧误报已撤销（持续 %.1fs，不足 %.0fs）" % (
+                    float(dur),
+                    float(self.freeze_duration),
+                )
+                self.logger.info(json.dumps(event, ensure_ascii=False))
+                self._save_event(event)
+                self._write_status()
+                return
             self.logger.info(json.dumps(event, ensure_ascii=False))
             self._save_event(event)
             self._write_status()
