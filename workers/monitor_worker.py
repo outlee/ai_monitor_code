@@ -390,22 +390,30 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        # 不再 split 第二路：这台 FFmpeg 7 对直播 mpegts 的 [vsnap]
-        # 从不打开输出 fd（FIFO/image2 都是 0 包），检测却是绿的。
-        # 检测滤镜是直通，单路接到 image2，解码有帧就一定能写出。
-        scale_in = (
-            f"scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
-            if dw and dw > 0
-            else ""
-        )
+        # 检测必须走 null 口才会真正拉帧（只接 rawvideo 时 CPU≈0、frame=0）。
+        # 截图走 split 的 [vsnap] → pipe:1（进程里已经打开，避免磁盘
+        # image2/FIFO 懒打开死锁）。
+        snap = "scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
         if use_side:
-            v = (
-                f"[{vin}]{scale_in}{detect},"
-                f"scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
-            )
+            if dw and dw > 0:
+                v = (
+                    f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear[vs];"
+                    f"[vs]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
+            else:
+                v = (
+                    f"[{vin}]split=2[vd][vf];"
+                    f"[vd]{detect}[vout];"
+                    f"[vf]{snap}"
+                )
             return f"{v};{audio}"
         if dw and dw > 0:
-            v = f"[{vin}]{scale_in}{detect}[vout]"
+            v = (
+                f"[{vin}]scale=w='min(iw\\,{dw})':h=-2:flags=fast_bilinear,"
+                f"{detect}[vout]"
+            )
         else:
             v = f"[{vin}]{detect}[vout]"
         return f"{v};{audio}"
@@ -441,10 +449,24 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
-        cmd.extend(["-i", ingest, "-filter_complex", fc])
+        cmd.extend(
+            [
+                "-i",
+                ingest,
+                "-filter_complex",
+                fc,
+                "-map",
+                "[vout]",
+                "-map",
+                "[aout]",
+                "-max_interleave_delta",
+                "0",
+                "-f",
+                "null",
+                "/dev/null",
+            ]
+        )
         if self.frame_interval_sec > 0:
-            # 视频写到 pipe:1（进程一启动 fd 就在）。image2/FIFO 文件是
-            # 懒打开：没有第一包就不 open，不 open 就没有第一包。
             cmd.extend(
                 [
                     "-map",
@@ -452,6 +474,8 @@ class StreamMonitor:
                     "-an",
                     "-fps_mode",
                     "passthrough",
+                    "-max_interleave_delta",
+                    "0",
                     "-f",
                     "rawvideo",
                     "-pix_fmt",
@@ -459,27 +483,6 @@ class StreamMonitor:
                     "-flush_packets",
                     "1",
                     "pipe:1",
-                    "-map",
-                    "[aout]",
-                    "-max_interleave_delta",
-                    "0",
-                    "-f",
-                    "null",
-                    "/dev/null",
-                ]
-            )
-        else:
-            cmd.extend(
-                [
-                    "-map",
-                    "[vout]",
-                    "-map",
-                    "[aout]",
-                    "-max_interleave_delta",
-                    "0",
-                    "-f",
-                    "null",
-                    "/dev/null",
                 ]
             )
         return cmd
