@@ -105,10 +105,15 @@ class StreamMonitor:
         self.freeze_duration = float(
             channel.get("freeze_duration", defaults.get("freeze_duration", 12.0))
         )
-        # freezedetect 噪声阈值，越大越不敏感（组播环境建议 >= 0.02）
+        # 组播丢包/skip_loop_filter 后帧差变小，过短会误报静帧
+        if self.freeze_duration < 10.0:
+            self.freeze_duration = 10.0
+        # freezedetect 噪声阈值，越大越不敏感（组播环境建议 >= 0.05）
         self.freeze_noise = float(
-            channel.get("freeze_noise", defaults.get("freeze_noise", 0.02))
+            channel.get("freeze_noise", defaults.get("freeze_noise", 0.05))
         )
+        if self.freeze_noise < 0.05:
+            self.freeze_noise = 0.05
         self.silence_duration = float(
             channel.get("silence_duration", defaults.get("silence_duration", 12.0))
         )
@@ -131,8 +136,10 @@ class StreamMonitor:
         )
         # 告警确认：ffmpeg 报 start 后还要再持续 confirm 秒且未 end 才正式告警
         self.alarm_confirm_sec = float(
-            defaults.get("alarm_confirm_sec", 3.0)
+            defaults.get("alarm_confirm_sec", 5.0)
         )
+        if self.alarm_confirm_sec < 5.0:
+            self.alarm_confirm_sec = 5.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -678,16 +685,7 @@ class StreamMonitor:
         src = self._thumb_url or self._ingest_url or self.url
         return src
 
-    def _gst_grab_jpeg(self, ts_path: Path, jpg_tmp: Path):
-        """tsdemux 抽第一帧即停。全机 flock，避免多 worker 同时解 TS。"""
-        gst = shutil.which("gst-launch-1.0") or "/usr/bin/gst-launch-1.0"
-        if not os.path.isfile(gst):
-            return False, "no_gst"
-        try:
-            if jpg_tmp.is_file():
-                jpg_tmp.unlink()
-        except OSError:
-            pass
+    def _gst_pipeline_cmd(self, gst, ts_path, jpg_tmp, kind):
         cmd = [
             gst,
             "-q",
@@ -698,12 +696,14 @@ class StreamMonitor:
         ]
         if self.program is not None:
             cmd.append("program-number=%d" % int(self.program))
+        if kind == "h264":
+            cmd.extend(["!", "h264parse", "!", "avdec_h264"])
+        elif kind == "mpeg2":
+            cmd.extend(["!", "mpegvideoparse", "!", "avdec_mpeg2video"])
+        else:
+            cmd.extend(["!", "decodebin"])
         cmd.extend(
             [
-                "!",
-                "h264parse",
-                "!",
-                "avdec_h264",
                 "!",
                 "videoconvert",
                 "!",
@@ -719,61 +719,82 @@ class StreamMonitor:
                 "max-files=1",
             ]
         )
+        return cmd
+
+    def _gst_run_until_jpeg(self, cmd, jpg_tmp, wait_sec, env):
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        deadline = time.time() + float(wait_sec)
+        try:
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    if jpg_tmp.is_file() and jpg_tmp.stat().st_size > 2048:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        err = b""
+        try:
+            if proc.stderr:
+                err = proc.stderr.read() or b""
+        except Exception:
+            pass
+        last = err.decode("utf-8", "replace").strip().splitlines()
+        last = last[-1][:180] if last else ""
+        return last
+
+    def _gst_grab_jpeg(self, ts_path: Path, jpg_tmp: Path):
+        """tsdemux 抽第一帧即停。排队拿全机锁，缺图频道也能轮到。"""
+        gst = shutil.which("gst-launch-1.0") or "/usr/bin/gst-launch-1.0"
+        if not os.path.isfile(gst):
+            return False, "no_gst"
         env = os.environ.copy()
         env["GST_DEBUG"] = "0"
         lock_path = self.work_dir / "logs" / ".gst_thumb.lock"
         lf = None
-        proc = None
         last = ""
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             lf = open(str(lock_path), "a+")
-            try:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (IOError, OSError):
-                return False, "gst_busy"
+            lock_deadline = time.time() + 45.0
+            while True:
+                try:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (IOError, OSError):
+                    if time.time() >= lock_deadline:
+                        return False, "gst_busy"
+                    time.sleep(0.25)
             with _gst_thumb_sem:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    env=env,
-                )
-                deadline = time.time() + 5.0
-                while time.time() < deadline:
-                    if proc.poll() is not None:
-                        break
+                for kind in ("h264", "mpeg2", "decode"):
                     try:
-                        if jpg_tmp.is_file() and jpg_tmp.stat().st_size > 2048:
-                            break
+                        if jpg_tmp.is_file():
+                            jpg_tmp.unlink()
                     except OSError:
                         pass
-                    time.sleep(0.05)
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=1.5)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                err = b""
-                try:
-                    if proc.stderr:
-                        err = proc.stderr.read() or b""
-                except Exception:
-                    pass
-                last = err.decode("utf-8", "replace").strip().splitlines()
-                last = last[-1][:180] if last else ""
+                    cmd = self._gst_pipeline_cmd(gst, ts_path, jpg_tmp, kind)
+                    last = self._gst_run_until_jpeg(cmd, jpg_tmp, 8.0, env)
+                    if jpg_tmp.is_file() and jpg_tmp.stat().st_size > 2048:
+                        break
         except Exception as e:
             return False, str(e)[:120]
         finally:
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
             if lf is not None:
                 try:
                     fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
@@ -826,8 +847,8 @@ class StreamMonitor:
         if not data:
             return False
         data = align_ts_sync(data)
-        # 只落盘尾部约 2s，解完整 64MB 会把 12 核打满
-        max_grab = 8 * 1024 * 1024
+        # 只落盘尾部，解完整 64MB 会把 CPU 打满；约 3s@32Mbps / 10s@8Mbps
+        max_grab = 12 * 1024 * 1024
         if len(data) > max_grab:
             data = align_ts_sync(data[-max_grab:])
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -1297,7 +1318,6 @@ class StreamMonitor:
 
         def _loop():
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-            interval = max(float(self.frame_interval_sec), 20.0)
             fail_streak = 0
             stagger = (hash(self.id) % 17) * 0.25
             if stagger > 0:
@@ -1305,8 +1325,7 @@ class StreamMonitor:
                 while self.running and time.time() < end:
                     time.sleep(min(0.3, max(0.05, end - time.time())))
             self.logger.info(
-                "[thumb] thread_run mode=gst_ring interval=%.1fs -> %s"
-                % (interval, self.latest_frame_path)
+                "[thumb] thread_run mode=gst_ring -> %s" % self.latest_frame_path
             )
             while self.running:
                 if self._state not in ("running", "starting"):
@@ -1334,6 +1353,16 @@ class StreamMonitor:
                 except Exception as e:
                     self.logger.warning("实时截图刷新异常: %s" % e)
                     fail_streak += 1
+                have_ok = False
+                try:
+                    have_ok = (
+                        (self.snapshot_dir / "latest_ok.jpg").is_file()
+                        and (self.snapshot_dir / "latest_ok.jpg").stat().st_size
+                        > 2048
+                    )
+                except OSError:
+                    have_ok = False
+                interval = 8.0 if not have_ok else 20.0
                 end = time.time() + interval
                 while self.running and time.time() < end:
                     time.sleep(min(0.5, max(0.05, end - time.time())))
@@ -1899,7 +1928,10 @@ class StreamMonitor:
         now = _now_ts()
         done = []
         for key, item in list(self._pending_alarms.items()):
-            if now - item["since"] >= self.alarm_confirm_sec:
+            need = self.alarm_confirm_sec
+            if key == "freeze":
+                need = max(need, 6.0)
+            if now - item["since"] >= need:
                 self._commit_alarm_start(key, item["event"])
                 done.append(key)
         for key in done:
