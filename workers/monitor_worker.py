@@ -390,15 +390,10 @@ class StreamMonitor:
 
         dw = self.detect_width
         use_side = self.frame_interval_sec > 0
-        # 截图支路必须沿用检测支路 PTS。setpts=N/TB 会从 0 起算，和 PCR
-        # 差几个数量级，FFmpeg 7 多路输出调度会把 [vsnap] 整路丢掉。
-        # select 按帧号抽（不看 PTS）；fifo/queue 滤镜本机静态包没有。
-        every = max(int(round(float(self.frame_interval_sec) * 25.0)), 1)
-        snap = (
-            "select=not(mod(n\\,%d)),"
-            "scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
-            % every
-        )
+        # 截图支路沿用检测 PTS，不再 setpts=N/TB（时间轴从 0 起会被
+        # FFmpeg 7 多路调度丢掉）。也不用 select/fifo/queue（本机包没有
+        # fifo/queue；select 是 V->N，第二路输出可能一直不打开文件）。
+        snap = "scale=320:180:flags=fast_bilinear[vsnap]"
         if use_side:
             if dw and dw > 0:
                 v = (
@@ -454,6 +449,8 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
+        # 组播 PCR 乱跳时，用墙钟给输出 -r 1 一个单调时间轴，首帧才能出图。
+        cmd.extend(["-use_wallclock_as_timestamps", "1"])
         cmd.extend(
             [
                 "-i",
@@ -472,23 +469,27 @@ class StreamMonitor:
             ]
         )
         if self.frame_interval_sec > 0:
-            fifo = self._ensure_snap_fifo()
+            # 第二路直接覆盖写 latest.jpg。FIFO/rawvideo 在这台 FFmpeg 7
+            # 上从未打开过 fd（监测仍走 null）。-r 1 在编码侧限 1fps，
+            # 检测滤镜仍按原帧率跑。
             cmd.extend(
                 [
                     "-map",
                     "[vsnap]",
                     "-an",
+                    "-r",
+                    "1",
                     "-fps_mode",
-                    "passthrough",
-                    "-max_interleave_delta",
-                    "0",
+                    "cfr",
+                    "-q:v",
+                    "5",
+                    "-f",
+                    "image2",
+                    "-update",
+                    "1",
                     "-flush_packets",
                     "1",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    str(fifo),
+                    str(self.latest_frame_path),
                 ]
             )
         return cmd
@@ -1258,6 +1259,65 @@ class StreamMonitor:
         self._latest_valid = True
         self._note_media()
 
+    def _watch_latest_file(self, proc: subprocess.Popen) -> None:
+        """FFmpeg 直接覆盖 latest.jpg；此处只做绿/灰过滤并复制 latest_ok.jpg。"""
+        path = self.latest_frame_path
+        ok_path = self.snapshot_dir / "latest_ok.jpg"
+        last_mtime = 0.0
+        logged = False
+        self.logger.info("[thumb] jpg watch started -> %s" % path)
+        while self.running and proc.poll() is None:
+            try:
+                if path.is_file():
+                    st = path.stat()
+                    if st.st_size > 1024 and st.st_mtime != last_mtime:
+                        last_mtime = st.st_mtime
+                        try:
+                            with self._latest_lock:
+                                data = path.read_bytes()
+                        except OSError:
+                            data = b""
+                        if not self._is_complete_jpeg(data):
+                            continue
+                        try:
+                            from frame_quality import jpeg_looks_displayable
+                        except ImportError:
+                            try:
+                                from workers.frame_quality import jpeg_looks_displayable
+                            except ImportError:
+                                jpeg_looks_displayable = None
+                        if jpeg_looks_displayable is not None:
+                            good, reason = jpeg_looks_displayable(data)
+                            if not good:
+                                now = time.time()
+                                last = getattr(self, "_last_bad_thumb_log", 0.0)
+                                if now - last >= 30:
+                                    self.logger.info(
+                                        "[thumb] skip_%s size=%d (keep last good)"
+                                        % (reason, len(data))
+                                    )
+                                    self._last_bad_thumb_log = now
+                                continue
+                        try:
+                            with self._latest_lock:
+                                tmp = self.snapshot_dir / (".ok_%s.tmp.jpg" % self.id)
+                                tmp.write_bytes(data)
+                                os.replace(str(tmp), str(ok_path))
+                        except OSError:
+                            continue
+                        self._latest_valid = True
+                        self._note_media()
+                        if not logged:
+                            self.logger.info(
+                                "[thumb] latest_ok size=%d via=image2" % len(data)
+                            )
+                            logged = True
+            except OSError:
+                pass
+            time.sleep(0.5)
+        if not logged:
+            self.logger.info("[thumb] jpg watch ended without frame")
+
     def _ensure_snap_fifo(self) -> Path:
         import stat as _stat
 
@@ -1903,17 +1963,6 @@ class StreamMonitor:
         if shutil.which("stdbuf"):
             wrapped = ["stdbuf", "-oL", "-eL"] + cmd
         self.logger.info("[ffmpeg] %s", " ".join(cmd))
-        use_mjpeg_pipe = self.frame_interval_sec > 0
-        mjpeg_file = None
-        if use_mjpeg_pipe:
-            fifo = self._ensure_snap_fifo()
-            # O_RDWR 打开 fifo 不会阻塞，且保证 ffmpeg 写端立刻成功
-            fd = os.open(str(fifo), os.O_RDWR | os.O_NONBLOCK)
-            try:
-                fcntl.fcntl(fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 262144)
-            except (OSError, ValueError, AttributeError):
-                pass
-            mjpeg_file = os.fdopen(fd, "rb", 0)
         self.process = subprocess.Popen(
             wrapped,
             stdout=subprocess.DEVNULL,
@@ -1929,11 +1978,11 @@ class StreamMonitor:
         run_started = self._run_started_ts
         last_lines = deque(maxlen=12)
 
-        if mjpeg_file is not None:
+        if self.frame_interval_sec > 0:
             threading.Thread(
-                target=self._drain_raw_frames,
-                args=(self.process, mjpeg_file),
-                name="rawsnap-%s" % self.id,
+                target=self._watch_latest_file,
+                args=(self.process,),
+                name="jpgwatch-%s" % self.id,
                 daemon=True,
             ).start()
 
