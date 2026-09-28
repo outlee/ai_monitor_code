@@ -226,6 +226,13 @@ body {
 }
 .panel-head h2 { font-size: 14px; font-weight: 600; }
 .hint { font-size: 11px; color: var(--muted); }
+.head-actions { display: flex; align-items: center; gap: 10px; }
+#btn-save-order:not(:disabled) { border-color: var(--accent); color: #fff; background: rgba(59,130,246,.28); }
+.ch-card.dragging { opacity: 0.45; }
+.ch-card.drag-over { outline: 2px dashed var(--accent); }
+.channel-grid .ch-card { cursor: grab; }
+.channel-grid .ch-card:active { cursor: grabbing; }
+.hint.order-dirty { color: var(--warn); }
 
 .table-wrap { overflow: auto; max-height: 420px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }

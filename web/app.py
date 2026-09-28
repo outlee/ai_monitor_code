@@ -33,6 +33,11 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+try:
+    from web.channel_order import merge_channel_order, sort_cards_by_order
+except ImportError:
+    from channel_order import merge_channel_order, sort_cards_by_order
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -42,6 +47,8 @@ LOG_DIR = ROOT / "logs"
 STATUS_DIR = LOG_DIR / "status"
 EVENTS_FILE = LOG_DIR / "events.jsonl"
 SNAPSHOT_DIR = ROOT / "snapshots"
+DATA_DIR = ROOT / "data"
+CHANNEL_ORDER_PATH = DATA_DIR / "channel_order.json"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _config_lock = threading.Lock()
@@ -90,6 +97,38 @@ def _save_config(cfg: Dict[str, Any]) -> None:
                 default_flow_style=False,
                 sort_keys=False,
             )
+
+
+def _load_channel_order() -> List[str]:
+    if not CHANNEL_ORDER_PATH.is_file():
+        return []
+    try:
+        raw = json.loads(CHANNEL_ORDER_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    if isinstance(raw, list):
+        ids = raw
+    elif isinstance(raw, dict) and isinstance(raw.get("ids"), list):
+        ids = raw.get("ids")
+    else:
+        return []
+    out = []
+    for x in ids:
+        s = str(x).strip() if x is not None else ""
+        if s:
+            out.append(s)
+    return out
+
+
+def _save_channel_order(ids: List[str]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"ids": list(ids)}
+    tmp = CHANNEL_ORDER_PATH.with_suffix(".json.tmp")
+    with _config_lock:
+        with open(str(tmp), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp.replace(CHANNEL_ORDER_PATH)
 
 
 def _read_events(limit: int = 100, channel_id: Optional[str] = None) -> List[Dict]:
@@ -327,6 +366,10 @@ class ChannelCreate(BaseModel):
     iface: Optional[str] = None
 
 
+class ChannelOrderBody(BaseModel):
+    ids: List[str]
+
+
 class ChannelImport(BaseModel):
     """导入频道列表。mode=replace 全量替换；mode=merge 按 id 合并（同 id 覆盖）。"""
     mode: str = "merge"  # merge | replace
@@ -405,6 +448,49 @@ def api_channels():
         "channels": cfg.get("channels") or [],
         "ai": cfg.get("ai") or {},
         "defaults": cfg.get("defaults") or {},
+    }
+
+
+@app.get("/api/channels/order")
+def api_get_channel_order():
+    cfg = _load_config()
+    current = [
+        c.get("id")
+        for c in (cfg.get("channels") or [])
+        if c.get("enabled", True) and c.get("id")
+    ]
+    ids = merge_channel_order(_load_channel_order(), current)
+    return {"ids": ids}
+
+
+@app.post("/api/channels/order")
+def api_save_channel_order(body: ChannelOrderBody):
+    cfg = _load_config()
+    current = [
+        c.get("id")
+        for c in (cfg.get("channels") or [])
+        if c.get("enabled", True) and c.get("id")
+    ]
+    current_set = set(current)
+    want = []
+    seen = set()
+    ignored = []
+    for x in body.ids or []:
+        cid = str(x).strip() if x is not None else ""
+        if not cid or cid in seen:
+            continue
+        if cid not in current_set:
+            ignored.append(cid)
+            continue
+        want.append(cid)
+        seen.add(cid)
+    ids = merge_channel_order(want, current)
+    _save_channel_order(ids)
+    return {
+        "ok": True,
+        "ids": ids,
+        "ignored": ignored,
+        "message": "排列已保存",
     }
 
 
@@ -514,13 +600,11 @@ def api_dashboard():
 
     # 大屏只展示正在监测的频道；禁用的只出现在管理页
     cards = [c for c in cards if c.get("enabled", True)]
-    lamp_rank = {"red": 0, "yellow": 1, "green": 2, "gray": 3}
-    cards.sort(
-        key=lambda c: (
-            lamp_rank.get(c.get("lamp") or "", 9),
-            (c.get("name") or c.get("id") or ""),
-        )
+    order_ids = merge_channel_order(
+        _load_channel_order(),
+        [c.get("id") for c in cards if c.get("id")],
     )
+    cards = sort_cards_by_order(cards, order_ids)
 
     hist = None
     if event_db is not None:
@@ -541,6 +625,7 @@ def api_dashboard():
         },
         "stats_24h": hist,
         "recent_events": events[:30],
+        "card_order": order_ids,
     }
 
 

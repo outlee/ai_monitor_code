@@ -39,6 +39,10 @@
   let evOffset = 0;
   const EV_PAGE = 20;
   let evTotal = 0;
+  let orderDirty = false;
+  let lastOrderIds = [];
+  let lastDashCardIds = [];
+  let dragSrc = null;
 
   function typeLabel(t) {
     if (!t) return "异常";
@@ -540,6 +544,10 @@
     if (!root) return;
     root.querySelectorAll(".ch-card").forEach((el) => {
       el.addEventListener("click", () => {
+        if (el.dataset.justDragged === "1") {
+          el.dataset.justDragged = "";
+          return;
+        }
         const id = el.dataset.id;
         const name =
           (el.querySelector(".ch-name") && el.querySelector(".ch-name").textContent) ||
@@ -547,6 +555,104 @@
         openPreview(id, name);
       });
     });
+  }
+
+  function setOrderDirty(v) {
+    orderDirty = !!v;
+    const btn = $("#btn-save-order");
+    if (btn) btn.disabled = !orderDirty;
+    const hint = $("#ok-strip-hint");
+    if (hint) {
+      hint.classList.toggle("order-dirty", orderDirty);
+      if (orderDirty) hint.textContent = "顺序已改，尚未保存";
+      else hint.textContent = "拖动卡片调整顺序 · 点「保存排列」后全员生效";
+    }
+  }
+
+  function mergeGridIntoOrder(prevOrder, gridIds, allIds) {
+    const inGrid = {};
+    (gridIds || []).forEach((id) => {
+      if (id) inGrid[id] = true;
+    });
+    const q = (gridIds || []).slice();
+    const out = [];
+    const used = {};
+    (prevOrder || []).forEach((id) => {
+      if (!id || used[id]) return;
+      if (inGrid[id]) {
+        const n = q.shift();
+        if (n && !used[n]) {
+          out.push(n);
+          used[n] = true;
+        }
+      } else {
+        out.push(id);
+        used[id] = true;
+      }
+    });
+    q.forEach((id) => {
+      if (id && !used[id]) {
+        out.push(id);
+        used[id] = true;
+      }
+    });
+    (allIds || []).forEach((id) => {
+      if (id && !used[id]) {
+        out.push(id);
+        used[id] = true;
+      }
+    });
+    return out;
+  }
+
+  function bindReorder(grid) {
+    if (!grid) return;
+    grid.querySelectorAll(".ch-card").forEach((el) => {
+      el.setAttribute("draggable", "true");
+      el.addEventListener("dragstart", (e) => {
+        dragSrc = el;
+        el.classList.add("dragging");
+        el.dataset.justDragged = "1";
+        try {
+          e.dataTransfer.setData("text/plain", el.dataset.id || "");
+          e.dataTransfer.effectAllowed = "move";
+        } catch (err) {}
+      });
+      el.addEventListener("dragend", () => {
+        el.classList.remove("dragging");
+        grid.querySelectorAll(".drag-over").forEach((x) => x.classList.remove("drag-over"));
+        dragSrc = null;
+      });
+      el.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        if (!dragSrc || el === dragSrc) return;
+        el.classList.add("drag-over");
+        const rect = el.getBoundingClientRect();
+        const before = e.clientX < rect.left + rect.width / 2;
+        if (before) grid.insertBefore(dragSrc, el);
+        else grid.insertBefore(dragSrc, el.nextSibling);
+        setOrderDirty(true);
+      });
+      el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+    });
+  }
+
+  async function saveChannelOrder() {
+    const grid = $("#channel-grid");
+    if (!grid) return;
+    const gridIds = [];
+    grid.querySelectorAll(".ch-card").forEach((el) => {
+      if (el.dataset.id) gridIds.push(el.dataset.id);
+    });
+    const ids = mergeGridIntoOrder(lastOrderIds, gridIds, lastDashCardIds);
+    try {
+      const r = await postJSON("/api/channels/order", { ids: ids });
+      lastOrderIds = r.ids || ids;
+      setOrderDirty(false);
+      toast("排列已保存", "ok");
+    } catch (e) {
+      toast("保存排列失败: " + (e.message || e), "err");
+    }
   }
 
   function renderDashboard(dash) {
@@ -599,12 +705,16 @@
     const okHead = $("#ok-strip-head");
     if (okHead) {
       okHead.style.display = all.length ? "" : "none";
-      const hint = okHead.querySelector(".hint");
-      if (hint) hint.textContent = bad.length ? "正常频道" : "已启用监测的频道";
+    }
+    lastDashCardIds = all.map((c) => c.id).filter(Boolean);
+    if (!orderDirty) {
+      lastOrderIds = Array.isArray(dash.card_order) && dash.card_order.length
+        ? dash.card_order.slice()
+        : lastDashCardIds.slice();
     }
 
     const grid = $("#channel-grid");
-    if (grid) {
+    if (grid && !orderDirty) {
       if (!all.length) {
         grid.innerHTML = `<div class="empty">暂无已启用的监测频道</div>`;
       } else if (!ok.length) {
@@ -612,6 +722,7 @@
       } else {
         grid.innerHTML = ok.map((c) => channelCardHtml(c, false)).join("");
         bindChannelCardClicks(grid);
+        bindReorder(grid);
       }
     }
 
@@ -1377,6 +1488,11 @@
           loadEventsPage();
         }
       });
+    });
+  }
+  if ($("#btn-save-order")) {
+    $("#btn-save-order").addEventListener("click", () => {
+      saveChannelOrder();
     });
   }
   $("#auto-refresh").addEventListener("change", setupAuto);

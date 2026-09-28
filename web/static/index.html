@@ -76,7 +76,7 @@
   <section class="panel dash-panel" id="view-dash">
     <div class="panel-head">
       <h2>频道大屏</h2>
-      <span class="hint">仅显示已启用监测的频道 · 异常置顶 · 点击放大预览</span>
+      <span class="hint">仅显示已启用监测的频道 · 异常置顶 · 监测中可拖动排序</span>
     </div>
     <div class="lamp-legend">
       <span><i class="dot green"></i>正常 <b id="sum-green">0</b></span>
@@ -92,7 +92,10 @@
     </div>
     <div class="panel-head" id="ok-strip-head">
       <h2>监测中</h2>
-      <span class="hint">正常频道</span>
+      <div class="head-actions">
+        <span class="hint" id="ok-strip-hint">拖动卡片调整顺序 · 点「保存排列」后全员生效</span>
+        <button type="button" class="btn" id="btn-save-order" disabled title="把当前大屏顺序写入服务器">保存排列</button>
+      </div>
     </div>
     <div class="channel-grid" id="channel-grid">
       <div class="empty">加载中…</div>
