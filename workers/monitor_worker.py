@@ -399,10 +399,8 @@ class StreamMonitor:
             else ""
         )
         if use_side:
-            every = max(int(round(float(self.frame_interval_sec) * 25.0)), 1)
             v = (
                 f"[{vin}]{scale_in}{detect},"
-                f"select=not(mod(n\\,{every})),"
                 f"scale=320:180:flags=fast_bilinear,format=rgb24[vsnap]"
             )
             return f"{v};{audio}"
@@ -443,8 +441,6 @@ class StreamMonitor:
             )
         if is_udp:
             cmd.extend(["-f", "mpegts"])
-        # 组播 PCR 乱跳时，用墙钟给输出 -r 1 一个单调时间轴，首帧才能出图。
-        cmd.extend(["-use_wallclock_as_timestamps", "1"])
         cmd.extend(["-i", ingest, "-filter_complex", fc])
         if self.frame_interval_sec > 0:
             # 视频写到 pipe:1（进程一启动 fd 就在）。image2/FIFO 文件是
@@ -1951,7 +1947,7 @@ class StreamMonitor:
             f"detect_width={self.detect_width} "
             f"frame_interval={self.frame_interval_sec}s"
         )
-        # stderr 用 stdbuf -eL 行缓冲；stdout 是 RGB 二进制，绝不能 -oL。
+        # stdout 是 RGB，不能套 stdbuf -oL；stderr 仍要行缓冲才能边跑边「已解到」。
         wrapped = list(cmd)
         if shutil.which("stdbuf"):
             wrapped = ["stdbuf", "-eL"] + cmd
