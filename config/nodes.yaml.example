@@ -1,0 +1,10 @@
+# 汇总页节点。复制为 config/nodes.yaml 后生效。
+# 没有这个文件，或下面没有任何 http 地址时，页面只看本机。
+# 地址留空 = 本机，只能有一条。频道和静帧参数仍在各台自己的 channels.yaml 里改。
+nodes:
+  - id: local
+    name: 本机
+    url: ""
+  # - id: room2
+  #   name: 机房2
+  #   url: http://10.6.9.174:8080

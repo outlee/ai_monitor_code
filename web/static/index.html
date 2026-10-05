@@ -83,6 +83,7 @@
       <span><i class="dot red"></i>异常 <b id="sum-red">0</b></span>
       <span><i class="dot yellow"></i>离线/无信号 <b id="sum-yellow">0</b></span>
     </div>
+    <div id="node-strip" class="node-strip hidden"></div>
     <div id="alarm-strip" class="alarm-strip hidden">
       <div class="panel-head alarm-strip-head">
         <h2>异常节目</h2>
@@ -90,6 +91,7 @@
       </div>
       <div class="alarm-grid" id="alarm-grid"></div>
     </div>
+    <div class="cat-tabs" id="cat-tabs"></div>
     <div class="panel-head" id="ok-strip-head">
       <h2>监测中</h2>
       <div class="head-actions">
@@ -177,10 +179,15 @@
           <span>黑场时长 (秒)</span>
           <input type="number" id="inp-black" min="0.5" max="60" step="0.5" title="持续黑场达到此时长才告警" />
         </label>
+        <div class="freeze-modes" id="freeze-modes">
+          <label><input type="radio" name="freeze-mode" value="video" checked /> 只报静帧</label>
+          <label><input type="radio" name="freeze-mode" value="video_silence" /> 静帧且无伴音</label>
+        </div>
         <label class="field-row">
           <span>静帧时长 (秒)</span>
-          <input type="number" id="inp-freeze" min="0.5" max="60" step="0.5" title="建议 6～10，过短易误报" />
+          <input type="number" id="inp-freeze" min="1" max="120" step="0.5" title="只报静帧最短 12 秒；静帧且无伴音按填写秒数" />
         </label>
+        <p class="hint" id="freeze-hint">只看画面。最短 12 秒。</p>
         <label class="field-row">
           <span>静音时长 (秒)</span>
           <input type="number" id="inp-silence" min="0.5" max="60" step="0.5" />
@@ -190,6 +197,16 @@
           <input type="number" id="inp-silence-db" min="-80" max="0" step="1" title="音量低于此 dB 视为静音，默认 -40" />
         </label>
         <button class="btn btn-primary" id="btn-save-defaults">保存规则参数</button>
+      </div>
+
+      <div class="ctrl-block" id="hub-editor">
+        <h3>监测节点</h3>
+        <p class="hint">每台监测机照旧跑自己的节目。这里填写地址后，这一页的大屏、告警和截图会合并过来。频道和静帧参数仍到各台自己的页面上改。地址留空表示本机，只能有一条。</p>
+        <div id="hub-rows"></div>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="btn-hub-add">添加节点</button>
+          <button type="button" class="btn btn-primary" id="btn-hub-save">保存节点</button>
+        </div>
       </div>
 
       <div class="ctrl-block note-block" id="perf-panel">
@@ -220,6 +237,7 @@
               <th>状态</th>
               <th>ID</th>
               <th>名称</th>
+              <th>分类</th>
               <th>Program</th>
               <th>码流</th>
               <th>网卡</th>
@@ -271,7 +289,7 @@
   <section class="panel snapshots-panel" id="snapshots-anchor">
     <div class="panel-head">
       <h2>异常截图</h2>
-      <span class="hint">显示节目名称 · 异常告警保留截图</span>
+      <span class="hint">只显示告警当时留下的画面，不含大屏实时图</span>
     </div>
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>
@@ -338,6 +356,16 @@
         <label class="field-row">
           <span>名称</span>
           <input type="text" id="ch-name" required maxlength="128" placeholder="显示名称" />
+        </label>
+        <label class="field-row">
+          <span>分类</span>
+          <input type="text" id="ch-category" maxlength="32" list="cat-presets" placeholder="可选，如央视、卫视、高清、标清" />
+          <datalist id="cat-presets">
+            <option value="央视"></option>
+            <option value="卫视"></option>
+            <option value="高清"></option>
+            <option value="标清"></option>
+          </datalist>
         </label>
         <label class="field-row">
           <span>流地址</span>

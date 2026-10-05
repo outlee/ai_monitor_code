@@ -700,11 +700,16 @@ python3 -m uvicorn web.app:app --host 0.0.0.0 --port 8080
 
 | 功能 | 说明 |
 |------|------|
-| 频道管理 | 新增/编辑/删除/导入导出；填名称、组播 URL、可选 program |
-| 功能开关 | AI 启停、mode、阈值；规则时长阈值 |
+| 频道管理 | 新增/编辑/删除/导入导出；填名称、组播 URL、可选 program、分类（央视/卫视/高清/标清，手填） |
+| 功能开关 | AI 启停；静帧二选一（只报静帧 / 静帧且无伴音）和静帧秒数 |
 | 状态 | ok / alarm / reconnecting / stale / offline / disabled |
-| 事件 / 截图 | 读 `logs/events.jsonl` 与 `snapshots/` |
+| 事件 / 截图 | 事件读 `logs/events.jsonl`。异常截图只列 `freeze_` / `black_` 等告警文件，不含 `latest_ok.jpg` |
+| 监测节点 | 管理页填写 `config/nodes.yaml`。有远程地址时，大屏合并各台卡片和截图；改频道仍在各台页面 |
 | 本地提醒 | 浏览器声音、桌面通知（需授权） |
+
+静帧：「只报静帧」最短 12 秒；「静帧且无伴音」按填写秒数（例如 8 就是 8），伴音低于静音阈值才落账，不另开无伴音告警。没有音频的节目仍只看画面。
+
+多机：每台监测机各自收自己网卡上的组播。汇总页不收流。示例见 `config/nodes.yaml.example`。未配置远程节点时，页面只看本机。
 
 配置写入 `channels.yaml` 后 **热重载约 3 秒** 被 Manager/Worker 应用（监测服务须在运行）。
 

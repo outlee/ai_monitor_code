@@ -36,6 +36,8 @@
     ai_anomaly: "画面异常",
   };
 
+  let dashCategory = "";
+  let lastDash = null;
   let evOffset = 0;
   const EV_PAGE = 20;
   let evTotal = 0;
@@ -414,7 +416,12 @@
     if ($("#inp-block-th")) $("#inp-block-th").value = ai.block_score_th ?? 0.12;
     $("#sw-save-snapshot").checked = d.save_snapshot !== false;
     $("#inp-black").value = d.black_duration ?? 2;
-    $("#inp-freeze").value = d.freeze_duration ?? 3;
+    $("#inp-freeze").value = d.freeze_duration ?? 12;
+    const mode = d.freeze_mode === "video_silence" ? "video_silence" : "video";
+    document.querySelectorAll('input[name="freeze-mode"]').forEach((el) => {
+      el.checked = el.value === mode;
+    });
+    syncFreezeHint();
     $("#inp-silence").value = d.silence_duration ?? 3;
     if ($("#inp-silence-db")) $("#inp-silence-db").value = d.silence_threshold ?? -40;
   }
@@ -463,6 +470,7 @@
       idEl.value = "";
       idEl.disabled = false;
       $("#ch-name").value = "";
+      if ($("#ch-category")) $("#ch-category").value = "";
       $("#ch-url").value = "udp://@239.1.1.1:5000";
       $("#ch-program").value = "";
       $("#ch-enabled").checked = true;
@@ -471,6 +479,7 @@
       idEl.value = ch.id;
       idEl.disabled = true;
       $("#ch-name").value = ch.name || "";
+      if ($("#ch-category")) $("#ch-category").value = ch.category || "";
       $("#ch-url").value = ch.url || "";
       $("#ch-program").value =
         ch.program !== undefined && ch.program !== null && ch.program !== ""
@@ -526,14 +535,22 @@
     const thumb = c.thumb_url
       ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
+    const tags = [];
+    if (c.node_name) tags.push(c.node_name);
+    if (c.category) tags.push(c.category);
+    const tagHtml = tags.length
+      ? `<div class="ch-tags">${escapeHtml(tags.join(" · "))}</div>`
+      : "";
     const cls = large ? "ch-card ch-card-lg" : "ch-card";
+    const snap = c.preview_base || ("/api/snapshots/" + (c.channel_id || c.id));
     return `<div class="${cls} lamp-${escapeHtml(c.lamp || "gray")}" data-id="${escapeHtml(
       c.id
-    )}" title="${escapeHtml(c.name || c.id)}">
+    )}" data-snap="${escapeHtml(snap)}" title="${escapeHtml(c.name || c.id)}">
+      ${tagHtml}
       ${thumb}
       <div class="ch-body">
         <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
-        <div class="ch-id">${escapeHtml(c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
+        <div class="ch-id">${escapeHtml(c.channel_id || c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
         <div class="ch-rate">${stream ? escapeHtml(stream) : "码流 —"}</div>
         <div class="ch-meta">${escapeHtml(statusText(c.status))} · ${escapeHtml(alarms)}</div>
       </div>
@@ -552,7 +569,7 @@
         const name =
           (el.querySelector(".ch-name") && el.querySelector(".ch-name").textContent) ||
           id;
-        openPreview(id, name);
+        openPreview(id, name, el.dataset.snap || "");
       });
     });
   }
@@ -655,8 +672,76 @@
     }
   }
 
+  function syncFreezeHint() {
+    const picked = document.querySelector('input[name="freeze-mode"]:checked');
+    const mode = picked ? picked.value : "video";
+    const n = parseFloat(($("#inp-freeze") && $("#inp-freeze").value) || "");
+    const hint = $("#freeze-hint");
+    if (!hint) return;
+    if (mode === "video_silence") {
+      hint.textContent = "画面静止且这几秒电平低于静音阈值才告警。填几秒就按几秒，不另报无伴音。";
+    } else if (!Number.isNaN(n) && n < 12) {
+      hint.textContent = "只报静帧最短 12 秒。当前填写 " + n + " 秒，保存后按 12 秒执行。";
+    } else {
+      hint.textContent = "只看画面。最短 12 秒。";
+    }
+  }
+
+  function renderCategoryTabs(all) {
+    const box = $("#cat-tabs");
+    if (!box) return;
+    const names = [];
+    let uncat = false;
+    all.forEach((c) => {
+      const name = (c.category || "").trim();
+      if (!name) uncat = true;
+      else if (names.indexOf(name) < 0) names.push(name);
+    });
+    if (dashCategory && dashCategory !== "__none__" && names.indexOf(dashCategory) < 0) {
+      dashCategory = "";
+    }
+    if (dashCategory === "__none__" && !uncat) dashCategory = "";
+    const btn = (cat, label) =>
+      `<button type="button" class="cat-tab${dashCategory === cat ? " on" : ""}" data-cat="${escapeHtml(
+        cat
+      )}">${escapeHtml(label)}</button>`;
+    let html = btn("", "全部");
+    names.forEach((name) => {
+      html += btn(name, name);
+    });
+    if (uncat && names.length) html += btn("__none__", "未分类");
+    box.innerHTML = html;
+    box.querySelectorAll(".cat-tab").forEach((el) => {
+      el.addEventListener("click", () => {
+        dashCategory = el.dataset.cat || "";
+        if (lastDash) renderDashboard(lastDash);
+      });
+    });
+  }
+
+  function renderNodeStrip(dash) {
+    const box = $("#node-strip");
+    if (!box) return;
+    const hub = dash.hub || {};
+    const nodes = hub.nodes || dash.nodes || [];
+    if (!hub.active || !nodes.length) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    box.classList.remove("hidden");
+    box.innerHTML = nodes
+      .map((n) => {
+        const cls = n.ok ? "node-pill" : "node-pill bad";
+        const st = n.ok ? (n.cards || 0) + " 路" : "离线";
+        return `<span class="${cls}">${escapeHtml(n.name || n.id)} · ${escapeHtml(st)}</span>`;
+      })
+      .join("");
+  }
+
   function renderDashboard(dash) {
     if (!dash) return;
+    lastDash = dash;
     const sum = dash.summary || {};
     if ($("#sum-green")) $("#sum-green").textContent = sum.green ?? 0;
     if ($("#sum-red")) $("#sum-red").textContent = sum.red ?? 0;
@@ -664,8 +749,16 @@
     if ($("#sum-gray")) $("#sum-gray").textContent = sum.gray ?? 0;
 
     const all = (dash.cards || []).filter((c) => c.enabled !== false);
+    renderNodeStrip(dash);
+    renderCategoryTabs(all);
     const bad = all.filter((c) => c.lamp === "red" || c.lamp === "yellow");
-    const ok = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
+    const okAll = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
+    const ok = okAll.filter((c) => {
+      if (!dashCategory) return true;
+      const cat = (c.category || "").trim();
+      if (dashCategory === "__none__") return !cat;
+      return cat === dashCategory;
+    });
 
     const strip = $("#alarm-strip");
     const alarmGrid = $("#alarm-grid");
@@ -718,7 +811,9 @@
       if (!all.length) {
         grid.innerHTML = `<div class="empty">暂无已启用的监测频道</div>`;
       } else if (!ok.length) {
-        grid.innerHTML = `<div class="empty">当前没有正常频道</div>`;
+        grid.innerHTML = `<div class="empty">${
+          dashCategory ? "这个分类里没有正常频道" : "当前没有正常频道"
+        }</div>`;
       } else {
         grid.innerHTML = ok.map((c) => channelCardHtml(c, false)).join("");
         bindChannelCardClicks(grid);
@@ -790,7 +885,7 @@
     if (img) img.style.display = "none";
   }
 
-  function startThumbFallback(channelId, hint) {
+  function startThumbFallback(channelId, hint, snapBase) {
     const video = $("#preview-video");
     if (!video) return;
     // 用图片轮询代替直播（内网更稳）
@@ -803,12 +898,9 @@
       video.parentNode.insertBefore(img, video);
     }
     img.style.display = "block";
+    const base = snapBase || ("/api/snapshots/" + encodeURIComponent(channelId));
     const tick = () => {
-      img.src =
-        "/api/snapshots/" +
-        encodeURIComponent(channelId) +
-        "/latest.jpg?t=" +
-        Date.now();
+      img.src = base.replace(/\/$/, "") + "/latest.jpg?t=" + Date.now();
     };
     tick();
     previewThumbTimer = setInterval(tick, 1000);
@@ -817,7 +909,7 @@
     }
   }
 
-  function openPreview(channelId, name) {
+  function openPreview(channelId, name, snapBase) {
     // 内网默认用实时截图轮询（稳）；不依赖浏览器播 TS
     const modal = $("#preview-modal");
     const video = $("#preview-video");
@@ -827,7 +919,7 @@
     closePreview();
     if (title) title.textContent = "预览: " + (name || channelId);
     modal.classList.remove("hidden");
-    startThumbFallback(channelId, hint);
+    startThumbFallback(channelId, hint, snapBase);
   }
 
   function renderOverview(data) {
@@ -848,7 +940,7 @@
     });
 
     if (!channels.length) {
-      tbody.innerHTML = `<tr><td colspan="11" class="empty">暂无频道，点击「新增」或「导入」</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="12" class="empty">暂无频道，点击「新增」或「导入」</td></tr>`;
     } else {
       tbody.innerHTML = channels
         .map(
@@ -862,6 +954,11 @@
           <td>${statusBadge(c.status)}</td>
           <td>${escapeHtml(c.id)}</td>
           <td>${escapeHtml(c.name)}</td>
+          <td>${
+            c.category
+              ? escapeHtml(c.category)
+              : "<span style=\"color:var(--muted)\">-</span>"
+          }</td>
           <td>${
             c.program !== undefined && c.program !== null && c.program !== ""
               ? escapeHtml(c.program)
@@ -1008,7 +1105,7 @@
       <div class="snap-card" data-url="${escapeHtml(s.url)}" data-cap="${escapeHtml(cap)}">
         <img src="${escapeHtml(s.url)}" loading="lazy" alt="${escapeHtml(title)}" />
         <div class="snap-meta">
-          <strong>${escapeHtml(title)}</strong>
+          <strong>${escapeHtml(s.node_name ? s.node_name + " · " + title : title)}</strong>
           <span style="color:var(--muted);font-size:11px"> ${escapeHtml(s.channel_id || "")}</span><br/>
           ${escapeHtml(typeLabel((s.filename || "").split("_")[0]))} · ${escapeHtml(relativeTime(s.mtime) || s.mtime)}
         </div>
@@ -1051,6 +1148,8 @@
           c.enabled = byId[c.id].enabled;
           if (byId[c.id].program !== undefined) c.program = byId[c.id].program;
           if (byId[c.id].iface) c.iface = byId[c.id].iface;
+          if (byId[c.id].category) c.category = byId[c.id].category;
+          else if (!c.category) c.category = "";
         }
       });
       handleNewEvents(overview.recent_events || []);
@@ -1079,6 +1178,7 @@
       if (manageVisible) {
         refreshPerf().catch(() => {});
         refreshStorageDetail().catch(() => {});
+        loadHubEditor().catch(() => {});
       }
     } catch (e) {
       console.error(e);
@@ -1200,6 +1300,74 @@
     }
   });
 
+  document.querySelectorAll('input[name="freeze-mode"]').forEach((el) => {
+    el.addEventListener("change", syncFreezeHint);
+  });
+  if ($("#inp-freeze")) $("#inp-freeze").addEventListener("input", syncFreezeHint);
+
+  function hubRowHtml(n) {
+    n = n || {};
+    return `<div class="hub-row">
+      <input class="hub-id" placeholder="ID" maxlength="32" value="${escapeHtml(n.id || "")}" />
+      <input class="hub-name" placeholder="名称" maxlength="32" value="${escapeHtml(n.name || "")}" />
+      <input class="hub-url" placeholder="http://监测机:8080，本机留空" value="${escapeHtml(n.url || "")}" />
+      <button type="button" class="btn hub-del">删除</button>
+    </div>`;
+  }
+
+  function bindHubRows() {
+    document.querySelectorAll("#hub-rows .hub-del").forEach((btn) => {
+      btn.onclick = () => {
+        const row = btn.closest(".hub-row");
+        if (row) row.remove();
+      };
+    });
+  }
+
+  async function loadHubEditor() {
+    const box = $("#hub-rows");
+    if (!box) return;
+    const ae = document.activeElement;
+    if (ae && ae.closest && ae.closest("#hub-editor")) return;
+    const data = await fetchJSON("/api/hub/nodes");
+    const nodes = data.nodes && data.nodes.length ? data.nodes : [{ id: "local", name: "本机", url: "" }];
+    box.innerHTML = nodes.map(hubRowHtml).join("");
+    bindHubRows();
+  }
+
+  const btnHubAdd = $("#btn-hub-add");
+  if (btnHubAdd) {
+    btnHubAdd.addEventListener("click", () => {
+      const box = $("#hub-rows");
+      if (!box) return;
+      box.insertAdjacentHTML("beforeend", hubRowHtml({}));
+      bindHubRows();
+    });
+  }
+  const btnHubSave = $("#btn-hub-save");
+  if (btnHubSave) {
+    btnHubSave.addEventListener("click", async () => {
+      const nodes = [];
+      document.querySelectorAll("#hub-rows .hub-row").forEach((row) => {
+        nodes.push({
+          id: (row.querySelector(".hub-id").value || "").trim(),
+          name: (row.querySelector(".hub-name").value || "").trim(),
+          url: (row.querySelector(".hub-url").value || "").trim(),
+        });
+      });
+      btnHubSave.disabled = true;
+      try {
+        const res = await postJSON("/api/hub/nodes", { nodes: nodes });
+        toast(res.message || "节点已保存", "ok");
+        await refresh();
+      } catch (e) {
+        toast("保存节点失败: " + (e.message || e), "err");
+      } finally {
+        btnHubSave.disabled = false;
+      }
+    });
+  }
+
   $("#btn-save-defaults").addEventListener("click", async () => {
     const btn = $("#btn-save-defaults");
     btn.disabled = true;
@@ -1207,7 +1375,8 @@
       const res = await postJSON("/api/config/defaults", {
         save_snapshot: $("#sw-save-snapshot").checked,
         black_duration: parseFloat($("#inp-black").value) || 2,
-        freeze_duration: parseFloat($("#inp-freeze").value) || 3,
+        freeze_duration: parseFloat($("#inp-freeze").value) || 12,
+        freeze_mode: (document.querySelector('input[name="freeze-mode"]:checked') || {}).value || "video",
         silence_duration: parseFloat($("#inp-silence").value) || 3,
         silence_threshold: parseFloat($("#inp-silence-db").value),
       });
@@ -1265,6 +1434,8 @@
         };
         if (program !== null) body.program = program;
         if (iface) body.iface = iface;
+        const cat = ($("#ch-category") && $("#ch-category").value.trim()) || "";
+        if (cat) body.category = cat;
         res = await postJSON("/api/config/channels", body);
       } else {
         res = await postJSON(`/api/config/channels/${encodeURIComponent(payload.id)}`, {
@@ -1273,6 +1444,7 @@
           enabled: payload.enabled,
           program: program, // null 表示清空
           iface: iface || null,
+          category: ($("#ch-category") && $("#ch-category").value.trim()) || "",
         });
       }
       toast(res.message || "已保存", "ok");

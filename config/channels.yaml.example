@@ -7,7 +7,8 @@
 defaults:
   # ---------- 规则检测（黑场 / 静帧 / 无伴音）----------
   black_duration: 5.0          # 黑场持续多久才告警（秒），越大越不敏感
-  freeze_duration: 12.0        # 静帧持续多久才告警（秒），组播建议 12～15；过短会把定镜头当故障
+  freeze_duration: 12.0        # 静帧持续多久才告警（秒）。只报静帧时最短 12；静帧且无伴音时按这里的秒数
+  freeze_mode: video           # video=只报静帧；video_silence=画面静止且这几秒无伴音才告警（不另报无伴音）
   freeze_noise: 0.003          # freezedetect n，FFmpeg 默认 0.001。越大越容易把微动判成静帧，不要超过 0.01
   silence_duration: 12.0       # 无伴音持续多久才告警（秒）
   silence_threshold: -50.0     # 静音判定电平（dB），越负越不容易报无伴音

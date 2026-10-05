@@ -35,14 +35,21 @@ from pydantic import BaseModel, Field
 
 try:
     from web.channel_order import merge_channel_order, sort_cards_by_order
+    from web.channel_meta import clean_category
+    from web.snapshot_names import is_alarm_snapshot, is_proxy_image
+    from web import hub as hub_mod
 except ImportError:
     from channel_order import merge_channel_order, sort_cards_by_order
+    from channel_meta import clean_category
+    from snapshot_names import is_alarm_snapshot, is_proxy_image
+    import hub as hub_mod
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 CONFIG_PATH = ROOT / "config" / "channels.yaml"
+NODES_PATH = ROOT / "config" / "nodes.yaml"
 LOG_DIR = ROOT / "logs"
 STATUS_DIR = LOG_DIR / "status"
 EVENTS_FILE = LOG_DIR / "events.jsonl"
@@ -131,6 +138,46 @@ def _save_channel_order(ids: List[str]) -> None:
         tmp.replace(CHANNEL_ORDER_PATH)
 
 
+def _category_of(ch: Dict[str, Any]) -> str:
+    try:
+        return clean_category(ch.get("category"))
+    except ValueError:
+        return ""
+
+
+def _public_defaults(defaults: Dict[str, Any], stale_sec: float) -> Dict[str, Any]:
+    try:
+        from workers.freeze_rules import effective_freeze_seconds, normalize_freeze_mode
+    except ImportError:
+        from freeze_rules import effective_freeze_seconds, normalize_freeze_mode
+
+    mode = normalize_freeze_mode(defaults.get("freeze_mode"))
+    stored = defaults.get("freeze_duration", 12.0)
+    try:
+        stored_f = float(stored)
+    except (TypeError, ValueError):
+        stored_f = 12.0
+    return {
+        "save_snapshot": bool(defaults.get("save_snapshot", True)),
+        "black_duration": float(defaults.get("black_duration", 2.0)),
+        "freeze_duration": stored_f,
+        "freeze_duration_effective": effective_freeze_seconds(mode, stored_f),
+        "freeze_mode": mode,
+        "silence_duration": float(defaults.get("silence_duration", 3.0)),
+        "silence_threshold": defaults.get("silence_threshold", -40),
+        "status_stale_sec": stale_sec,
+    }
+
+
+def _load_hub_nodes() -> List[Dict[str, str]]:
+    if not NODES_PATH.is_file():
+        return []
+    try:
+        return hub_mod.load_nodes_doc(NODES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
 def _read_events(limit: int = 100, channel_id: Optional[str] = None) -> List[Dict]:
     if not EVENTS_FILE.is_file():
         return []
@@ -180,7 +227,7 @@ def _list_snapshots(channel_id: Optional[str] = None, limit: int = 40) -> List[D
 
     for d in dirs:
         for f in d.glob("*.jpg"):
-            if f.name == "latest.jpg" or f.name.startswith("."):
+            if not is_alarm_snapshot(f.name):
                 continue
             try:
                 st = f.stat()
@@ -250,6 +297,7 @@ def _channel_stats(
             "program": ch.get("program"),
             "iface": ch.get("iface"),
             "enabled": ch.get("enabled", True),
+            "category": _category_of(ch),
             "event_count": 0,
             "last_event": None,
             "last_type": None,
@@ -343,7 +391,8 @@ class AIUpdate(BaseModel):
 class DefaultsUpdate(BaseModel):
     save_snapshot: Optional[bool] = None
     black_duration: Optional[float] = Field(None, ge=0.5, le=60)
-    freeze_duration: Optional[float] = Field(None, ge=0.5, le=60)
+    freeze_duration: Optional[float] = Field(None, ge=0.5, le=120)
+    freeze_mode: Optional[str] = None
     silence_duration: Optional[float] = Field(None, ge=0.5, le=60)
     silence_threshold: Optional[float] = Field(None, ge=-80, le=0)
 
@@ -355,6 +404,7 @@ class ChannelUpdate(BaseModel):
     # None=不修改；传 null 可清空（见 model_fields_set）
     program: Optional[int] = Field(None, ge=0, le=65535)
     iface: Optional[str] = None
+    category: Optional[str] = None
 
 
 class ChannelCreate(BaseModel):
@@ -364,10 +414,15 @@ class ChannelCreate(BaseModel):
     enabled: bool = True
     program: Optional[int] = Field(None, ge=0, le=65535)
     iface: Optional[str] = None
+    category: Optional[str] = None
 
 
 class ChannelOrderBody(BaseModel):
     ids: List[str]
+
+
+class HubNodesBody(BaseModel):
+    nodes: List[Dict[str, Any]]
 
 
 class ChannelImport(BaseModel):
@@ -419,14 +474,7 @@ def api_overview():
             "green_ratio_th": float(ai.get("green_ratio_th", 0.35)),
             "block_score_th": float(ai.get("block_score_th", 0.12)),
         },
-        "defaults": {
-            "save_snapshot": bool(defaults.get("save_snapshot", True)),
-            "black_duration": float(defaults.get("black_duration", 2.0)),
-            "freeze_duration": float(defaults.get("freeze_duration", 3.0)),
-            "silence_duration": float(defaults.get("silence_duration", 3.0)),
-            "silence_threshold": defaults.get("silence_threshold", -40),
-            "status_stale_sec": stale_sec,
-        },
+        "defaults": _public_defaults(defaults, stale_sec),
         "channels": stats,
         "recent_events": events[:50],
         "note": "配置已支持热重载：Manager/Worker 运行中修改将在数秒内自动生效（可用 --no-reload 关闭）",
@@ -507,7 +555,102 @@ def api_snapshots(
     limit: int = Query(40, ge=1, le=200),
     channel_id: Optional[str] = None,
 ):
-    return {"snapshots": _list_snapshots(channel_id=channel_id, limit=limit)}
+    nodes = _load_hub_nodes()
+    if not hub_mod.hub_is_active(nodes):
+        return {"snapshots": _list_snapshots(channel_id=channel_id, limit=limit)}
+    items: List[Dict[str, Any]] = []
+    per = max(int(limit), 24)
+    for node in nodes:
+        if node.get("url"):
+            try:
+                data = hub_mod.fetch_json(
+                    node["url"], "/api/snapshots?limit=%d" % per, timeout=2.5
+                )
+            except Exception:
+                data = None
+            for snap in (data or {}).get("snapshots") or []:
+                fn = str(snap.get("filename") or "")
+                cid = str(snap.get("channel_id") or "")
+                if channel_id and cid != channel_id:
+                    continue
+                if not is_alarm_snapshot(fn):
+                    continue
+                row = dict(snap)
+                row["node_id"] = node["id"]
+                row["node_name"] = node["name"]
+                row["url"] = "/api/hub/snap/%s/%s/%s" % (node["id"], cid, fn)
+                items.append(row)
+        else:
+            for snap in _list_snapshots(channel_id=channel_id, limit=per):
+                row = dict(snap)
+                row["node_id"] = node["id"]
+                row["node_name"] = node["name"]
+                items.append(row)
+    items.sort(key=lambda x: x.get("mtime_ts") or x.get("mtime") or "", reverse=True)
+    return {"snapshots": items[:limit]}
+
+
+@app.get("/api/hub/nodes")
+def api_hub_nodes():
+    nodes = _load_hub_nodes()
+    return {
+        "nodes": nodes,
+        "active": hub_mod.hub_is_active(nodes),
+        "path": "config/nodes.yaml",
+    }
+
+
+@app.post("/api/hub/nodes")
+def api_hub_nodes_save(body: HubNodesBody):
+    try:
+        nodes = hub_mod.normalize_node_list(body.nodes)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    NODES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _config_lock:
+        with open(str(NODES_PATH), "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                {"nodes": nodes},
+                f,
+                allow_unicode=True,
+                default_flow_style=False,
+                sort_keys=False,
+            )
+    active = hub_mod.hub_is_active(nodes)
+    msg = "节点已保存。大屏会合并各台节目。" if active else "节点已保存。未填写远程地址，大屏仍只看本机。"
+    return {"ok": True, "nodes": nodes, "active": active, "message": msg}
+
+
+@app.get("/api/hub/snap/{node_id}/{channel_id}/{filename}")
+def api_hub_snap(node_id: str, channel_id: str, filename: str):
+    if (
+        not is_proxy_image(filename)
+        or "/" in node_id
+        or "/" in channel_id
+        or ".." in node_id
+        or ".." in channel_id
+    ):
+        raise HTTPException(404, "截图不存在")
+    node = None
+    for item in _load_hub_nodes():
+        if item["id"] == node_id:
+            node = item
+            break
+    if node is None:
+        raise HTTPException(404, "节点不存在")
+    if not node.get("url"):
+        path = SNAPSHOT_DIR / channel_id / filename
+        if not path.is_file():
+            raise HTTPException(404, "截图不存在")
+        return FileResponse(path, media_type="image/jpeg")
+    remote = "%s/api/snapshots/%s/%s" % (node["url"], channel_id, filename)
+    try:
+        blob = hub_mod.fetch_bytes(remote)
+    except Exception:
+        raise HTTPException(502, "节点截图不可达")
+    if not blob:
+        raise HTTPException(404, "截图不存在")
+    return Response(content=blob, media_type="image/jpeg")
 
 
 @app.get("/api/snapshots/{channel_id}/{filename}")
@@ -594,6 +737,10 @@ def api_dashboard():
                 "pkt_rate": s.get("pkt_rate"),
                 "bitrate_kbps": s.get("bitrate_kbps"),
                 "iface": s.get("iface"),
+                "category": s.get("category") or "",
+                "preview_base": f"/api/snapshots/{s['id']}",
+                "node_id": "",
+                "node_name": "",
             }
         )
 
@@ -613,7 +760,7 @@ def api_dashboard():
         except Exception:
             hist = None
 
-    return {
+    local = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "cards": cards,
         "summary": {
@@ -626,7 +773,21 @@ def api_dashboard():
         "stats_24h": hist,
         "recent_events": events[:30],
         "card_order": order_ids,
+        "hub": {"active": False, "nodes": []},
     }
+    nodes = _load_hub_nodes()
+    if not hub_mod.hub_is_active(nodes):
+        return local
+    merged = hub_mod.assemble_hub(nodes, local, hub_mod.fetch_json)
+    merged["time"] = local["time"]
+    order_ids = merge_channel_order(
+        _load_channel_order(),
+        [c.get("id") for c in merged["cards"] if c.get("id")],
+    )
+    merged["cards"] = sort_cards_by_order(merged["cards"], order_ids)
+    merged["card_order"] = order_ids
+    merged["hub"] = {"active": True, "nodes": merged.get("nodes") or []}
+    return merged
 
 
 @app.get("/api/alerts/history")
@@ -1015,9 +1176,25 @@ def api_update_defaults(body: DefaultsUpdate):
     if body.black_duration is not None:
         defaults["black_duration"] = float(body.black_duration)
         changed.append(f"black_duration={body.black_duration}")
+    if body.freeze_mode is not None:
+        try:
+            from workers.freeze_rules import normalize_freeze_mode
+        except ImportError:
+            from freeze_rules import normalize_freeze_mode
+        mode = str(body.freeze_mode).strip()
+        if mode not in ("video", "video_silence"):
+            raise HTTPException(400, "静帧模式只能是只报静帧或静帧且无伴音")
+        defaults["freeze_mode"] = normalize_freeze_mode(mode)
+        changed.append("freeze_mode=%s" % defaults["freeze_mode"])
     if body.freeze_duration is not None:
-        defaults["freeze_duration"] = float(body.freeze_duration)
-        changed.append(f"freeze_duration={body.freeze_duration}")
+        try:
+            from workers.freeze_rules import effective_freeze_seconds, normalize_freeze_mode
+        except ImportError:
+            from freeze_rules import effective_freeze_seconds, normalize_freeze_mode
+        mode = normalize_freeze_mode(defaults.get("freeze_mode"))
+        dur = effective_freeze_seconds(mode, body.freeze_duration)
+        defaults["freeze_duration"] = dur
+        changed.append("freeze_duration=%s" % dur)
     if body.silence_duration is not None:
         defaults["silence_duration"] = float(body.silence_duration)
         changed.append(f"silence_duration={body.silence_duration}")
@@ -1029,11 +1206,18 @@ def api_update_defaults(body: DefaultsUpdate):
         raise HTTPException(400, "没有可更新的字段")
 
     _save_config(cfg)
+    message = "默认检测参数已保存，热重载后数秒内生效"
+    if (
+        body.freeze_duration is not None
+        and (defaults.get("freeze_mode") or "video") != "video_silence"
+        and float(body.freeze_duration) < 12
+    ):
+        message = "只报静帧最短 12 秒，已按 12 秒保存。热重载后数秒内生效"
     return {
         "ok": True,
         "changed": changed,
-        "defaults": defaults,
-        "message": "默认检测参数已保存，热重载后数秒内生效",
+        "defaults": _public_defaults(defaults, float(defaults.get("status_stale_sec", 30))),
+        "message": message,
     }
 
 
@@ -1096,6 +1280,13 @@ def _normalize_channel(raw: Dict[str, Any], require_all: bool = True) -> Dict[st
         iface = str(raw.get("iface") or "").strip()
         if iface:
             out["iface"] = iface
+    if "category" in raw:
+        try:
+            cat = clean_category(raw.get("category"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if cat:
+            out["category"] = cat
     return out
 
 
@@ -1314,6 +1505,17 @@ def api_update_channel(channel_id: str, body: ChannelUpdate):
         else:
             target["iface"] = str(iface).strip()
             changed.append(f"iface={target['iface']}")
+    if "category" in data:
+        try:
+            cat = clean_category(data.get("category"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if cat:
+            target["category"] = cat
+            changed.append("category=%s" % cat)
+        elif "category" in target:
+            target.pop("category", None)
+            changed.append("category=cleared")
 
     if not changed:
         raise HTTPException(400, "没有可更新的字段")

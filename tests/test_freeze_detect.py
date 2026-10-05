@@ -61,6 +61,7 @@ class FreezeDetectConfigTests(unittest.TestCase):
         self.assertIn("freezedetect=n=", fc)
         self.assertIn(":d=2.0", fc)
         self.assertNotIn(":d=12.0", fc)
+        self.assertNotIn("silencedetect", fc)
 
     def test_ffmpeg_cmd_drops_demux_wallclock_and_igndts(self):
         m = _mon()
@@ -112,6 +113,67 @@ class FreezeDetectConfigTests(unittest.TestCase):
         m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 13}
         m._flush_pending_alarms()
         self.assertIn("freeze", m._active_alarms)
+
+    def test_video_silence_keeps_typed_seconds(self):
+        m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8})
+        self.assertEqual(m.freeze_mode, "video_silence")
+        self.assertEqual(m.freeze_duration, 8.0)
+        self.assertEqual(m.freeze_confirm_sec, 8.0)
+        fc = m._build_filter_complex()
+        self.assertIn("silencedetect=", fc)
+        self.assertIn(":d=1.0", fc)
+        self.assertNotIn("silence_duration", fc)
+
+    def test_video_silence_holds_while_audio_present(self):
+        m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8, "alarm_confirm_sec": 3})
+        m._run_started_ts = time.time() - 60
+        m.save_snapshot = False
+        ev = {
+            "type": "freeze",
+            "phase": "start",
+            "channel_id": m.id,
+            "channel_name": m.name,
+            "message": "检测到静帧",
+            "time": "t",
+        }
+        m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 9}
+        m._flush_pending_alarms()
+        self.assertNotIn("freeze", m._active_alarms)
+        self.assertIn("freeze", m._pending_alarms)
+        self.assertEqual(ev["message"], "检测到静帧")
+
+    def test_video_silence_commits_when_audio_silent(self):
+        m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8, "alarm_confirm_sec": 3})
+        m._run_started_ts = time.time() - 60
+        m.save_snapshot = False
+        ev = {
+            "type": "freeze",
+            "phase": "start",
+            "channel_id": m.id,
+            "channel_name": m.name,
+            "message": "检测到静帧",
+            "time": "t",
+        }
+        m._silence_active = True
+        m._silence_since = time.time() - 9
+        m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 9}
+        m._flush_pending_alarms()
+        self.assertIn("freeze", m._active_alarms)
+        self.assertEqual(ev["message"], "检测到静帧无伴音")
+
+    def test_missing_audio_falls_back_to_picture(self):
+        m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8})
+        m._audio_unavailable = True
+        fc = m._build_filter_complex()
+        self.assertIn("anullsrc=", fc)
+        self.assertNotIn("silencedetect", fc)
+        m._run_started_ts = time.time() - 60
+        m.save_snapshot = False
+        ev = {"type": "freeze", "message": "检测到静帧", "time": "t"}
+        m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 9}
+        m._flush_pending_alarms()
+        self.assertIn("freeze", m._active_alarms)
+        self.assertEqual(ev["message"], "检测到静帧")
 
 
 if __name__ == "__main__":

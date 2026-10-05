@@ -227,6 +227,31 @@ body {
 .panel-head h2 { font-size: 14px; font-weight: 600; }
 .hint { font-size: 11px; color: var(--muted); }
 .head-actions { display: flex; align-items: center; gap: 10px; }
+.freeze-modes { display: flex; flex-wrap: wrap; gap: 14px; margin: 4px 0 8px; font-size: 13px; }
+.freeze-modes label { display: flex; align-items: center; gap: 6px; }
+.cat-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+.cat-tab {
+  background: var(--bg3);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cat-tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.node-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.node-pill {
+  border: 1px solid var(--ok);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+.node-pill.bad { border-color: var(--alarm); color: var(--alarm); }
+.ch-tags { position: absolute; left: 8px; top: 8px; font-size: 11px; background: rgba(0,0,0,.55); padding: 1px 6px; border-radius: 6px; }
+.ch-card { position: relative; }
+.hub-row { display: flex; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+.hub-row input { flex: 1; min-width: 90px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
 #btn-save-order:not(:disabled) { border-color: var(--accent); color: #fff; background: rgba(59,130,246,.28); }
 .ch-card.dragging { opacity: 0.45; }
 .ch-card.drag-over { outline: 2px dashed var(--accent); }

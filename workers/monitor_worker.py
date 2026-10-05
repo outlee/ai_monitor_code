@@ -36,6 +36,18 @@ from typing import Any, Dict, List, Optional, Set
 
 import yaml
 
+
+def _is_alarm_snapshot_name(name: str) -> bool:
+    try:
+        from web.snapshot_names import is_alarm_snapshot
+    except ImportError:
+        low = (name or "").strip().lower()
+        if not low.endswith(".jpg") or low.startswith("latest") or low.startswith("."):
+            return False
+        return "/" not in name and "\\" not in name
+    return is_alarm_snapshot(name)
+
+
 # 可选 AI 模块：导入失败也不影响主流程
 try:
     from ai_detector import AIDetector, create_detector
@@ -102,12 +114,20 @@ class StreamMonitor:
         self.black_duration = float(
             channel.get("black_duration", defaults.get("black_duration", 3.0))
         )
-        self.freeze_duration = float(
-            channel.get("freeze_duration", defaults.get("freeze_duration", 12.0))
+        try:
+            from freeze_rules import effective_freeze_seconds, normalize_freeze_mode
+        except ImportError:
+            from workers.freeze_rules import (  # type: ignore
+                effective_freeze_seconds,
+                normalize_freeze_mode,
+            )
+        self.freeze_mode = normalize_freeze_mode(
+            channel.get("freeze_mode", defaults.get("freeze_mode", "video"))
         )
-        # 短于 12s 容易把片头静画、镜头定住打成故障
-        if self.freeze_duration < 12.0:
-            self.freeze_duration = 12.0
+        self.freeze_duration = effective_freeze_seconds(
+            self.freeze_mode,
+            channel.get("freeze_duration", defaults.get("freeze_duration", 12.0)),
+        )
         # freezedetect n：平均绝对差 / 256。FFmpeg 默认 0.001。
         # 越大越容易把微动画面判成静帧（0.08 ≈ 20 灰阶，电视剧定镜头必误报）。
         self.freeze_noise = float(
@@ -145,15 +165,24 @@ class StreamMonitor:
             self.alarm_confirm_sec = 5.0
         # FFmpeg d= 不可信（PTS/补帧）。freezedetect 只作「画面很像」的触发，
         # 真正静帧时长按墙钟 freeze_duration 确认，避免漏掉真静帧、也不把定镜头抖动打出去。
-        self.freeze_confirm_sec = float(
-            defaults.get("freeze_confirm_sec", self.freeze_duration)
-        )
-        if self.freeze_confirm_sec < self.freeze_duration:
-            self.freeze_confirm_sec = self.freeze_duration
+        # 静帧且无伴音：确认秒数就是填写的静帧时长，不再被另一条 freeze_confirm_sec 拉长。
+        if self.freeze_mode == "video_silence":
+            self.freeze_confirm_sec = float(self.freeze_duration)
+        else:
+            self.freeze_confirm_sec = float(
+                defaults.get("freeze_confirm_sec", self.freeze_duration)
+            )
+            if self.freeze_confirm_sec < self.freeze_duration:
+                self.freeze_confirm_sec = self.freeze_duration
         # 解码器刚起来的重复帧不算静帧
         self.freeze_startup_ignore_sec = 20.0
         # freezedetect 自身 d= 只作相似度触发，秒数由上面墙钟确认
         self._freeze_detect_d = 2.0
+        # 伴音只做静帧门闩，不单独出无伴音告警（detect_silence 仍管那条告警）
+        self._audio_unavailable = False
+        self._silence_active = False
+        self._silence_since = None
+        self._silence_probe_d = 1.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -406,10 +435,20 @@ class StreamMonitor:
                 f"freezedetect=n={self.freeze_noise}:d={self._freeze_detect_d}"
             )
         detect = ",".join(vparts) if vparts else "null"
-        if self.detect_silence:
+        meter = self.detect_silence or (
+            self.detect_freeze and self.freeze_mode == "video_silence"
+        )
+        if meter and self._audio_unavailable:
+            # 这一路没有音频 PID。静帧退回只看画面，图仍然要有一路音频输出。
+            audio = "anullsrc=channel_layout=stereo:sample_rate=8000[aout]"
+        elif meter:
+            if self.detect_silence:
+                self._silence_probe_d = float(self.silence_duration)
+            else:
+                self._silence_probe_d = 1.0
             audio = (
                 f"[{ain}]silencedetect=noise={self.silence_threshold}dB:"
-                f"d={self.silence_duration}[aout]"
+                f"d={self._silence_probe_d}[aout]"
             )
         else:
             audio = f"[{ain}]volume=1[aout]"
@@ -1454,16 +1493,13 @@ class StreamMonitor:
             self.logger.error(f"写事件失败: {e}")
 
     def _prune_snapshots(self):
-        """保留每个频道最近 N 张 jpg（不删 latest / 点文件 / AI 临时读文件）。"""
+        """保留每个频道最近 N 张告警 jpg。不删 latest.jpg / latest_ok.jpg。"""
         try:
             files = sorted(
                 (
                     p
                     for p in self.snapshot_dir.glob("*.jpg")
-                    if p.name != "latest.jpg"
-                    and not p.name.startswith(".")
-                    and not p.name.startswith(".ai_read_")
-                    and not p.name.endswith(".part")
+                    if _is_alarm_snapshot_name(p.name)
                 ),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
@@ -1958,10 +1994,46 @@ class StreamMonitor:
                 ):
                     continue
             if now - item["since"] >= need:
+                if key == "freeze" and not self._freeze_silence_ready(now, need):
+                    if not item.get("silence_hold_logged"):
+                        item["silence_hold_logged"] = True
+                        self.logger.info("静帧待确认，伴音仍在，不落账")
+                    continue
+                if (
+                    key == "freeze"
+                    and self.freeze_mode == "video_silence"
+                    and not self._audio_unavailable
+                ):
+                    item["event"]["message"] = "检测到静帧无伴音"
                 self._commit_alarm_start(key, item["event"], started=item["since"])
                 done.append(key)
         for key in done:
             self._pending_alarms.pop(key, None)
+
+    def _freeze_silence_ready(self, now: float, need: float) -> bool:
+        """静帧且无伴音：画面已满时长，伴音也连续低于门限满同一时长。无音频则只看画面。"""
+        if self.freeze_mode != "video_silence" or self._audio_unavailable:
+            return True
+        if not self._silence_active or self._silence_since is None:
+            return False
+        return (now - float(self._silence_since)) >= float(need)
+
+    def _note_silence_line(self, lower: str) -> None:
+        if "silence_start" in lower:
+            self._silence_active = True
+            self._silence_since = _now_ts() - float(self._silence_probe_d or 0)
+        elif "silence_end" in lower:
+            self._silence_active = False
+            self._silence_since = None
+
+    def _note_audio_missing(self, lower: str) -> None:
+        if self._audio_unavailable:
+            return
+        if "matches no streams" in lower or (
+            "stream specifier" in lower and ":a" in lower
+        ):
+            self._audio_unavailable = True
+            self.logger.warning("未找到音频，下一轮静帧只看画面")
 
     def _emit_alarm_event(
         self,
@@ -2037,6 +2109,9 @@ class StreamMonitor:
         self._last_ffmpeg_activity_ts = _now_ts()
         now = _now_str()
         lower = line.lower()
+        self._note_audio_missing(lower)
+        if "silence_start" in lower or "silence_end" in lower:
+            self._note_silence_line(lower)
         # 真正解到流的标志，不含 Packet corrupt / 打开失败
         if (
             "stream mapping" in lower
@@ -2303,6 +2378,8 @@ class StreamMonitor:
         )
         self._last_media_ts = 0.0
         self._latest_valid = False
+        self._silence_active = False
+        self._silence_since = None
         self._run_started_ts = _now_ts()
         self._write_status("starting")
         self._start_ai_thread()
