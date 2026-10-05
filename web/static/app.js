@@ -1241,48 +1241,91 @@
     return v.toFixed(i === 0 ? 0 : 1) + u[i];
   }
 
+  function perfLevel(pct) {
+    if (pct == null || pct === "") return "";
+    const n = Number(pct);
+    if (Number.isNaN(n)) return "";
+    if (n >= 85) return "hot";
+    if (n >= 60) return "warn";
+    return "ok";
+  }
+
+  function perfBar(pct) {
+    const known = pct != null && pct !== "" && !Number.isNaN(Number(pct));
+    const n = known ? Math.max(0, Math.min(100, Number(pct))) : 0;
+    return `<div class="perf-bar"><span class="${perfLevel(pct)}" style="width:${n.toFixed(1)}%"></span></div>`;
+  }
+
+  function fmtLink(mbps) {
+    const n = Number(mbps);
+    if (!n || n <= 0) return "";
+    if (n >= 1000 && n % 1000 === 0) return n / 1000 + " Gb/s";
+    return n + " Mb/s";
+  }
+
+  function perfMeter(label, value, pct, foot) {
+    return `<div class="perf-meter">
+      <div class="perf-meter-top"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>
+      ${perfBar(pct)}
+      <div class="perf-foot">${escapeHtml(foot)}</div>
+    </div>`;
+  }
+
   async function refreshPerf() {
     const box = $("#perf-detail");
     if (!box) return;
     try {
       const p = await fetchJSON("/api/system/perf");
       const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
-      const memPct = p.memory && p.memory.used_percent != null ? p.memory.used_percent + "%" : "-";
-      const diskPct = p.disk && p.disk.used_percent != null ? p.disk.used_percent + "%" : "-";
+      const mem = p.memory || {};
+      const disk = p.disk || {};
+      const memPct = mem.used_percent != null ? mem.used_percent + "%" : "-";
+      const diskPct = disk.used_percent != null ? disk.used_percent + "%" : "-";
       const load1 = p.loadavg && p.loadavg["1"] != null ? Number(p.loadavg["1"]).toFixed(2) : "-";
       const load5 = p.loadavg && p.loadavg["5"] != null ? Number(p.loadavg["5"]).toFixed(2) : "-";
-      const cores = p.cpu_cores != null ? p.cpu_cores : "-";
-      const nicLines = (p.nics || [])
+      const cores = p.cpu_cores != null ? p.cpu_cores + " 核" : "-";
+      const nicCards = (p.nics || [])
         .map((n) => {
           const car =
             n.carrier === true ? "有载波" : n.carrier === false ? "无载波" : n.operstate || "-";
-          const sp = n.speed_mbps ? n.speed_mbps + "Mb/s" : "";
-          const ip = n.ipv4 ? n.ipv4 : "无IP";
-          const mark = n.up ? "●" : "○";
-          const rx = fmtBitrate(n.rx_kbps);
+          const link = fmtLink(n.speed_mbps);
+          const ip = n.ipv4 || "无地址";
+          const rx = fmtBitrate(n.rx_kbps) || "-";
+          const tx = fmtBitrate(n.tx_kbps) || "-";
           const occ =
-            n.occupancy_percent != null ? Number(n.occupancy_percent).toFixed(1) + "%" : "";
-          const flow = rx ? "实时 " + rx : "";
-          const use = occ ? "占用 " + occ : "";
-          return `${mark} ${n.name} ${car} ${sp} ${ip} ${flow} ${use}`
-            .replace(/\s+/g, " ")
-            .trim();
+            n.occupancy_percent != null ? Number(n.occupancy_percent).toFixed(1) + "%" : "速率未知";
+          const bits = [car, link, ip, "占用 " + occ, "发送 " + tx].filter(Boolean);
+          return `<div class="perf-nic">
+            <div class="perf-nic-top">
+              <span><span class="dot${n.up ? " on" : ""}">●</span>${escapeHtml(n.name || "")}</span>
+              <b>${escapeHtml(rx)}</b>
+            </div>
+            ${perfBar(n.occupancy_percent)}
+            <div class="perf-foot">${bits.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>
+          </div>`;
         })
-        .join("<br/>");
-      const monBr = fmtBitrate(p.monitor_bitrate_kbps);
+        .join("");
+      const monBr = fmtBitrate(p.monitor_bitrate_kbps) || "-";
       box.innerHTML = `
-        CPU 估算 <b>${cpu}</b>（核数 ${cores}）· 负载 <b>${load1}</b> / ${load5}<br/>
-        内存 <b>${memPct}</b>（${fmtBytes(p.memory && p.memory.used_bytes)} / ${fmtBytes(
-        p.memory && p.memory.total_bytes
-      )}）<br/>
-        磁盘 <b>${diskPct}</b>（已用 ${fmtBytes(p.disk && p.disk.used_bytes)} · 剩余 ${fmtBytes(
-        p.disk && p.disk.free_bytes
-      )}）<br/>
-        <div class="perf-net"><b>网络</b> 监测码流 <b>${monBr || "-"}</b><br/>${
-        nicLines || "-"
-      }</div>
-        <span style="font-size:11px">更新于 ${escapeHtml(p.time || "")}</span>
+        <div class="perf-meters">
+          ${perfMeter("CPU", cpu, p.cpu_percent, cores + " · 负载 " + load1 + " / " + load5)}
+          ${perfMeter(
+            "内存",
+            memPct,
+            mem.used_percent,
+            fmtBytes(mem.used_bytes) + " / " + fmtBytes(mem.total_bytes)
+          )}
+          ${perfMeter(
+            "磁盘",
+            diskPct,
+            disk.used_percent,
+            "已用 " + fmtBytes(disk.used_bytes) + " · 剩余 " + fmtBytes(disk.free_bytes)
+          )}
+        </div>
+        <div class="perf-net-head"><span>网络</span><span>监测节目合计 <b>${escapeHtml(monBr)}</b></span></div>
+        <div class="perf-nics">${nicCards || '<div class="empty">没有读到网卡</div>'}</div>
       `;
+      if ($("#perf-time")) $("#perf-time").textContent = p.time ? "更新于 " + p.time : "";
     } catch (e) {
       box.textContent = "无法读取性能：" + (e.message || e);
     }

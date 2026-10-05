@@ -153,8 +153,51 @@ body {
 .ch-card .ch-id { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .ch-card .ch-rate { font-size: 11px; color: #93c5fd; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .ch-card .ch-meta { font-size: 11px; color: var(--muted); margin-top: 6px; min-height: 28px; }
-.perf-net { margin-top: 8px; font-size: 12px; line-height: 1.5; color: var(--text); }
-.perf-net b { color: var(--muted); font-weight: 600; }
+.perf-panel { grid-column: 1 / -1; border-right: none; border-top: 1px solid var(--border); }
+.perf-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.perf-panel .perf-head h3 { margin-bottom: 0; }
+.perf-head-actions { display: flex; align-items: center; gap: 10px; }
+.perf-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.perf-meter, .perf-nic {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.perf-meter-top, .perf-nic-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.perf-meter-top b, .perf-nic-top b {
+  color: var(--text);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+.perf-bar {
+  height: 8px;
+  margin: 8px 0 6px;
+  background: var(--bg3);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.perf-bar > span { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--ok); }
+.perf-bar > span.warn { background: var(--warn); }
+.perf-bar > span.hot { background: var(--alarm); }
+.perf-foot { font-size: 12px; color: var(--muted); line-height: 1.45; }
+.perf-nic .perf-foot { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.perf-nic .perf-foot span { white-space: nowrap; }
+.perf-net-head { display: flex; justify-content: space-between; align-items: baseline; margin: 14px 0 8px; font-size: 13px; color: var(--muted); }
+.perf-net-head b { color: var(--text); font-variant-numeric: tabular-nums; }
+.perf-nics { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.perf-nic .dot { color: var(--muted); margin-right: 4px; }
+.perf-nic .dot.on { color: var(--ok); }
+@media (max-width: 900px) {
+  .perf-meters { grid-template-columns: 1fr; }
+}
 
 .event-toolbar {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center;

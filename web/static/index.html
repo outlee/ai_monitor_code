@@ -209,10 +209,15 @@
         </div>
       </div>
 
-      <div class="ctrl-block note-block" id="perf-panel">
-        <h3>服务器性能</h3>
-        <div id="perf-detail" class="storage-detail">加载中…</div>
-        <button type="button" class="btn" id="btn-perf-refresh" style="margin-top:8px">刷新性能</button>
+      <div class="ctrl-block perf-panel" id="perf-panel">
+        <div class="perf-head">
+          <h3>服务器性能</h3>
+          <div class="perf-head-actions">
+            <span id="perf-time" class="hint"></span>
+            <button type="button" class="btn" id="btn-perf-refresh">刷新</button>
+          </div>
+        </div>
+        <div id="perf-detail" class="perf-board">加载中…</div>
       </div>
     </div>
   </section>
