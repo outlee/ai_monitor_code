@@ -159,10 +159,10 @@
           <span>花屏确认 (秒)</span>
           <input type="number" id="inp-ai-confirm" min="1" max="60" step="1" title="连续这么多秒都像花屏或马赛克才告警" />
         </label>
-        <p class="hint">连续这么多秒都像花屏或马赛克才告警。模型加载失败时用内置检测。</p>
+        <p class="hint">连续这么多秒都像花屏或马赛克才告警。马赛克要画面上真有成片的方块，模型分数单独偏高不算。花屏看绿色占比。</p>
         <label class="field-row">
-          <span>ONNX 异常阈值</span>
-          <input type="number" id="inp-ai-threshold" min="0" max="1" step="0.05" title="分数≥此值判异常，默认 0.55" />
+          <span>模型分数记录</span>
+          <input type="number" id="inp-ai-threshold" min="0" max="1" step="0.05" title="只记在明细里，单独偏高不会报马赛克" />
         </label>
         <label class="field-row">
           <span>绿屏占比阈值</span>
