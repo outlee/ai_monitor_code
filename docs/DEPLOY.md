@@ -703,7 +703,7 @@ python3 -m uvicorn web.app:app --host 0.0.0.0 --port 8080
 | 频道管理 | 新增/编辑/删除/导入导出；名称、组播 URL、可选 program。标签可多选（卫视+高清），监测中点任一标签都能看到。标签单独保存，不改频道配置，监测不中断 |
 | 功能开关 | AI 启停；静帧二选一（只报静帧 / 静帧且无伴音）和静帧秒数 |
 | 状态 | ok / alarm / reconnecting / stale / offline / disabled |
-| 事件 / 截图 | 事件读 `logs/events.jsonl`。异常截图只列 `freeze_` / `black_` 等告警文件，不含 `latest_ok.jpg`。静帧/黑场用最近一张合格画面，没有则从收包缓冲抽一帧 |
+| 事件 / 截图 | 事件读 `logs/events.jsonl`。异常截图只列 `freeze_` / `black_` 等告警文件，不含 `latest_ok.jpg`。静帧/黑场在确认时从收包缓冲尾部抽当时的异常画面，不用告警前的合格缩略图 |
 | 监测节点 | 管理页填写 `config/nodes.yaml`。有远程地址时，大屏从左到右列出各台性能，并合并卡片和截图；改频道仍在各台页面 |
 | 本地提醒 | 浏览器声音、桌面通知（需授权） |
 

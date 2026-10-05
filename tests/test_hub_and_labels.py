@@ -14,7 +14,12 @@ sys.path.insert(0, str(ROOT / "workers"))
 from channel_meta import clean_categories, clean_category, resolve_categories  # noqa: E402
 from freeze_rules import effective_freeze_seconds  # noqa: E402
 from hub import assemble_hub, assemble_perf, hub_is_active, normalize_node_list  # noqa: E402
-from monitor_worker import alarm_frame_max_age_sec  # noqa: E402
+from monitor_worker import (  # noqa: E402
+    alarm_ring_tail,
+    alarm_tail_nbytes,
+    alarm_tail_span_sec,
+    alarm_tail_spans,
+)
 from snapshot_names import is_alarm_snapshot  # noqa: E402
 
 
@@ -116,9 +121,32 @@ class HubTests(unittest.TestCase):
         self.assertEqual(merged["stats_24h"]["total"], 3)
         self.assertEqual(merged["recent_events"][0]["node_name"], "机房2")
 
-    def test_alarm_frame_accepts_slow_thumbs(self):
-        self.assertEqual(alarm_frame_max_age_sec(5), 45.0)
-        self.assertEqual(alarm_frame_max_age_sec(60), 60.0)
+    def test_alarm_tail_stays_inside_the_anomaly(self):
+        # 静帧确认时已经持续约 12 秒。截图只取尾部两三秒，不能把整段缓冲头部的正常节目解进去。
+        span = alarm_tail_span_sec(12)
+        self.assertGreaterEqual(span, 1.0)
+        self.assertLessEqual(span, 2.0)
+        n = alarm_tail_nbytes(8000, span)
+        covered = n * 8.0 / (8000 * 1000.0)
+        self.assertGreater(covered, 0.8)
+        self.assertLess(covered, 2.5)
+        data = b"\x00" * (n + 64) + b"\x11" * n
+        self.assertEqual(alarm_ring_tail(data, 8000, span), b"\x11" * n)
+
+        # 黑场确认至少约 5 秒。2Mbps 时尾部仍要比这段黑场短。
+        black_span = alarm_tail_span_sec(5)
+        black_n = alarm_tail_nbytes(2000, black_span)
+        black_covered = black_n * 8.0 / (2000 * 1000.0)
+        self.assertLess(black_covered, 5.0)
+        for wider in alarm_tail_spans(12):
+            wide_n = alarm_tail_nbytes(2000, wider)
+            wide_covered = wide_n * 8.0 / (2000 * 1000.0)
+            self.assertLess(wide_covered, 12.0)
+        self.assertGreaterEqual(len(alarm_tail_spans(12)), 2)
+
+        # 不知道码率时按偏低码率估，避免把低码率节目的正常画面卷进来。
+        unknown = alarm_tail_nbytes(0, 2.0)
+        self.assertLess(unknown * 8.0 / (2000 * 1000.0), 3.0)
 
     def test_perf_keeps_dead_remote(self):
         nodes = normalize_node_list(

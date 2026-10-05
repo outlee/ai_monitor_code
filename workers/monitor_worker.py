@@ -48,13 +48,60 @@ def _is_alarm_snapshot_name(name: str) -> bool:
     return is_alarm_snapshot(name)
 
 
-def alarm_frame_max_age_sec(latest_max_age_sec: float) -> float:
-    """大屏合格画面大约 20 秒一张。告警截图要能用到上一张，不能只认几秒内的。"""
+def alarm_tail_span_sec(anomaly_age_sec: float) -> float:
+    """告警截图只覆盖异常已经持续的后半段，避免解到异常前的正常画面。"""
     try:
-        age = float(latest_max_age_sec or 0)
+        age = float(anomaly_age_sec or 0)
     except (TypeError, ValueError):
         age = 0.0
-    return max(age, 45.0)
+    if age <= 0:
+        return 1.0
+    if age < 1.5:
+        return max(0.4, age * 0.65)
+    return min(2.0, age * 0.45)
+
+
+def alarm_tail_spans(anomaly_age_sec: float) -> List[float]:
+    """先取短尾。短尾没有关键帧时再放宽，第二段仍然落在异常时段里。"""
+    primary = alarm_tail_span_sec(anomaly_age_sec)
+    spans = [primary]
+    try:
+        age = float(anomaly_age_sec or 0)
+    except (TypeError, ValueError):
+        age = 0.0
+    if age >= 3.0:
+        wider = min(age * 0.75, 3.5)
+        if wider >= primary + 0.5:
+            spans.append(wider)
+    return spans
+
+
+def alarm_tail_nbytes(bitrate_kbps: float, span_sec: float) -> int:
+    """按码率把秒数换成字节。不知道码率时按 2.5Mbps 估，宁短勿把正常画面卷进来。"""
+    try:
+        kbps = float(bitrate_kbps or 0)
+    except (TypeError, ValueError):
+        kbps = 0.0
+    try:
+        span = float(span_sec or 0)
+    except (TypeError, ValueError):
+        span = 1.0
+    if span <= 0:
+        span = 1.0
+    if kbps < 200:
+        kbps = 2500.0
+    nbytes = int(kbps * 1000.0 / 8.0 * span)
+    return max(188 * 40, min(nbytes, 3 * 1024 * 1024))
+
+
+def alarm_ring_tail(data: bytes, bitrate_kbps: float, span_sec: float) -> bytes:
+    """只留缓冲最新的一段。解的是这段里的第一帧，所以段不能伸到异常开始之前。"""
+    if not data:
+        return b""
+    n = alarm_tail_nbytes(bitrate_kbps, span_sec)
+    if len(data) <= n:
+        return data
+    return data[-n:]
 
 
 # 可选 AI 模块：导入失败也不影响主流程
@@ -1907,22 +1954,157 @@ class StreamMonitor:
         good, _reason = jpeg_looks_displayable(data)
         return bool(good)
 
-    def _read_alarm_jpeg(self) -> Optional[bytes]:
-        """用最近一张合格画面。大屏约 20 秒才更新，不能套用 5 秒新鲜度。"""
-        max_age = alarm_frame_max_age_sec(self.latest_max_age_sec)
-        now = _now_ts()
-        for path in (self.snapshot_dir / "latest_ok.jpg", self.latest_frame_path):
+    def _grab_alarm_from_ring(self, anomaly_age_sec: float) -> Optional[bytes]:
+        """抽当前异常画面。网卡收流时只读收包缓冲尾部，不再另开 UDP。"""
+        if not self._capture_key:
+            return None
+        lock = getattr(self, "_ring_grab_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._ring_grab_lock = lock
+        if not lock.acquire(timeout=20):
+            self.logger.warning("告警截图跳过: 收包缓冲正在抽帧")
+            return None
+        try:
+            return self._grab_alarm_from_ring_unlocked(anomaly_age_sec)
+        finally:
+            lock.release()
+
+    def _grab_alarm_from_ring_unlocked(self, anomaly_age_sec: float) -> Optional[bytes]:
+        try:
+            from iface_mcast import align_ts_sync, hub_stats, snapshot_ts
+        except ImportError:
             try:
-                if not path.is_file():
+                from workers.iface_mcast import align_ts_sync, hub_stats, snapshot_ts
+            except ImportError:
+                return None
+        try:
+            iface, group, port, _cid = self._capture_key
+        except Exception:
+            return None
+        data = snapshot_ts(iface, group, port, min_bytes=160 * 1024)
+        if not data:
+            self.logger.warning("告警截图失败: 收包缓冲还不够")
+            return None
+        data = align_ts_sync(data)
+        if len(data) > 12 * 1024 * 1024:
+            data = align_ts_sync(data[-12 * 1024 * 1024 :])
+        try:
+            bitrate = float((hub_stats(iface, group, port) or {}).get("bitrate_kbps") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0.0
+
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        ts_path = self.snapshot_dir / (".alarm_%s.ts" % self.id)
+        jpg_tmp = self.snapshot_dir / (".alarm_%s.tmp.jpg" % self.id)
+        last_err = ""
+        wrote = False
+        seen_len = set()
+        try:
+            for span in alarm_tail_spans(anomaly_age_sec):
+                chunk = align_ts_sync(alarm_ring_tail(data, bitrate, span))
+                if len(chunk) < 32 * 1024 or len(chunk) in seen_len:
                     continue
-                if now - path.stat().st_mtime > max_age:
-                    continue
-                data = path.read_bytes()
+                seen_len.add(len(chunk))
+                try:
+                    with open(str(ts_path), "wb") as f:
+                        f.write(chunk)
+                        f.flush()
+                except OSError as e:
+                    self.logger.warning("告警截图写缓冲失败: %s" % e)
+                    return None
+                wrote = True
+                blob, last_err = self._ffmpeg_alarm_jpeg(ts_path, jpg_tmp)
+                if blob:
+                    self.logger.info(
+                        "告警截图取自缓冲尾部 age=%.1fs bitrate=%.0fkbps span=%.1fs bytes=%d"
+                        % (float(anomaly_age_sec or 0), bitrate, span, len(chunk))
+                    )
+                    return blob
+            if wrote:
+                ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
+                if ok:
+                    try:
+                        blob = jpg_tmp.read_bytes()
+                    except OSError:
+                        blob = b""
+                    if self._jpeg_ok_for_alarm(blob):
+                        self.logger.info(
+                            "告警截图取自缓冲尾部 age=%.1fs bitrate=%.0fkbps via=gst"
+                            % (float(anomaly_age_sec or 0), bitrate)
+                        )
+                        return blob
+            self.logger.warning(
+                "告警截图失败: 缓冲尾部没有可显示画面 %s" % (last_err or "")
+            )
+            return None
+        finally:
+            for p in (ts_path, jpg_tmp):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                except OSError:
+                    pass
+
+    def _ffmpeg_alarm_jpeg(self, ts_path: Path, jpg_tmp: Path):
+        """从已经截短的 TS 里解一帧。文件本身就是异常时段的尾部。"""
+        map_list = []
+        if self.program is not None:
+            map_list.append(["-map", "0:p:%d:v:0" % int(self.program)])
+            map_list.append(["-map", "0:p:%d:v" % int(self.program)])
+        map_list.append(["-map", "0:v:0"])
+        map_list.append(["-map", "0:v:1"])
+        map_list.append([])
+        last = ""
+        for maps in map_list:
+            try:
+                if jpg_tmp.is_file():
+                    jpg_tmp.unlink()
+            except OSError:
+                pass
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-fflags",
+                "+genpts+igndts",
+                "-err_detect",
+                "ignore_err",
+                "-probesize",
+                "2M",
+                "-analyzeduration",
+                "1M",
+                "-f",
+                "mpegts",
+                "-i",
+                str(ts_path),
+            ]
+            cmd.extend(list(maps))
+            cmd.extend(["-an", "-frames:v", "1", "-q:v", "3", str(jpg_tmp)])
+            try:
+                r = subprocess.run(
+                    cmd,
+                    timeout=8,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.TimeoutExpired:
+                last = "timeout"
+                continue
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            last = err.splitlines()[-1][:200] if err else ""
+            if not (jpg_tmp.is_file() and jpg_tmp.stat().st_size > 2048):
+                continue
+            try:
+                blob = jpg_tmp.read_bytes()
             except OSError:
                 continue
-            if self._jpeg_ok_for_alarm(data):
-                return data
-        return None
+            if self._jpeg_ok_for_alarm(blob):
+                return blob, last
+            last = last or "not_displayable"
+        return None, last
 
     def _store_alarm_jpeg(self, dest: Path, data: bytes) -> bool:
         tmp = dest.with_suffix(dest.suffix + ".part")
@@ -1940,25 +2122,26 @@ class StreamMonitor:
                 pass
             return False
 
-    def _take_snapshot(self, event_type: str) -> Optional[Path]:
+    def _take_snapshot(self, event_type: str, started: Optional[float] = None) -> Optional[Path]:
         """
-        黑场/静帧留下告警图。优先复制最近合格画面；没有则从收包缓冲抽一帧。
-        网卡收流时不再另开一路 UDP，那个口已经被监测进程占着。
+        黑场/静帧留下当时的异常画面。
+        大屏合格图可能是异常开始前的正常节目，不能拿来当告警截图。
+        网卡收流时从收包缓冲尾部抽一帧，不再另开一路 UDP。
         """
         if event_type in ("stream_down",) or str(event_type).endswith("_end"):
+            return None
+        visual = event_type in ("black", "freeze") or str(event_type).startswith("ai_")
+        if not visual:
             return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = self.snapshot_dir / f"{event_type}_{ts}.jpg"
-        visual = event_type in ("black", "freeze") or str(event_type).startswith("ai_")
-
-        data = self._read_alarm_jpeg()
-        if data and self._store_alarm_jpeg(out_path, data):
-            self.logger.info("截图已保存(最近合格画面): %s" % out_path)
-            self._prune_snapshots()
-            return out_path
-        if not visual:
-            return None
+        age = 0.0
+        if started:
+            try:
+                age = max(0.0, _now_ts() - float(started))
+            except (TypeError, ValueError):
+                age = 0.0
 
         def _bg():
             with self._snapshot_lock:
@@ -1967,13 +2150,12 @@ class StreamMonitor:
                 self._snapshot_inflight = True
             try:
                 if self._capture_key:
-                    self._refresh_latest_from_ring()
-                    again = self._read_alarm_jpeg()
-                    if again and self._store_alarm_jpeg(out_path, again):
-                        self.logger.info("截图已保存(收包缓冲): %s" % out_path)
+                    blob = self._grab_alarm_from_ring(age)
+                    if blob and self._store_alarm_jpeg(out_path, blob):
+                        self.logger.info("截图已保存(异常画面): %s" % out_path)
                         self._prune_snapshots()
                         return
-                    self.logger.warning("截图失败: 收包缓冲没有合格画面 %s" % out_path)
+                    self.logger.warning("截图失败: %s" % out_path)
                     return
                 if self._grab_frame_ffmpeg(out_path, quality=3, keyframe_only=True):
                     try:
@@ -2016,7 +2198,7 @@ class StreamMonitor:
         self._active_alarms[alarm_key] = started if started else now
         self._cooldown_until[alarm_key] = now + self.alarm_cooldown_sec
         if self.save_snapshot:
-            snap = self._take_snapshot(event["type"])
+            snap = self._take_snapshot(event["type"], started=started)
             if snap:
                 event["snapshot"] = str(snap)
         self.logger.warning(json.dumps(event, ensure_ascii=False))
