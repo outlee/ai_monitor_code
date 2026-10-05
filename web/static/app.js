@@ -31,8 +31,8 @@
     black_end: "黑场恢复",
     freeze_end: "静帧恢复",
     silence_end: "伴音恢复",
-    ai_mosaic: "花屏/马赛克",
-    ai_green_screen: "绿屏花屏",
+    ai_mosaic: "马赛克",
+    ai_green_screen: "花屏",
     ai_anomaly: "画面异常",
   };
 
@@ -51,8 +51,9 @@
     if (TYPE_LABELS[t]) return TYPE_LABELS[t];
     const s = String(t);
     if (s.startsWith("ai_")) {
-      if (s.indexOf("mosaic") >= 0) return "花屏/马赛克";
-      if (s.indexOf("green") >= 0) return "绿屏花屏";
+      if (s.indexOf("green") >= 0 && s.indexOf("mosaic") >= 0) return "花屏马赛克";
+      if (s.indexOf("mosaic") >= 0) return "马赛克";
+      if (s.indexOf("green") >= 0) return "花屏";
       return "AI画面异常";
     }
     return t;
@@ -411,6 +412,7 @@
     $("#sw-ai-enabled").checked = !!ai.enabled;
     $("#sel-ai-mode").value = ai.mode || "auto";
     $("#inp-ai-interval").value = ai.interval_sec ?? 2;
+    if ($("#inp-ai-confirm")) $("#inp-ai-confirm").value = ai.confirm_sec ?? 6;
     if ($("#inp-ai-threshold")) $("#inp-ai-threshold").value = ai.threshold ?? 0.55;
     if ($("#inp-green-th")) $("#inp-green-th").value = ai.green_ratio_th ?? 0.35;
     if ($("#inp-block-th")) $("#inp-block-th").value = ai.block_score_th ?? 0.12;
@@ -422,8 +424,12 @@
       el.checked = el.value === mode;
     });
     syncFreezeHint();
+    if ($("#inp-freeze-startup")) {
+      $("#inp-freeze-startup").value = d.freeze_startup_ignore_sec ?? 20;
+    }
+    if ($("#sw-detect-silence")) $("#sw-detect-silence").checked = !!d.detect_silence;
     $("#inp-silence").value = d.silence_duration ?? 3;
-    if ($("#inp-silence-db")) $("#inp-silence-db").value = d.silence_threshold ?? -40;
+    if ($("#inp-silence-db")) $("#inp-silence-db").value = d.silence_threshold ?? -50;
   }
 
   async function loadNicOptions(selected) {
@@ -675,15 +681,12 @@
   function syncFreezeHint() {
     const picked = document.querySelector('input[name="freeze-mode"]:checked');
     const mode = picked ? picked.value : "video";
-    const n = parseFloat(($("#inp-freeze") && $("#inp-freeze").value) || "");
     const hint = $("#freeze-hint");
     if (!hint) return;
     if (mode === "video_silence") {
-      hint.textContent = "画面静止且这几秒电平低于静音阈值才告警。填几秒就按几秒，不另报无伴音。";
-    } else if (!Number.isNaN(n) && n < 12) {
-      hint.textContent = "只报静帧最短 12 秒。当前填写 " + n + " 秒，保存后按 12 秒执行。";
+      hint.textContent = "画面静止且这几秒电平低于无伴音阈值才告警。静帧且无伴音是一条告警。无伴音开关另外单独报没声音。";
     } else {
-      hint.textContent = "只看画面。最短 12 秒。";
+      hint.textContent = "只看画面。填几秒就按几秒告警。";
     }
   }
 
@@ -1415,6 +1418,7 @@
         enabled: $("#sw-ai-enabled").checked,
         mode: $("#sel-ai-mode").value,
         interval_sec: parseFloat($("#inp-ai-interval").value) || 2,
+        confirm_sec: parseFloat($("#inp-ai-confirm").value) || 6,
         threshold: parseFloat($("#inp-ai-threshold").value),
         green_ratio_th: parseFloat($("#inp-green-th").value),
         block_score_th: parseFloat($("#inp-block-th").value),
@@ -1507,6 +1511,11 @@
         freeze_mode: (document.querySelector('input[name="freeze-mode"]:checked') || {}).value || "video",
         silence_duration: parseFloat($("#inp-silence").value) || 3,
         silence_threshold: parseFloat($("#inp-silence-db").value),
+        detect_silence: !!($("#sw-detect-silence") && $("#sw-detect-silence").checked),
+        freeze_startup_ignore_sec: (function () {
+          const n = parseFloat($("#inp-freeze-startup") && $("#inp-freeze-startup").value);
+          return Number.isNaN(n) ? 20 : n;
+        })(),
       });
       toast(res.message || "规则参数已保存", "ok");
       await refresh();

@@ -6,19 +6,20 @@
 
 defaults:
   # ---------- 规则检测（黑场 / 静帧 / 无伴音）----------
-  black_duration: 5.0          # 黑场持续多久才告警（秒），越大越不敏感
-  freeze_duration: 12.0        # 静帧持续多久才告警（秒）。只报静帧时最短 12；静帧且无伴音时按这里的秒数
-  freeze_mode: video           # video=只报静帧；video_silence=画面静止且这几秒无伴音才告警（不另报无伴音）
+  black_duration: 5.0          # 黑场持续多久才告警（秒）。填几秒就按几秒
+  freeze_duration: 12.0        # 静帧持续多久才告警（秒）。只报静帧、静帧且无伴音都按这里的秒数
+  freeze_mode: video           # video=只看画面；video_silence=画面静止且这几秒无伴音才报「检测到静帧无伴音」
+  freeze_startup_ignore_sec: 20.0  # 监测刚启动的这段秒数内不计静帧。黑场、无伴音不受影响
   freeze_noise: 0.003          # freezedetect n，FFmpeg 默认 0.001。越大越容易把微动判成静帧，不要超过 0.01
-  silence_duration: 12.0       # 无伴音持续多久才告警（秒）
-  silence_threshold: -50.0     # 静音判定电平（dB），越负越不容易报无伴音
+  silence_duration: 12.0       # 单独无伴音持续多久才告警（秒）
+  silence_threshold: -50.0     # 无伴音判定电平（dB），越负越不容易报
   detect_black: true           # 是否检测黑场
   detect_freeze: true          # 是否检测静帧
-  detect_silence: false        # 是否检测无伴音；有 iface 网卡抓包时建议先 false（丢包易误报）
+  detect_silence: false        # 单独告警「检测到无伴音」。可与静帧且无伴音同时开。抓包丢包时可能误报
 
   # ---------- 告警确认 / 冷却（防抖）----------
-  alarm_confirm_sec: 3.0       # 检出后还要再持续该秒数且未恢复，才正式记告警
-  freeze_confirm_sec: 12.0     # 静帧按墙钟再确认的秒数（与 freeze_duration 对齐）；FFmpeg d= 只作画面相似触发
+  alarm_confirm_sec: 3.0       # 只给没有单独时长的告警兜底。黑场、静帧、无伴音不看这个值
+  freeze_confirm_sec: 12.0     # 不再单独加时。静帧确认秒数等于 freeze_duration
   alarm_cooldown_sec: 90.0     # 同类告警冷却时间（秒），避免反复刷屏
   stream_down_confirm: 2       # 连续断流/退出多少次才记「节目流中断」告警
 
@@ -50,10 +51,11 @@ defaults:
 
 ai:
   enabled: false               # 是否开启 AI 画面异常（马赛克/花屏）；先规则稳定再开
-  mode: auto                   # auto=有模型用 onnx 否则启发式；也可 onnx / heuristic
+  mode: auto                   # auto=有模型用 onnx，否则启发式；onnx 加载失败则改用内置花屏/马赛克
   model_path: models/mosaic_detector.onnx  # ONNX 模型路径（相对工作目录）
-  interval_sec: 2.0            # AI 抽帧分析间隔（秒），越大越省 CPU
-  threshold: 0.55              # ONNX 异常分阈值，≥ 则告警
+  interval_sec: 2.0            # 隔多少秒看一张画面
+  confirm_sec: 6.0             # 连续这么多秒都像花屏或马赛克才告警
+  threshold: 0.55              # ONNX 异常分阈值，≥ 则判马赛克
   green_ratio_th: 0.35         # 启发式：绿色像素占比阈值
   block_score_th: 0.12         # 启发式：块状/马赛克分数阈值
 

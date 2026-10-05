@@ -213,32 +213,34 @@ class StreamMonitor:
         self.detect_silence = bool(
             channel.get("detect_silence", defaults.get("detect_silence", _def_sil))
         )
-        # 告警确认：ffmpeg 报 start 后还要再持续 confirm 秒且未 end 才正式告警
+        # 没有单独时长的告警才用这个兜底。黑场 / 静帧 / 无伴音各自用配置里的秒数。
         self.alarm_confirm_sec = float(
             defaults.get("alarm_confirm_sec", 5.0)
         )
-        if self.alarm_confirm_sec < 5.0:
-            self.alarm_confirm_sec = 5.0
-        # FFmpeg d= 不可信（PTS/补帧）。freezedetect 只作「画面很像」的触发，
-        # 真正静帧时长按墙钟 freeze_duration 确认，避免漏掉真静帧、也不把定镜头抖动打出去。
-        # 静帧且无伴音：确认秒数就是填写的静帧时长，不再被另一条 freeze_confirm_sec 拉长。
-        if self.freeze_mode == "video_silence":
-            self.freeze_confirm_sec = float(self.freeze_duration)
-        else:
-            self.freeze_confirm_sec = float(
-                defaults.get("freeze_confirm_sec", self.freeze_duration)
+        if self.alarm_confirm_sec < 0.5:
+            self.alarm_confirm_sec = 0.5
+        # 静帧确认秒数就是填写的静帧时长。不再被 alarm_confirm_sec 或另一条下限抬高。
+        self.freeze_confirm_sec = float(self.freeze_duration)
+        try:
+            self.freeze_startup_ignore_sec = float(
+                channel.get(
+                    "freeze_startup_ignore_sec",
+                    defaults.get("freeze_startup_ignore_sec", 20),
+                )
             )
-            if self.freeze_confirm_sec < self.freeze_duration:
-                self.freeze_confirm_sec = self.freeze_duration
-        # 解码器刚起来的重复帧不算静帧
-        self.freeze_startup_ignore_sec = 20.0
-        # freezedetect 自身 d= 只作相似度触发，秒数由上面墙钟确认
-        self._freeze_detect_d = 2.0
-        # 伴音只做静帧门闩，不单独出无伴音告警（detect_silence 仍管那条告警）
+        except (TypeError, ValueError):
+            self.freeze_startup_ignore_sec = 20.0
+        if self.freeze_startup_ignore_sec < 0:
+            self.freeze_startup_ignore_sec = 0.0
+        if self.freeze_startup_ignore_sec > 120:
+            self.freeze_startup_ignore_sec = 120.0
+        # FFmpeg 滤镜 d= 只做最多 1 秒的短触发，墙钟再补到配置时长，避免两段相加。
+        self._black_detect_d = self._probe_seconds(self.black_duration)
+        self._freeze_detect_d = self._probe_seconds(self.freeze_duration)
+        self._silence_probe_d = self._probe_seconds(self.silence_duration)
         self._audio_unavailable = False
         self._silence_active = False
         self._silence_since = None
-        self._silence_probe_d = 1.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -332,6 +334,9 @@ class StreamMonitor:
         # AI 检测器（可选）
         self.ai: Optional[Any] = None
         self._last_ai_ts = 0.0
+        self._ai_bad_since = None
+        self._ai_cool_until = 0.0
+        self._ai_last_ident = None
         self._init_ai(ai_config or {})
 
     @staticmethod
@@ -472,6 +477,39 @@ class StreamMonitor:
         sep = "&" if "?" in url else "?"
         return url + sep + "&".join(extras)
 
+    @staticmethod
+    def _probe_seconds(seconds: float) -> float:
+        """滤镜 d= 最长 1 秒。配置时长由墙钟确认，探针秒数从起点里扣回。"""
+        try:
+            d = float(seconds)
+        except (TypeError, ValueError):
+            d = 1.0
+        if d < 0.1:
+            d = 0.1
+        if d > 1.0:
+            d = 1.0
+        return d
+
+    def _alarm_need_sec(self, key: str) -> float:
+        """这条告警要持续的墙钟秒数，就是配置里的对应时长。"""
+        if key == "freeze":
+            return float(self.freeze_duration)
+        if key == "black":
+            return float(self.black_duration)
+        if key == "silence":
+            return float(self.silence_duration)
+        return float(self.alarm_confirm_sec)
+
+    def _detector_lead_sec(self, key: str) -> float:
+        """FFmpeg 报 start 时，异常已经持续了探针这么久。"""
+        if key == "freeze":
+            return float(self._freeze_detect_d)
+        if key == "black":
+            return float(self._black_detect_d)
+        if key == "silence":
+            return float(self._silence_probe_d)
+        return 0.0
+
     def _build_filter_complex(self) -> str:
         """
         视频：降采样 → 规则检测；可选按帧序号旁路 latest.jpg
@@ -486,10 +524,13 @@ class StreamMonitor:
         # PCR 跳变会让 freezedetect 瞬间 freeze_start，freeze_end 却只有 0.4～3s。
         vparts.append("setpts=N/25/TB")
         if self.detect_black:
-            vparts.append(f"blackdetect=d={self.black_duration}:pix_th=0.10")
+            vparts.append(
+                "blackdetect=d=%.1f:pix_th=0.10" % self._black_detect_d
+            )
         if self.detect_freeze:
             vparts.append(
-                f"freezedetect=n={self.freeze_noise}:d={self._freeze_detect_d}"
+                "freezedetect=n=%s:d=%.1f"
+                % (self.freeze_noise, self._freeze_detect_d)
             )
         detect = ",".join(vparts) if vparts else "null"
         meter = self.detect_silence or (
@@ -499,13 +540,9 @@ class StreamMonitor:
             # 这一路没有音频 PID。静帧退回只看画面，图仍然要有一路音频输出。
             audio = "anullsrc=channel_layout=stereo:sample_rate=8000[aout]"
         elif meter:
-            if self.detect_silence:
-                self._silence_probe_d = float(self.silence_duration)
-            else:
-                self._silence_probe_d = 1.0
             audio = (
-                f"[{ain}]silencedetect=noise={self.silence_threshold}dB:"
-                f"d={self._silence_probe_d}[aout]"
+                "[%s]silencedetect=noise=%sdB:d=%.1f[aout]"
+                % (ain, self.silence_threshold, self._silence_probe_d)
             )
         else:
             audio = f"[{ain}]volume=1[aout]"
@@ -933,6 +970,7 @@ class StreamMonitor:
         if jpeg_looks_displayable is not None:
             good, reason = jpeg_looks_displayable(blob)
             if not good:
+                self._stash_ai_frame(blob)
                 return False, reason or last
         return True, last
 
@@ -1058,6 +1096,7 @@ class StreamMonitor:
             if jpeg_looks_displayable is not None:
                 good, reason = jpeg_looks_displayable(blob)
                 if not good:
+                    self._stash_ai_frame(blob)
                     return False, reason or last
             return True, last
 
@@ -1415,6 +1454,7 @@ class StreamMonitor:
         if jpeg_looks_displayable is not None:
             good, reason = jpeg_looks_displayable(data)
             if not good:
+                self._stash_ai_frame(data)
                 now = time.time()
                 last = getattr(self, "_last_bad_thumb_log", 0.0)
                 if now - last >= 30:
@@ -1640,6 +1680,7 @@ class StreamMonitor:
         if jpeg_looks_displayable is not None:
             ok, reason = jpeg_looks_displayable(data)
             if not ok:
+                self._stash_ai_frame(data)
                 now = time.time()
                 last = getattr(self, "_last_bad_thumb_log", 0.0)
                 if now - last >= 30:
@@ -1698,6 +1739,7 @@ class StreamMonitor:
                         if jpeg_looks_displayable is not None:
                             good, reason = jpeg_looks_displayable(data)
                             if not good:
+                                self._stash_ai_frame(data)
                                 now = time.time()
                                 last = getattr(self, "_last_bad_thumb_log", 0.0)
                                 if now - last >= 30:
@@ -2212,9 +2254,8 @@ class StreamMonitor:
         now = _now_ts()
         done = []
         for key, item in list(self._pending_alarms.items()):
-            need = self.alarm_confirm_sec
+            need = self._alarm_need_sec(key)
             if key == "freeze":
-                need = max(need, float(self.freeze_confirm_sec))
                 if (
                     self._run_started_ts
                     and now - self._run_started_ts < self.freeze_startup_ignore_sec
@@ -2278,16 +2319,14 @@ class StreamMonitor:
             if alarm_key in self._active_alarms:
                 return
             if alarm_key not in self._pending_alarms:
+                lead = self._detector_lead_sec(alarm_key)
                 self._pending_alarms[alarm_key] = {
                     "event": event,
-                    "since": _now_ts(),
+                    "since": _now_ts() - lead,
                 }
-                wait_s = self.alarm_confirm_sec
-                if alarm_key == "freeze":
-                    wait_s = max(wait_s, float(self.freeze_confirm_sec))
+                wait_s = self._alarm_need_sec(alarm_key)
                 self.logger.info(
-                    "待确认告警 %s（%.1fs 内若恢复则不计）"
-                    % (alarm_key, wait_s)
+                    "待确认告警 %s（满 %.1fs 才记）" % (alarm_key, wait_s)
                 )
             return
 
@@ -2422,24 +2461,130 @@ class StreamMonitor:
 
     # ---------- AI（旁路线程，不堵 stderr） ----------
 
-    def _analyze_frame_for_ai(self, frame_path: Path) -> None:
-        if not self.ai or not self.ai.is_ready:
+    def _stash_ai_frame(self, data: bytes) -> None:
+        """大屏不显示的完整画面留给花屏检测。不改 latest.jpg / latest_ok.jpg。"""
+        if not data or len(data) <= 2048 or not self._is_complete_jpeg(data):
             return
-        # 若源是 FFmpeg 正在写的 latest.jpg，先拷到私有文件再推理，避免半帧
+        path = self.snapshot_dir / "latest_ai.jpg"
+        tmp = self.snapshot_dir / (".ai_keep_%s.tmp.jpg" % self.id)
+        try:
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            os.replace(str(tmp), str(path))
+        except OSError:
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    def _ai_may_grab_udp(self) -> bool:
+        """网卡抓包已经占住这一路组播。AI 不能再开第二个 UDP。"""
+        return not self._capture_key
+
+    def _jpeg_ident(self, path: Path):
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        mtime = getattr(st, "st_mtime_ns", None)
+        if mtime is None:
+            mtime = st.st_mtime
+        return (path.name, mtime, st.st_size)
+
+    def _ai_frame_candidates(self) -> List[Path]:
+        """已有画面里较新的一张。纯绿花屏也要留下，不能按缩略图标准丢掉。"""
+        now = _now_ts()
+        found = []
+        for name in ("latest.jpg", "latest_ok.jpg", "latest_ai.jpg"):
+            path = self.snapshot_dir / name
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if st.st_size <= 2048:
+                continue
+            if now - st.st_mtime > 45:
+                continue
+            found.append((st.st_mtime, path))
+        found.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in found]
+
+    def _read_jpeg_file(self, path: Path, max_age: float = 45.0) -> Optional[bytes]:
+        """读完整 JPEG。不判断好不好看，花屏本身就要送去检测。"""
+        for attempt in range(3):
+            try:
+                with self._latest_lock:
+                    if not path.is_file():
+                        return None
+                    st = path.stat()
+                    if st.st_size <= 2048:
+                        return None
+                    if _now_ts() - st.st_mtime > max_age:
+                        return None
+                    data = path.read_bytes()
+                if len(data) > 2048 and self._is_complete_jpeg(data):
+                    return data
+            except OSError:
+                return None
+            time.sleep(0.02 * (attempt + 1))
+        return None
+
+    @staticmethod
+    def _ai_alarm_text(label: str) -> str:
+        if label == "green_screen+mosaic":
+            return "检测到花屏马赛克"
+        if label == "green_screen":
+            return "检测到花屏"
+        if label == "mosaic":
+            return "检测到马赛克"
+        return "检测到花屏或马赛克"
+
+    @staticmethod
+    def _ai_alarm_type(label: str) -> str:
+        if label in ("green_screen", "green_screen+mosaic"):
+            return "ai_green_screen"
+        return "ai_mosaic"
+
+    def _analyze_frame_for_ai(self, frame_path: Path) -> bool:
+        """分析一帧。读不到图返回 False，不因此清掉连续计数。"""
+        if not self.ai or not self.ai.is_ready:
+            return False
         work_path = frame_path
         tmp_copy: Optional[Path] = None
         try:
-            if frame_path.resolve() == self.latest_frame_path.resolve():
-                tmp_copy = self.snapshot_dir / f".ai_read_{os.getpid()}_{threading.get_ident()}.jpg"
-                if not self._copy_latest_frame(tmp_copy):
-                    return
+            if frame_path.name in ("latest.jpg", "latest_ok.jpg", "latest_ai.jpg"):
+                data = self._read_jpeg_file(frame_path, 45.0)
+                if not data:
+                    return False
+                tmp_copy = self.snapshot_dir / (
+                    ".ai_read_%s_%s.jpg" % (os.getpid(), threading.get_ident())
+                )
+                tmp_copy.write_bytes(data)
                 work_path = tmp_copy
+            elif not frame_path.is_file() or frame_path.stat().st_size <= 2048:
+                return False
             result = self.ai.analyze_image(str(work_path))
+            label = str(result.get("label") or "")
+            if label in ("skipped", "unreadable", "error", ""):
+                return True
+            now = _now_ts()
             if not result.get("is_anomaly"):
-                return
+                self._ai_bad_since = None
+                return True
+            if now < float(self._ai_cool_until or 0):
+                return True
+            if self._ai_bad_since is None:
+                self._ai_bad_since = now
+                return True
+            confirm = float(getattr(self.ai, "confirm_sec", 6.0) or 6.0)
+            if confirm < 1.0:
+                confirm = 1.0
+            if now - float(self._ai_bad_since) < confirm:
+                return True
+            safe = label.replace("+", "_").replace("/", "_")
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            label = result.get("label", "anomaly")
-            archive = self.snapshot_dir / f"ai_{label}_{ts}.jpg"
+            archive = self.snapshot_dir / ("ai_%s_%s.jpg" % (safe, ts))
             try:
                 if work_path.is_file():
                     shutil.copy2(work_path, archive)
@@ -2448,22 +2593,26 @@ class StreamMonitor:
             except OSError:
                 archive = work_path
             event = {
-                "type": "ai_" + label,
+                "type": self._ai_alarm_type(label),
                 "phase": "start",
                 "channel_id": self.id,
                 "channel_name": self.name,
-                "message": result.get("message", "AI 检测到画面异常"),
+                "message": self._ai_alarm_text(label),
                 "score": result.get("score"),
                 "detail": result.get("detail"),
                 "backend": result.get("backend"),
                 "time": _now_str(),
                 "snapshot": str(archive),
             }
+            self._ai_cool_until = now + float(self.alarm_cooldown_sec)
+            self._ai_bad_since = None
             self.logger.warning(json.dumps(event, ensure_ascii=False))
             self._save_event(event)
             self._prune_snapshots()
+            return True
         except Exception as e:
-            self.logger.debug(f"AI 分析跳过: {e}")
+            self.logger.debug("AI 分析跳过: %s" % e)
+            return False
         finally:
             if tmp_copy is not None:
                 try:
@@ -2471,8 +2620,43 @@ class StreamMonitor:
                 except OSError:
                     pass
 
+    def _run_ai_once(self) -> bool:
+        cands = self._ai_frame_candidates()
+        if cands:
+            top = cands[0]
+            ident = self._jpeg_ident(top)
+            # 同一张图反复读不算时间过去，避免一张坏图停在磁盘上就报花屏。
+            if ident is not None and ident == self._ai_last_ident:
+                return True
+            if self._analyze_frame_for_ai(top):
+                if ident is not None:
+                    self._ai_last_ident = ident
+                return True
+            for cand in cands[1:]:
+                ident = self._jpeg_ident(cand)
+                if ident is not None and ident == self._ai_last_ident:
+                    continue
+                if self._analyze_frame_for_ai(cand):
+                    if ident is not None:
+                        self._ai_last_ident = ident
+                    return True
+            return False
+        if not self._ai_may_grab_udp():
+            return False
+        tmp = self.snapshot_dir / "ai_frame_tmp.jpg"
+        if not self._grab_frame_ffmpeg(tmp, quality=4):
+            return False
+        try:
+            return self._analyze_frame_for_ai(tmp)
+        finally:
+            try:
+                if tmp.is_file():
+                    tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _ai_loop(self):
-        """独立线程：按 interval 读 latest 或回退抽帧，不阻塞规则解析。"""
+        """独立线程：读已有画面。网卡抓包时不再另开 UDP。"""
         self.logger.info("AI 旁路线程已启动")
         while self.running:
             try:
@@ -2489,32 +2673,13 @@ class StreamMonitor:
                     time.sleep(0.2)
                     continue
 
-                used = False
-                # 优先旁路帧
-                age = self._latest_frame_age()
-                if age is not None and age <= max(self.latest_max_age_sec, interval * 2):
+                if self._run_ai_once():
                     self._last_ai_ts = now
-                    self._analyze_frame_for_ai(self.latest_frame_path)
-                    used = True
-                else:
-                    # 旁路未就绪：低频独立抽帧（仍在 AI 线程，不堵主循环）
-                    tmp = self.snapshot_dir / "ai_frame_tmp.jpg"
-                    if self._grab_frame_ffmpeg(tmp, quality=4):
-                        self._last_ai_ts = now
-                        self._analyze_frame_for_ai(tmp)
-                        try:
-                            if tmp.is_file():
-                                tmp.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        used = True
-
-                if not used:
-                    time.sleep(0.5)
-                else:
                     time.sleep(0.1)
+                else:
+                    time.sleep(0.5)
             except Exception as e:
-                self.logger.debug(f"AI 线程异常: {e}")
+                self.logger.debug("AI 线程异常: %s" % e)
                 time.sleep(1.0)
         self.logger.info("AI 旁路线程已退出")
 
@@ -2542,22 +2707,10 @@ class StreamMonitor:
         interval = float(getattr(self.ai, "interval_sec", 2.0) or 2.0)
         if now - self._last_ai_ts < interval:
             return
-        age = self._latest_frame_age()
-        if age is not None and age <= max(self.latest_max_age_sec, interval * 2):
-            self._last_ai_ts = now
-            self._analyze_frame_for_ai(self.latest_frame_path)
-            return
-        # 回退独立抽帧也放到短线程，避免长时间阻塞
-        self._last_ai_ts = now
 
         def _bg():
-            tmp = self.snapshot_dir / "ai_frame_tmp.jpg"
-            if self._grab_frame_ffmpeg(tmp, quality=4):
-                self._analyze_frame_for_ai(tmp)
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if self._run_ai_once():
+                self._last_ai_ts = time.time()
 
         threading.Thread(target=_bg, name=f"ai-inline-{self.id}", daemon=True).start()
 

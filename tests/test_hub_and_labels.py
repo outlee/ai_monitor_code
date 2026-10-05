@@ -35,10 +35,11 @@ class SnapshotNameTests(unittest.TestCase):
 
 
 class FreezeSecondsTests(unittest.TestCase):
-    def test_video_floor_and_silence_mode(self):
-        self.assertEqual(effective_freeze_seconds("video", 8), 12.0)
+    def test_typed_seconds_for_both_modes(self):
+        self.assertEqual(effective_freeze_seconds("video", 8), 8.0)
         self.assertEqual(effective_freeze_seconds("video_silence", 8), 8.0)
-        self.assertEqual(effective_freeze_seconds("video_silence", 0.2), 1.0)
+        self.assertEqual(effective_freeze_seconds("video", 0.2), 0.5)
+        self.assertEqual(effective_freeze_seconds("video_silence", 0.2), 0.5)
 
 
 class CategoryTests(unittest.TestCase):

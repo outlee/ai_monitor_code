@@ -227,8 +227,22 @@ def _public_defaults(defaults: Dict[str, Any], stale_sec: float) -> Dict[str, An
         "freeze_mode": mode,
         "silence_duration": float(defaults.get("silence_duration", 3.0)),
         "silence_threshold": defaults.get("silence_threshold", -40),
+        "detect_silence": bool(defaults.get("detect_silence", False)),
+        "freeze_startup_ignore_sec": _startup_ignore_sec(defaults),
         "status_stale_sec": stale_sec,
     }
+
+
+def _startup_ignore_sec(defaults: Dict[str, Any]) -> float:
+    try:
+        ign = float(defaults.get("freeze_startup_ignore_sec", 20))
+    except (TypeError, ValueError):
+        ign = 20.0
+    if ign < 0:
+        return 0.0
+    if ign > 120:
+        return 120.0
+    return ign
 
 
 def _load_hub_nodes() -> List[Dict[str, str]]:
@@ -449,6 +463,7 @@ class AIUpdate(BaseModel):
     threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
     green_ratio_th: Optional[float] = Field(None, ge=0.0, le=1.0)
     block_score_th: Optional[float] = Field(None, ge=0.0, le=1.0)
+    confirm_sec: Optional[float] = Field(None, ge=1, le=60)
 
 
 class DefaultsUpdate(BaseModel):
@@ -458,6 +473,8 @@ class DefaultsUpdate(BaseModel):
     freeze_mode: Optional[str] = None
     silence_duration: Optional[float] = Field(None, ge=0.5, le=60)
     silence_threshold: Optional[float] = Field(None, ge=-80, le=0)
+    detect_silence: Optional[bool] = None
+    freeze_startup_ignore_sec: Optional[float] = Field(None, ge=0, le=120)
 
 
 class ChannelUpdate(BaseModel):
@@ -536,6 +553,7 @@ def api_overview():
             "threshold": float(ai.get("threshold", 0.55)),
             "green_ratio_th": float(ai.get("green_ratio_th", 0.35)),
             "block_score_th": float(ai.get("block_score_th", 0.12)),
+            "confirm_sec": float(ai.get("confirm_sec", 6.0) or 6.0),
         },
         "defaults": _public_defaults(defaults, stale_sec),
         "channels": stats,
@@ -1226,6 +1244,9 @@ def api_update_ai(body: AIUpdate):
     if body.block_score_th is not None:
         ai["block_score_th"] = float(body.block_score_th)
         changed.append(f"block_score_th={body.block_score_th}")
+    if body.confirm_sec is not None:
+        ai["confirm_sec"] = float(body.confirm_sec)
+        changed.append("confirm_sec=%s" % body.confirm_sec)
 
     if not changed:
         raise HTTPException(400, "没有可更新的字段")
@@ -1276,18 +1297,20 @@ def api_update_defaults(body: DefaultsUpdate):
     if body.silence_threshold is not None:
         defaults["silence_threshold"] = float(body.silence_threshold)
         changed.append(f"silence_threshold={body.silence_threshold}")
+    if body.detect_silence is not None:
+        defaults["detect_silence"] = bool(body.detect_silence)
+        changed.append("detect_silence=%s" % defaults["detect_silence"])
+    if body.freeze_startup_ignore_sec is not None:
+        defaults["freeze_startup_ignore_sec"] = float(body.freeze_startup_ignore_sec)
+        changed.append(
+            "freeze_startup_ignore_sec=%s" % defaults["freeze_startup_ignore_sec"]
+        )
 
     if not changed:
         raise HTTPException(400, "没有可更新的字段")
 
     _save_config(cfg)
     message = "默认检测参数已保存，热重载后数秒内生效"
-    if (
-        body.freeze_duration is not None
-        and (defaults.get("freeze_mode") or "video") != "video_silence"
-        and float(body.freeze_duration) < 12
-    ):
-        message = "只报静帧最短 12 秒，已按 12 秒保存。热重载后数秒内生效"
     return {
         "ok": True,
         "changed": changed,

@@ -20,10 +20,162 @@ AI 画面异常检测模块（可选）
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("ai_detector")
+
+# 内置马赛克：平坦小块且和邻居色差大的占比。不用启发式那条 0.12，那条会把正常画面报出去。
+BUILTIN_MOSAIC_RATIO = 0.34
+
+
+def rgb_green_ratio(buf: bytes, w: int, h: int) -> float:
+    """纯绿像素占比。g 明显高于 r、b，用来认花屏，不把普通绿色画面算进去。"""
+    n = int(w) * int(h)
+    if w <= 0 or h <= 0 or n <= 0 or len(buf) < n * 3:
+        return 0.0
+    green = 0
+    mv = memoryview(buf)
+    for i in range(0, n * 3, 3):
+        r = mv[i]
+        g = mv[i + 1]
+        b = mv[i + 2]
+        if g > r + 40 and g > b + 40 and g > 70:
+            green += 1
+    return green / float(n)
+
+
+def rgb_mosaic_ratio(buf: bytes, w: int, h: int, block: int = 8) -> float:
+    """平坦 8x8 块里，和邻居平均亮度差得开的比例。"""
+    w = int(w)
+    h = int(h)
+    block = int(block)
+    if block < 2 or w < block * 2 or h < block * 2 or len(buf) < w * h * 3:
+        return 0.0
+    bw = w // block
+    bh = h // block
+    means = []
+    stds = []
+    mv = memoryview(buf)
+    for by in range(bh):
+        row_m = []
+        row_s = []
+        for bx in range(bw):
+            acc = 0.0
+            acc2 = 0.0
+            count = block * block
+            y0 = by * block
+            x0 = bx * block
+            for yy in range(y0, y0 + block):
+                off = (yy * w + x0) * 3
+                for xx in range(block):
+                    i = off + xx * 3
+                    y = (int(mv[i]) + int(mv[i + 1]) + int(mv[i + 2])) / 3.0
+                    acc += y
+                    acc2 += y * y
+            mean = acc / count
+            var = acc2 / count - mean * mean
+            if var < 0:
+                var = 0.0
+            row_m.append(mean)
+            row_s.append(var ** 0.5)
+        means.append(row_m)
+        stds.append(row_s)
+    hit = 0
+    total = bw * bh
+    for by in range(bh):
+        for bx in range(bw):
+            if stds[by][bx] >= 6.0:
+                continue
+            m = means[by][bx]
+            delta = 0.0
+            if bx > 0:
+                delta = max(delta, abs(m - means[by][bx - 1]))
+            if bx + 1 < bw:
+                delta = max(delta, abs(m - means[by][bx + 1]))
+            if by > 0:
+                delta = max(delta, abs(m - means[by - 1][bx]))
+            if by + 1 < bh:
+                delta = max(delta, abs(m - means[by + 1][bx]))
+            if delta >= 28.0:
+                hit += 1
+    if total <= 0:
+        return 0.0
+    return hit / float(total)
+
+
+def judge_rgb_alarm(
+    buf: bytes,
+    w: int,
+    h: int,
+    green_th: float = 0.35,
+    mosaic_th: float = BUILTIN_MOSAIC_RATIO,
+) -> Dict[str, Any]:
+    """用原始 RGB 判断花屏和马赛克。"""
+    green = rgb_green_ratio(buf, w, h)
+    mosaic = rgb_mosaic_ratio(buf, w, h)
+    is_green = green >= float(green_th)
+    is_mosaic = mosaic >= float(mosaic_th)
+    if is_green and is_mosaic:
+        label = "green_screen+mosaic"
+        score = min(1.0, max(green, mosaic))
+    elif is_green:
+        label = "green_screen"
+        score = min(1.0, green)
+    elif is_mosaic:
+        label = "mosaic"
+        score = min(1.0, mosaic)
+    else:
+        label = "normal"
+        score = max(green, mosaic)
+    return {
+        "is_anomaly": label != "normal",
+        "score": round(float(score), 4),
+        "label": label,
+        "detail": {
+            "green_ratio": round(green, 4),
+            "mosaic_ratio": round(mosaic, 4),
+        },
+        "message": label,
+    }
+
+
+def _ffmpeg_rgb(path: Path, w: int = 96, h: int = 54) -> Optional[bytes]:
+    """把一张图缩成原始 RGB。失败就当这帧看不了，不抛给监测主循环。"""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-vf",
+        "scale=%d:%d" % (w, h),
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    data = proc.stdout or b""
+    need = w * h * 3
+    if len(data) < need:
+        return None
+    return data[:need]
 
 
 class AIDetector:
@@ -39,9 +191,16 @@ class AIDetector:
         self.threshold = float(ai_config.get("threshold", 0.55))
         self.green_ratio_th = float(ai_config.get("green_ratio_th", 0.35))
         self.block_score_th = float(ai_config.get("block_score_th", 0.12))
+        try:
+            confirm = float(ai_config.get("confirm_sec", 6.0))
+        except (TypeError, ValueError):
+            confirm = 6.0
+        if confirm < 1.0:
+            confirm = 1.0
+        self.confirm_sec = confirm
 
         self.available = False
-        self.backend = "none"  # none | onnx | heuristic
+        self.backend = "none"  # none | onnx | heuristic | builtin
         self._session = None
         self._input_name = None
         self._cv2 = None
@@ -57,21 +216,21 @@ class AIDetector:
         """按优先级尝试加载后端，失败则安全降级。"""
         prefer = self.mode
 
+        if prefer == "off":
+            logger.info("AI mode=off，跳过画面检测")
+            return
+
         if prefer in ("auto", "onnx"):
             if self._try_load_onnx():
                 return
             if prefer == "onnx":
-                logger.warning("指定 mode=onnx 但加载失败，AI 将不可用")
-                return
+                logger.warning("指定 mode=onnx 但加载失败，改用内置花屏/马赛克检测")
 
         if prefer in ("auto", "heuristic"):
             if self._try_load_heuristic():
                 return
 
-        logger.warning(
-            "AI 模块已启用，但未找到可用后端（onnxruntime/模型 或 opencv）。"
-            "将跳过 AI 检测，规则检测不受影响。"
-        )
+        self._load_builtin()
 
     def _try_load_onnx(self) -> bool:
         try:
@@ -121,6 +280,12 @@ class AIDetector:
             logger.warning(f"启发式后端初始化失败: {e}")
             return False
 
+    def _load_builtin(self) -> None:
+        """不依赖 onnxruntime / opencv。花屏和马赛克用原始 RGB 统计。"""
+        self.available = True
+        self.backend = "builtin"
+        logger.info("AI 后端已加载: 内置花屏/马赛克检测")
+
     @property
     def is_ready(self) -> bool:
         return self.enabled and self.available
@@ -132,6 +297,7 @@ class AIDetector:
             "backend": self.backend,
             "model_path": str(self.model_path),
             "interval_sec": self.interval_sec,
+            "confirm_sec": self.confirm_sec,
         }
 
     def analyze_image(self, image_path: str) -> Dict[str, Any]:
@@ -177,6 +343,8 @@ class AIDetector:
                 return self._infer_onnx(path, base)
             if self.backend == "heuristic":
                 return self._infer_heuristic(path, base)
+            if self.backend == "builtin":
+                return self._infer_builtin(path, base)
         except Exception as e:
             logger.error(f"AI 分析异常: {e}")
             base["message"] = f"分析失败: {e}"
@@ -203,6 +371,17 @@ class AIDetector:
             from PIL import Image
             img = Image.open(path).convert("RGB").resize((224, 224))
             img = np.array(img)
+        if img is None:
+            base["label"] = "unreadable"
+            base["message"] = "无法读取图片"
+            return base
+
+        g_ratio = 0.0
+        try:
+            rgb = np.ascontiguousarray(img)
+            g_ratio = rgb_green_ratio(rgb.tobytes(), int(rgb.shape[1]), int(rgb.shape[0]))
+        except Exception:
+            g_ratio = 0.0
 
         x = img.astype("float32") / 255.0
         x = x.transpose(2, 0, 1)[None, ...]  # NCHW
@@ -215,17 +394,46 @@ class AIDetector:
         else:
             score = float(np.ravel(out)[0])
 
-        is_anomaly = score >= self.threshold
-        label = "mosaic" if is_anomaly else "normal"
+        is_mosaic = score >= self.threshold
+        is_green = g_ratio >= self.green_ratio_th
+        if is_green and is_mosaic:
+            label = "green_screen+mosaic"
+        elif is_green:
+            label = "green_screen"
+        elif is_mosaic:
+            label = "mosaic"
+        else:
+            label = "normal"
         base.update(
             {
-                "is_anomaly": is_anomaly,
-                "score": round(score, 4),
+                "is_anomaly": label != "normal",
+                "score": round(max(score, g_ratio), 4),
                 "label": label,
-                "detail": {"raw": float(np.ravel(out)[0]) if out.size else score},
-                "message": f"ONNX 判定: {label} (score={score:.3f})",
+                "detail": {
+                    "raw": float(np.ravel(out)[0]) if out.size else score,
+                    "green_ratio": round(g_ratio, 4),
+                },
+                "message": "ONNX 判定: %s (score=%.3f, green=%.2f)"
+                % (label, score, g_ratio),
             }
         )
+        return base
+
+    def _infer_builtin(self, path: Path, base: Dict[str, Any]) -> Dict[str, Any]:
+        raw = _ffmpeg_rgb(path, 96, 54)
+        if not raw:
+            base["label"] = "unreadable"
+            base["message"] = "内置检测读不出画面"
+            return base
+        judged = judge_rgb_alarm(
+            raw,
+            96,
+            54,
+            green_th=self.green_ratio_th,
+            mosaic_th=BUILTIN_MOSAIC_RATIO,
+        )
+        base.update(judged)
+        base["backend"] = "builtin"
         return base
 
     def _infer_heuristic(self, path: Path, base: Dict) -> Dict[str, Any]:

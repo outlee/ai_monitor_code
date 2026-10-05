@@ -15,16 +15,14 @@ def normalize_freeze_mode(raw) -> str:
 
 
 def effective_freeze_seconds(mode, duration) -> float:
-    """只报静帧：最短 12 秒。静帧且无伴音：按填写值，最短 1 秒。"""
-    mode = normalize_freeze_mode(mode)
+    """两种静帧模式都按填写秒数生效，只限制在 0.5～120 秒。"""
+    normalize_freeze_mode(mode)
     try:
         d = float(duration)
     except (TypeError, ValueError):
-        d = 12.0 if mode == VIDEO else 8.0
-    if mode == VIDEO_SILENCE:
-        if d < 1.0:
-            return 1.0
-        return d
-    if d < 12.0:
-        return 12.0
+        d = 12.0
+    if d < 0.5:
+        return 0.5
+    if d > 120.0:
+        return 120.0
     return d
