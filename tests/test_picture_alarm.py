@@ -11,7 +11,9 @@ sys.path.insert(0, str(ROOT / "workers"))
 
 from ai_detector import (  # noqa: E402
     AIDetector,
+    decide_picture_alarm,
     judge_rgb_alarm,
+    mosaic_ratio_hwc,
     rgb_green_ratio,
     rgb_mosaic_ratio,
 )
@@ -64,6 +66,46 @@ class RgbAlarmTests(unittest.TestCase):
         judged = judge_rgb_alarm(_solid(32, 32, (80, 90, 70)), 32, 32)
         self.assertEqual(judged["label"], "normal")
         self.assertFalse(judged["is_anomaly"])
+
+
+class DecidePictureTests(unittest.TestCase):
+    def test_high_onnx_score_on_a_normal_frame_is_not_mosaic(self):
+        # 线上 CCTV-13 / 少儿动画的分数就在这个区间，画面本身没有方块。
+        judged = decide_picture_alarm(0.0, 0.014, onnx_score=0.87)
+        self.assertEqual(judged["label"], "normal")
+        self.assertFalse(judged["is_anomaly"])
+
+    def test_real_blocks_still_alarm(self):
+        judged = decide_picture_alarm(0.0, 0.62, onnx_score=0.2)
+        self.assertEqual(judged["label"], "mosaic")
+        self.assertTrue(judged["is_anomaly"])
+
+    def test_green_does_not_need_the_model(self):
+        judged = decide_picture_alarm(0.8, 0.0, onnx_score=0.1)
+        self.assertEqual(judged["label"], "green_screen")
+
+
+class NativeBlockTests(unittest.TestCase):
+    def test_sixteen_pixel_tiles_count_as_mosaic(self):
+        import numpy as np
+
+        rng = np.random.RandomState(1)
+        bh, bw, block = 8, 10, 16
+        colors = rng.randint(0, 256, size=(bh, bw, 3), dtype=np.uint8)
+        img = np.repeat(np.repeat(colors, block, axis=0), block, axis=1)
+        ratio = mosaic_ratio_hwc(img)
+        self.assertGreater(ratio, 0.5)
+        judged = decide_picture_alarm(0.0, ratio, onnx_score=0.9)
+        self.assertEqual(judged["label"], "mosaic")
+
+    def test_large_flat_regions_are_not_mosaic(self):
+        import numpy as np
+
+        img = np.zeros((128, 160, 3), dtype=np.uint8)
+        img[:64] = 255
+        self.assertLess(mosaic_ratio_hwc(img), 0.2)
+        judged = decide_picture_alarm(0.0, mosaic_ratio_hwc(img), onnx_score=0.87)
+        self.assertEqual(judged["label"], "normal")
 
 
 class BackendFallbackTests(unittest.TestCase):

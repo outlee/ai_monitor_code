@@ -105,6 +105,95 @@ def rgb_mosaic_ratio(buf: bytes, w: int, h: int, block: int = 8) -> float:
     return hit / float(total)
 
 
+def decide_picture_alarm(
+    green_ratio: float,
+    mosaic_ratio: float,
+    onnx_score: float = 0.0,
+    green_th: float = 0.35,
+    mosaic_th: float = BUILTIN_MOSAIC_RATIO,
+) -> Dict[str, Any]:
+    """花屏看绿色占比，马赛克看方块占比。
+
+    ONNX 异常分只记在明细里。这路节目上正常画面也会到 0.5～0.9，
+    单靠分数会把新闻和动画报成马赛克。
+    """
+    green = float(green_ratio or 0.0)
+    mosaic = float(mosaic_ratio or 0.0)
+    score = float(onnx_score or 0.0)
+    is_green = green >= float(green_th)
+    is_block = mosaic >= float(mosaic_th)
+    if is_green and is_block:
+        label = "green_screen+mosaic"
+        shown = max(green, mosaic, score)
+    elif is_green:
+        label = "green_screen"
+        shown = max(green, score)
+    elif is_block:
+        label = "mosaic"
+        shown = max(mosaic, score)
+    else:
+        label = "normal"
+        shown = max(green, mosaic)
+    return {
+        "is_anomaly": label != "normal",
+        "score": round(shown, 4),
+        "label": label,
+        "detail": {
+            "green_ratio": round(green, 4),
+            "mosaic_ratio": round(mosaic, 4),
+            "onnx_score": round(score, 4),
+        },
+        "message": label,
+    }
+
+
+def mosaic_ratio_hwc(img, block: int = 8) -> float:
+    """按这张图自己的分辨率数方块占比。
+
+    先缩到 224 或 96x54 再数，16x16 的真马赛克会被抹成 0。
+    近邻缩小会凭空造出方块，所以这里不缩放。
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        arr = np.ascontiguousarray(img)
+        if getattr(arr, "ndim", 0) != 3 or arr.shape[2] < 3:
+            return 0.0
+        return _mosaic_ratio_np(arr, block)
+    h = int(img.shape[0])
+    w = int(img.shape[1])
+    return rgb_mosaic_ratio(memoryview(img).tobytes(), w, h, block)
+
+
+def _mosaic_ratio_np(img, block: int = 8) -> float:
+    """和 rgb_mosaic_ratio 同一条规则，用 numpy 算整帧。"""
+    import numpy as np
+
+    block = int(block)
+    if block < 2:
+        return 0.0
+    h, w = int(img.shape[0]), int(img.shape[1])
+    bh, bw = h // block, w // block
+    if bh < 2 or bw < 2:
+        return 0.0
+    y = img[: bh * block, : bw * block, :3].astype("float32").mean(axis=2)
+    y = y.reshape(bh, block, bw, block).swapaxes(1, 2)
+    means = y.mean(axis=(2, 3))
+    stds = y.std(axis=(2, 3))
+    flat = stds < 6.0
+    delta = np.zeros_like(means)
+    side = np.abs(means[:, 1:] - means[:, :-1])
+    delta[:, 1:] = np.maximum(delta[:, 1:], side)
+    delta[:, :-1] = np.maximum(delta[:, :-1], side)
+    vert = np.abs(means[1:, :] - means[:-1, :])
+    delta[1:, :] = np.maximum(delta[1:, :], vert)
+    delta[:-1, :] = np.maximum(delta[:-1, :], vert)
+    hit = flat & (delta >= 28.0)
+    return float(hit.mean())
+
+
 def judge_rgb_alarm(
     buf: bytes,
     w: int,
@@ -139,6 +228,27 @@ def judge_rgb_alarm(
         },
         "message": label,
     }
+
+
+def _open_rgb(path: Path):
+    """读出原始 RGB。读不到就返回 None，交给缩小后的兜底。"""
+    try:
+        import cv2
+
+        bgr = cv2.imread(str(path))
+        if bgr is not None:
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    try:
+        from PIL import Image
+        import numpy as np
+
+        return np.array(Image.open(path).convert("RGB"))
+    except Exception:
+        return None
 
 
 def _ffmpeg_rgb(path: Path, w: int = 96, h: int = 54) -> Optional[bytes]:
@@ -358,20 +468,21 @@ class AIDetector:
         assert self._session is not None and self._np is not None
         np = self._np
 
-        # 延迟导入 cv2 做 resize；若没有 cv2 用最简方式
+        # 方块占比必须用原图。缩到 224 再数，真马赛克会变成 0。
         try:
             import cv2
-            img = cv2.imread(str(path))
-            if img is None:
+            full = cv2.imread(str(path))
+            if full is None:
                 base["message"] = "无法读取图片"
                 return base
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (224, 224))
+            full = cv2.cvtColor(full, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(full, (224, 224))
         except ImportError:
             from PIL import Image
-            img = Image.open(path).convert("RGB").resize((224, 224))
-            img = np.array(img)
-        if img is None:
+            opened = Image.open(path).convert("RGB")
+            full = np.array(opened)
+            img = np.array(opened.resize((224, 224)))
+        if img is None or full is None:
             base["label"] = "unreadable"
             base["message"] = "无法读取图片"
             return base
@@ -394,32 +505,51 @@ class AIDetector:
         else:
             score = float(np.ravel(out)[0])
 
-        is_mosaic = score >= self.threshold
-        is_green = g_ratio >= self.green_ratio_th
-        if is_green and is_mosaic:
-            label = "green_screen+mosaic"
-        elif is_green:
-            label = "green_screen"
-        elif is_mosaic:
-            label = "mosaic"
-        else:
-            label = "normal"
-        base.update(
-            {
-                "is_anomaly": label != "normal",
-                "score": round(max(score, g_ratio), 4),
-                "label": label,
-                "detail": {
-                    "raw": float(np.ravel(out)[0]) if out.size else score,
-                    "green_ratio": round(g_ratio, 4),
-                },
-                "message": "ONNX 判定: %s (score=%.3f, green=%.2f)"
-                % (label, score, g_ratio),
-            }
+        try:
+            mosaic_ratio = mosaic_ratio_hwc(full)
+        except Exception:
+            mosaic_ratio = 0.0
+        judged = decide_picture_alarm(
+            g_ratio,
+            mosaic_ratio,
+            onnx_score=score,
+            green_th=self.green_ratio_th,
+            mosaic_th=BUILTIN_MOSAIC_RATIO,
         )
+        judged["detail"]["raw"] = float(np.ravel(out)[0]) if out.size else score
+        judged["message"] = "画面判定: %s (onnx=%.3f, mosaic=%.3f, green=%.3f)" % (
+            judged["label"],
+            score,
+            mosaic_ratio,
+            g_ratio,
+        )
+        base.update(judged)
         return base
 
     def _infer_builtin(self, path: Path, base: Dict[str, Any]) -> Dict[str, Any]:
+        full = _open_rgb(path)
+        if full is not None:
+            try:
+                mosaic = mosaic_ratio_hwc(full)
+                small = full
+                if int(full.shape[0]) > 54 and int(full.shape[1]) > 96:
+                    step_y = max(1, int(full.shape[0]) // 54)
+                    step_x = max(1, int(full.shape[1]) // 96)
+                    small = full[::step_y, ::step_x]
+                green = rgb_green_ratio(
+                    small.tobytes(), int(small.shape[1]), int(small.shape[0])
+                )
+                judged = decide_picture_alarm(
+                    green,
+                    mosaic,
+                    green_th=self.green_ratio_th,
+                    mosaic_th=BUILTIN_MOSAIC_RATIO,
+                )
+                base.update(judged)
+                base["backend"] = "builtin"
+                return base
+            except Exception:
+                pass
         raw = _ffmpeg_rgb(path, 96, 54)
         if not raw:
             base["label"] = "unreadable"

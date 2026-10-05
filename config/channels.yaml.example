@@ -55,7 +55,7 @@ ai:
   model_path: models/mosaic_detector.onnx  # ONNX 模型路径（相对工作目录）
   interval_sec: 2.0            # 隔多少秒看一张画面
   confirm_sec: 6.0             # 连续这么多秒都像花屏或马赛克才告警
-  threshold: 0.55              # ONNX 异常分阈值，≥ 则判马赛克
+  threshold: 0.55              # 模型异常分只记在明细里；马赛克要画面上真有方块才告警
   green_ratio_th: 0.35         # 启发式：绿色像素占比阈值
   block_score_th: 0.12         # 启发式：块状/马赛克分数阈值
 
