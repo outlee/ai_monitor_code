@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "web"))
 sys.path.insert(0, str(ROOT / "workers"))
 
-from channel_meta import clean_category  # noqa: E402
+from channel_meta import clean_categories, clean_category, resolve_categories  # noqa: E402
 from freeze_rules import effective_freeze_seconds  # noqa: E402
 from hub import assemble_hub, hub_is_active, normalize_node_list  # noqa: E402
 from snapshot_names import is_alarm_snapshot  # noqa: E402
@@ -41,6 +41,18 @@ class CategoryTests(unittest.TestCase):
         self.assertEqual(clean_category(""), "")
         with self.assertRaises(ValueError):
             clean_category("a/b")
+
+    def test_several_tags(self):
+        self.assertEqual(clean_categories("卫视、高清"), ["卫视", "高清"])
+        self.assertEqual(clean_categories(["卫视", "高清", "卫视"]), ["卫视", "高清"])
+        self.assertEqual(clean_categories("卫视"), ["卫视"])
+        self.assertEqual(clean_categories(""), [])
+
+    def test_saved_tags_override_old_string(self):
+        ch = {"id": "hd_1", "category": "卫视"}
+        self.assertEqual(resolve_categories(ch, {}), ["卫视"])
+        self.assertEqual(resolve_categories(ch, {"hd_1": ["卫视", "高清"]}), ["卫视", "高清"])
+        self.assertEqual(resolve_categories(ch, {"hd_1": []}), [])
 
 
 class HubTests(unittest.TestCase):

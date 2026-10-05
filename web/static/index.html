@@ -357,16 +357,19 @@
           <span>名称</span>
           <input type="text" id="ch-name" required maxlength="128" placeholder="显示名称" />
         </label>
-        <label class="field-row">
-          <span>分类</span>
-          <input type="text" id="ch-category" maxlength="32" list="cat-presets" placeholder="可选，如央视、卫视、高清、标清" />
-          <datalist id="cat-presets">
-            <option value="央视"></option>
-            <option value="卫视"></option>
-            <option value="高清"></option>
-            <option value="标清"></option>
-          </datalist>
-        </label>
+        <div class="field-row tag-field">
+          <span>标签</span>
+          <div>
+            <div class="tag-picks" id="ch-tags">
+              <label><input type="checkbox" value="央视" /> 央视</label>
+              <label><input type="checkbox" value="卫视" /> 卫视</label>
+              <label><input type="checkbox" value="高清" /> 高清</label>
+              <label><input type="checkbox" value="标清" /> 标清</label>
+            </div>
+            <input type="text" id="ch-category-extra" maxlength="64" placeholder="其他标签，用顿号隔开，可和上面同时选" />
+            <p class="hint">可同时选。卫视高清就勾「卫视」和「高清」，点哪个标签都能看到这套节目。</p>
+          </div>
+        </div>
         <label class="field-row">
           <span>流地址</span>
           <input type="text" id="ch-url" required placeholder="udp://@239.1.1.1:5000" />

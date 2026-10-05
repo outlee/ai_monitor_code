@@ -470,7 +470,7 @@
       idEl.value = "";
       idEl.disabled = false;
       $("#ch-name").value = "";
-      if ($("#ch-category")) $("#ch-category").value = "";
+      fillCategoryTags([]);
       $("#ch-url").value = "udp://@239.1.1.1:5000";
       $("#ch-program").value = "";
       $("#ch-enabled").checked = true;
@@ -479,7 +479,7 @@
       idEl.value = ch.id;
       idEl.disabled = true;
       $("#ch-name").value = ch.name || "";
-      if ($("#ch-category")) $("#ch-category").value = ch.category || "";
+      fillCategoryTags(ch.category);
       $("#ch-url").value = ch.url || "";
       $("#ch-program").value =
         ch.program !== undefined && ch.program !== null && ch.program !== ""
@@ -537,7 +537,7 @@
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
     const tags = [];
     if (c.node_name) tags.push(c.node_name);
-    if (c.category) tags.push(c.category);
+    cardTags(c).forEach((t) => tags.push(t));
     const tagHtml = tags.length
       ? `<div class="ch-tags">${escapeHtml(tags.join(" · "))}</div>`
       : "";
@@ -687,15 +687,50 @@
     }
   }
 
+  const PRESET_TAGS = ["央视", "卫视", "高清", "标清"];
+
+  function cardTags(c) {
+    const raw = c && c.category;
+    if (Array.isArray(raw)) {
+      return raw.map((x) => String(x || "").trim()).filter(Boolean);
+    }
+    const text = String(raw || "").trim();
+    if (!text) return [];
+    return text.split(/[、,，;；\s]+/).filter(Boolean);
+  }
+
+  function fillCategoryTags(raw) {
+    const tags = cardTags({ category: raw });
+    document.querySelectorAll("#ch-tags input").forEach((el) => {
+      el.checked = tags.indexOf(el.value) >= 0;
+    });
+    const extra = tags.filter((t) => PRESET_TAGS.indexOf(t) < 0);
+    if ($("#ch-category-extra")) $("#ch-category-extra").value = extra.join("、");
+  }
+
+  function readCategoryTags() {
+    const tags = [];
+    document.querySelectorAll("#ch-tags input:checked").forEach((el) => {
+      if (el.value) tags.push(el.value);
+    });
+    const extra = ($("#ch-category-extra") && $("#ch-category-extra").value) || "";
+    extra.split(/[、,，;；\s]+/).forEach((t) => {
+      if (t) tags.push(t);
+    });
+    return tags;
+  }
+
   function renderCategoryTabs(all) {
     const box = $("#cat-tabs");
     if (!box) return;
     const names = [];
     let uncat = false;
     all.forEach((c) => {
-      const name = (c.category || "").trim();
-      if (!name) uncat = true;
-      else if (names.indexOf(name) < 0) names.push(name);
+      const tags = cardTags(c);
+      if (!tags.length) uncat = true;
+      tags.forEach((name) => {
+        if (names.indexOf(name) < 0) names.push(name);
+      });
     });
     if (dashCategory && dashCategory !== "__none__" && names.indexOf(dashCategory) < 0) {
       dashCategory = "";
@@ -755,9 +790,9 @@
     const okAll = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
     const ok = okAll.filter((c) => {
       if (!dashCategory) return true;
-      const cat = (c.category || "").trim();
-      if (dashCategory === "__none__") return !cat;
-      return cat === dashCategory;
+      const tags = cardTags(c);
+      if (dashCategory === "__none__") return !tags.length;
+      return tags.indexOf(dashCategory) >= 0;
     });
 
     const strip = $("#alarm-strip");
@@ -955,8 +990,8 @@
           <td>${escapeHtml(c.id)}</td>
           <td>${escapeHtml(c.name)}</td>
           <td>${
-            c.category
-              ? escapeHtml(c.category)
+            cardTags(c).length
+              ? escapeHtml(cardTags(c).join("、"))
               : "<span style=\"color:var(--muted)\">-</span>"
           }</td>
           <td>${
@@ -1148,8 +1183,9 @@
           c.enabled = byId[c.id].enabled;
           if (byId[c.id].program !== undefined) c.program = byId[c.id].program;
           if (byId[c.id].iface) c.iface = byId[c.id].iface;
-          if (byId[c.id].category) c.category = byId[c.id].category;
-          else if (!c.category) c.category = "";
+          if (Array.isArray(byId[c.id].category) || byId[c.id].category) {
+            c.category = byId[c.id].category;
+          } else if (!c.category) c.category = [];
         }
       });
       handleNewEvents(overview.recent_events || []);
@@ -1434,8 +1470,8 @@
         };
         if (program !== null) body.program = program;
         if (iface) body.iface = iface;
-        const cat = ($("#ch-category") && $("#ch-category").value.trim()) || "";
-        if (cat) body.category = cat;
+        const cat = readCategoryTags();
+        if (cat.length) body.category = cat;
         res = await postJSON("/api/config/channels", body);
       } else {
         res = await postJSON(`/api/config/channels/${encodeURIComponent(payload.id)}`, {
@@ -1444,7 +1480,7 @@
           enabled: payload.enabled,
           program: program, // null 表示清空
           iface: iface || null,
-          category: ($("#ch-category") && $("#ch-category").value.trim()) || "",
+          category: readCategoryTags(),
         });
       }
       toast(res.message || "已保存", "ok");

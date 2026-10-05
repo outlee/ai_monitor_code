@@ -35,12 +35,12 @@ from pydantic import BaseModel, Field
 
 try:
     from web.channel_order import merge_channel_order, sort_cards_by_order
-    from web.channel_meta import clean_category
+    from web.channel_meta import clean_categories, resolve_categories
     from web.snapshot_names import is_alarm_snapshot, is_proxy_image
     from web import hub as hub_mod
 except ImportError:
     from channel_order import merge_channel_order, sort_cards_by_order
-    from channel_meta import clean_category
+    from channel_meta import clean_categories, resolve_categories
     from snapshot_names import is_alarm_snapshot, is_proxy_image
     import hub as hub_mod
 
@@ -56,6 +56,8 @@ EVENTS_FILE = LOG_DIR / "events.jsonl"
 SNAPSHOT_DIR = ROOT / "snapshots"
 DATA_DIR = ROOT / "data"
 CHANNEL_ORDER_PATH = DATA_DIR / "channel_order.json"
+# 标签不写进 channels.yaml，避免一保存就把该组监测打回探测
+CATEGORY_PATH = DATA_DIR / "channel_categories.json"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 _config_lock = threading.Lock()
@@ -138,11 +140,71 @@ def _save_channel_order(ids: List[str]) -> None:
         tmp.replace(CHANNEL_ORDER_PATH)
 
 
-def _category_of(ch: Dict[str, Any]) -> str:
+def _load_category_map() -> Dict[str, List[str]]:
+    if not CATEGORY_PATH.is_file():
+        return {}
     try:
-        return clean_category(ch.get("category"))
-    except ValueError:
-        return ""
+        raw = json.loads(CATEGORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for key, value in raw.items():
+        cid = str(key or "").strip()
+        if not cid:
+            continue
+        try:
+            out[cid] = clean_categories(value)
+        except ValueError:
+            out[cid] = []
+    return out
+
+
+def _save_category_map(data: Dict[str, List[str]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CATEGORY_PATH.with_suffix(".json.tmp")
+    with _config_lock:
+        with open(str(tmp), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        tmp.replace(CATEGORY_PATH)
+
+
+def _store_categories(channel_id: str, cats: List[str]) -> None:
+    """空列表也要记下，这样频道配置里的旧标签不会再冒出来。"""
+    data = _load_category_map()
+    data[channel_id] = list(cats)
+    _save_category_map(data)
+
+
+def _drop_categories(channel_id: str) -> None:
+    data = _load_category_map()
+    if channel_id not in data:
+        return
+    data.pop(channel_id, None)
+    _save_category_map(data)
+
+
+def _category_of(ch: Dict[str, Any], cat_map: Optional[Dict[str, List[str]]] = None) -> List[str]:
+    if cat_map is None:
+        cat_map = _load_category_map()
+    return resolve_categories(ch, cat_map)
+
+
+def _channels_with_categories(channels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """接口和导出里带上标签，不改磁盘上的频道配置。"""
+    cat_map = _load_category_map()
+    out: List[Dict[str, Any]] = []
+    for ch in channels:
+        item = dict(ch)
+        cats = _category_of(ch, cat_map)
+        if cats:
+            item["category"] = cats
+        else:
+            item.pop("category", None)
+        out.append(item)
+    return out
 
 
 def _public_defaults(defaults: Dict[str, Any], stale_sec: float) -> Dict[str, Any]:
@@ -287,6 +349,7 @@ def _channel_stats(
     「running」且未解到音视频时不得标为正常。
     """
     now = time.time()
+    cat_map = _load_category_map()
     by_ch: Dict[str, Dict] = {}
     for ch in channels:
         cid = ch.get("id", "")
@@ -297,7 +360,7 @@ def _channel_stats(
             "program": ch.get("program"),
             "iface": ch.get("iface"),
             "enabled": ch.get("enabled", True),
-            "category": _category_of(ch),
+            "category": _category_of(ch, cat_map),
             "event_count": 0,
             "last_event": None,
             "last_type": None,
@@ -404,7 +467,7 @@ class ChannelUpdate(BaseModel):
     # None=不修改；传 null 可清空（见 model_fields_set）
     program: Optional[int] = Field(None, ge=0, le=65535)
     iface: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[Any] = None
 
 
 class ChannelCreate(BaseModel):
@@ -414,7 +477,7 @@ class ChannelCreate(BaseModel):
     enabled: bool = True
     program: Optional[int] = Field(None, ge=0, le=65535)
     iface: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[Any] = None
 
 
 class ChannelOrderBody(BaseModel):
@@ -493,7 +556,7 @@ def api_channel_status(channel_id: str):
 def api_channels():
     cfg = _load_config()
     return {
-        "channels": cfg.get("channels") or [],
+        "channels": _channels_with_categories(cfg.get("channels") or []),
         "ai": cfg.get("ai") or {},
         "defaults": cfg.get("defaults") or {},
     }
@@ -737,7 +800,7 @@ def api_dashboard():
                 "pkt_rate": s.get("pkt_rate"),
                 "bitrate_kbps": s.get("bitrate_kbps"),
                 "iface": s.get("iface"),
-                "category": s.get("category") or "",
+                "category": s.get("category") or [],
                 "preview_base": f"/api/snapshots/{s['id']}",
                 "node_id": "",
                 "node_name": "",
@@ -1282,11 +1345,11 @@ def _normalize_channel(raw: Dict[str, Any], require_all: bool = True) -> Dict[st
             out["iface"] = iface
     if "category" in raw:
         try:
-            cat = clean_category(raw.get("category"))
+            cats = clean_categories(raw.get("category"))
         except ValueError as e:
             raise HTTPException(400, str(e))
-        if cat:
-            out["category"] = cat
+        if cats:
+            out["category"] = cats
     return out
 
 
@@ -1441,9 +1504,14 @@ def api_create_channel(body: ChannelCreate):
     ch = _normalize_channel(body.model_dump(), require_all=True)
     if any(c.get("id") == ch["id"] for c in channels):
         raise HTTPException(400, f"频道 ID 已存在: {ch['id']}")
+    cats = ch.pop("category", None)
     channels.append(ch)
     cfg["channels"] = channels
     _save_config(cfg)
+    if cats:
+        _store_categories(ch["id"], cats)
+        ch = dict(ch)
+        ch["category"] = cats
     return {
         "ok": True,
         "channel": ch,
@@ -1464,23 +1532,31 @@ def api_update_channel(channel_id: str, body: ChannelUpdate):
         raise HTTPException(404, f"频道不存在: {channel_id}")
 
     changed = []
+    yaml_changed = False
     data = body.model_dump(exclude_unset=True)
 
     if "enabled" in data and data["enabled"] is not None:
-        target["enabled"] = bool(data["enabled"])
-        changed.append(f"enabled={target['enabled']}")
+        enabled = bool(data["enabled"])
+        if bool(target.get("enabled", True)) != enabled:
+            target["enabled"] = enabled
+            changed.append(f"enabled={enabled}")
+            yaml_changed = True
     if "name" in data and data["name"] is not None:
         name = str(data["name"]).strip()
         if not name:
             raise HTTPException(400, "名称不能为空")
-        target["name"] = name
-        changed.append(f"name={name}")
+        if target.get("name") != name:
+            target["name"] = name
+            changed.append(f"name={name}")
+            yaml_changed = True
     if "url" in data and data["url"] is not None:
         url = str(data["url"]).strip()
         if not url:
             raise HTTPException(400, "地址不能为空")
-        target["url"] = url
-        changed.append("url")
+        if target.get("url") != url:
+            target["url"] = url
+            changed.append("url")
+            yaml_changed = True
     if "program" in data:
         # 显式传 program: null 或省略值 → 清除；传数字 → 设置
         prog = data["program"]
@@ -1488,46 +1564,62 @@ def api_update_channel(channel_id: str, body: ChannelUpdate):
             if "program" in target:
                 target.pop("program", None)
                 changed.append("program=cleared")
+                yaml_changed = True
         else:
             p = _parse_program_value(prog)
             if p is None:
-                target.pop("program", None)
-                changed.append("program=cleared")
-            else:
+                if "program" in target:
+                    target.pop("program", None)
+                    changed.append("program=cleared")
+                    yaml_changed = True
+            elif target.get("program") != p:
                 target["program"] = p
                 changed.append(f"program={p}")
+                yaml_changed = True
     if "iface" in data:
         iface = data["iface"]
         if iface is None or str(iface).strip() == "":
             if "iface" in target:
                 target.pop("iface", None)
                 changed.append("iface=cleared")
+                yaml_changed = True
         else:
-            target["iface"] = str(iface).strip()
-            changed.append(f"iface={target['iface']}")
+            iface = str(iface).strip()
+            if target.get("iface") != iface:
+                target["iface"] = iface
+                changed.append(f"iface={iface}")
+                yaml_changed = True
     if "category" in data:
         try:
-            cat = clean_category(data.get("category"))
+            cats = clean_categories(data.get("category"))
         except ValueError as e:
             raise HTTPException(400, str(e))
-        if cat:
-            target["category"] = cat
-            changed.append("category=%s" % cat)
-        elif "category" in target:
-            target.pop("category", None)
-            changed.append("category=cleared")
+        if _category_of(target) != cats:
+            _store_categories(channel_id, cats)
+            changed.append("category=%s" % ",".join(cats) if cats else "category=cleared")
 
     if not changed:
-        raise HTTPException(400, "没有可更新的字段")
+        return {
+            "ok": True,
+            "channel_id": channel_id,
+            "changed": [],
+            "channel": target,
+            "message": "没有改动",
+        }
 
-    cfg["channels"] = channels
-    _save_config(cfg)
+    if yaml_changed:
+        cfg["channels"] = channels
+        _save_config(cfg)
+    shown = dict(target)
+    shown["category"] = _category_of(target)
+    if not shown["category"]:
+        shown.pop("category", None)
     return {
         "ok": True,
         "channel_id": channel_id,
         "changed": changed,
-        "channel": target,
-        "message": "频道配置已保存，热重载后数秒内生效",
+        "channel": shown,
+        "message": "频道配置已保存，热重载后数秒内生效" if yaml_changed else "标签已保存",
     }
 
 
@@ -1540,6 +1632,7 @@ def api_delete_channel(channel_id: str):
         raise HTTPException(404, f"频道不存在: {channel_id}")
     cfg["channels"] = new_list
     _save_config(cfg)
+    _drop_categories(channel_id)
     return {
         "ok": True,
         "channel_id": channel_id,
@@ -1552,7 +1645,7 @@ def api_delete_channel(channel_id: str):
 def api_export_channels(fmt: str = Query("json", pattern="^(json|yaml)$")):
     """导出频道列表（不含 AI/defaults，便于迁移）。"""
     cfg = _load_config()
-    channels = cfg.get("channels") or []
+    channels = _channels_with_categories(cfg.get("channels") or [])
     payload = {"channels": channels, "exported_at": datetime.now().isoformat(timespec="seconds")}
     if fmt == "yaml":
         text = yaml.safe_dump(payload, allow_unicode=True, default_flow_style=False, sort_keys=False)
@@ -1581,6 +1674,10 @@ def api_import_channels(body: ChannelImport):
     ids = [c["id"] for c in normalized]
     if len(ids) != len(set(ids)):
         raise HTTPException(400, "导入数据中存在重复频道 ID")
+    imported_tags: Dict[str, List[str]] = {}
+    for ch in normalized:
+        if "category" in ch:
+            imported_tags[ch["id"]] = list(ch.pop("category"))
 
     cfg = _load_config()
     existing = cfg.get("channels") or []
@@ -1606,6 +1703,13 @@ def api_import_channels(body: ChannelImport):
         cfg["channels"] = [by_id[i] for i in order if i in by_id]
 
     _save_config(cfg)
+    if imported_tags or body.mode == "replace":
+        cat_map = _load_category_map()
+        if body.mode == "replace":
+            keep = set(ids)
+            cat_map = {k: v for k, v in cat_map.items() if k in keep}
+        cat_map.update(imported_tags)
+        _save_category_map(cat_map)
     return {
         "ok": True,
         "mode": body.mode,
