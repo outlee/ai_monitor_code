@@ -283,6 +283,7 @@ body {
   font-size: 13px;
 }
 .cat-tab.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cat-tab-hint { margin: 0 0 8px; }
 .node-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));

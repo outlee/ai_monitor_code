@@ -92,6 +92,7 @@
       <div class="alarm-grid" id="alarm-grid"></div>
     </div>
     <div class="cat-tabs" id="cat-tabs"></div>
+    <p class="hint cat-tab-hint">可多选。点中的标签要同时满足，例如「高清」和「卫视」。</p>
     <div class="panel-head" id="ok-strip-head">
       <h2>监测中</h2>
       <div class="head-actions">
@@ -372,7 +373,7 @@
               <label><input type="checkbox" value="标清" /> 标清</label>
             </div>
             <input type="text" id="ch-category-extra" maxlength="64" placeholder="其他标签，用顿号隔开，可和上面同时选" />
-            <p class="hint">可同时选。卫视高清就勾「卫视」和「高清」，点哪个标签都能看到这套节目。</p>
+            <p class="hint">可同时选。卫视高清就勾「卫视」和「高清」。大屏上同时点几个标签时，节目要每个都有才会留下。</p>
           </div>
         </div>
         <label class="field-row">
@@ -429,6 +430,7 @@
     </div>
   </div>
 
+  <script src="/static/category_filter.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

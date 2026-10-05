@@ -36,7 +36,7 @@
     ai_anomaly: "画面异常",
   };
 
-  let dashCategory = "";
+  let dashCategories = [];
   let lastDash = null;
   let evOffset = 0;
   const EV_PAGE = 20;
@@ -690,13 +690,7 @@
   const PRESET_TAGS = ["央视", "卫视", "高清", "标清"];
 
   function cardTags(c) {
-    const raw = c && c.category;
-    if (Array.isArray(raw)) {
-      return raw.map((x) => String(x || "").trim()).filter(Boolean);
-    }
-    const text = String(raw || "").trim();
-    if (!text) return [];
-    return text.split(/[、,，;；\s]+/).filter(Boolean);
+    return CategoryFilter.cardTags(c);
   }
 
   function fillCategoryTags(raw) {
@@ -732,14 +726,13 @@
         if (names.indexOf(name) < 0) names.push(name);
       });
     });
-    if (dashCategory && dashCategory !== "__none__" && names.indexOf(dashCategory) < 0) {
-      dashCategory = "";
-    }
-    if (dashCategory === "__none__" && !uncat) dashCategory = "";
-    const btn = (cat, label) =>
-      `<button type="button" class="cat-tab${dashCategory === cat ? " on" : ""}" data-cat="${escapeHtml(
+    dashCategories = CategoryFilter.pruneDashCategories(dashCategories, names, uncat);
+    const btn = (cat, label) => {
+      const on = !cat ? dashCategories.length === 0 : dashCategories.indexOf(cat) >= 0;
+      return `<button type="button" class="cat-tab${on ? " on" : ""}" data-cat="${escapeHtml(
         cat
       )}">${escapeHtml(label)}</button>`;
+    };
     let html = btn("", "全部");
     names.forEach((name) => {
       html += btn(name, name);
@@ -748,7 +741,10 @@
     box.innerHTML = html;
     box.querySelectorAll(".cat-tab").forEach((el) => {
       el.addEventListener("click", () => {
-        dashCategory = el.dataset.cat || "";
+        dashCategories = CategoryFilter.toggleDashCategories(
+          dashCategories,
+          el.dataset.cat || ""
+        );
         if (lastDash) renderDashboard(lastDash);
       });
     });
@@ -826,12 +822,7 @@
     renderCategoryTabs(all);
     const bad = all.filter((c) => c.lamp === "red" || c.lamp === "yellow");
     const okAll = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
-    const ok = okAll.filter((c) => {
-      if (!dashCategory) return true;
-      const tags = cardTags(c);
-      if (dashCategory === "__none__") return !tags.length;
-      return tags.indexOf(dashCategory) >= 0;
-    });
+    const ok = okAll.filter((c) => CategoryFilter.cardMatchesCategories(c, dashCategories));
 
     const strip = $("#alarm-strip");
     const alarmGrid = $("#alarm-grid");
@@ -885,7 +876,7 @@
         grid.innerHTML = `<div class="empty">暂无已启用的监测频道</div>`;
       } else if (!ok.length) {
         grid.innerHTML = `<div class="empty">${
-          dashCategory ? "这个分类里没有正常频道" : "当前没有正常频道"
+          dashCategories.length ? "没有同时带上这些标签的正常频道" : "当前没有正常频道"
         }</div>`;
       } else {
         grid.innerHTML = ok.map((c) => channelCardHtml(c, false)).join("");
