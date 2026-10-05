@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT / "workers"))
 
 from channel_meta import clean_categories, clean_category, resolve_categories  # noqa: E402
 from freeze_rules import effective_freeze_seconds  # noqa: E402
-from hub import assemble_hub, hub_is_active, normalize_node_list  # noqa: E402
+from hub import assemble_hub, assemble_perf, hub_is_active, normalize_node_list  # noqa: E402
+from monitor_worker import alarm_frame_max_age_sec  # noqa: E402
 from snapshot_names import is_alarm_snapshot  # noqa: E402
 
 
@@ -114,6 +115,38 @@ class HubTests(unittest.TestCase):
         self.assertEqual(merged["summary"]["red"], 1)
         self.assertEqual(merged["stats_24h"]["total"], 3)
         self.assertEqual(merged["recent_events"][0]["node_name"], "机房2")
+
+    def test_alarm_frame_accepts_slow_thumbs(self):
+        self.assertEqual(alarm_frame_max_age_sec(5), 45.0)
+        self.assertEqual(alarm_frame_max_age_sec(60), 60.0)
+
+    def test_perf_keeps_dead_remote(self):
+        nodes = normalize_node_list(
+            [
+                {"id": "local", "name": "本机", "url": ""},
+                {"id": "room2", "name": "机房2", "url": "http://10.0.0.8:8080"},
+                {"id": "room3", "name": "机房3", "url": "http://10.0.0.9:8080"},
+            ]
+        )
+
+        def fetch(url, path):
+            self.assertEqual(path, "/api/system/perf")
+            if "10.0.0.9" in url:
+                raise OSError("down")
+            return {"cpu_percent": 20}
+
+        out = assemble_perf(nodes, {"cpu_percent": 10}, fetch)
+        self.assertTrue(out["active"])
+        self.assertEqual([n["id"] for n in out["nodes"]], ["local", "room2", "room3"])
+        self.assertEqual(out["nodes"][0]["perf"]["cpu_percent"], 10)
+        self.assertFalse(out["nodes"][2]["ok"])
+        self.assertIsNone(out["nodes"][2]["perf"])
+
+    def test_perf_single_host_without_nodes(self):
+        out = assemble_perf([], {"cpu_percent": 1}, lambda *_a: None)
+        self.assertFalse(out["active"])
+        self.assertEqual(out["nodes"][0]["name"], "本机")
+        self.assertTrue(out["nodes"][0]["ok"])
 
     def test_reject_two_local_nodes(self):
         with self.assertRaises(ValueError):

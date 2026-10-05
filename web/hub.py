@@ -49,6 +49,44 @@ def hub_is_active(nodes: List[Dict[str, str]]) -> bool:
     return any(n.get("url") for n in nodes)
 
 
+def assemble_perf(
+    nodes: List[Dict[str, str]],
+    local_perf: Optional[Dict[str, Any]],
+    fetch_json: Callable[[str, str], Optional[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """每台的 /api/system/perf。远程失败记离线，不丢掉其他台。"""
+    active = hub_is_active(nodes)
+    use = list(nodes) if nodes else [{"id": "local", "name": "本机", "url": ""}]
+
+    def one(node: Dict[str, str]) -> Dict[str, Any]:
+        url = node.get("url") or ""
+        perf = None
+        if not url:
+            perf = local_perf if isinstance(local_perf, dict) else None
+        else:
+            try:
+                perf = fetch_json(url, "/api/system/perf")
+            except Exception:
+                perf = None
+        ok = isinstance(perf, dict)
+        return {
+            "id": node.get("id") or "",
+            "name": node.get("name") or node.get("id") or "",
+            "local": not bool(url),
+            "ok": ok,
+            "perf": perf if ok else None,
+        }
+
+    if len(use) <= 1:
+        rows = [one(n) for n in use]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(8, len(use))) as pool:
+            rows = list(pool.map(one, use))
+    return {"active": active, "nodes": rows}
+
+
 def load_nodes_doc(text: str) -> List[Dict[str, str]]:
     import yaml
 

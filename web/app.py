@@ -1050,6 +1050,18 @@ def _read_meminfo() -> Dict[str, int]:
     return out
 
 
+@app.get("/api/hub/perf")
+def api_hub_perf():
+    """本机或各监测机的性能。未配置远程节点时只有本机。"""
+    nodes = _load_hub_nodes()
+    local = api_system_perf()
+
+    def _fetch(url: str, path: str):
+        return hub_mod.fetch_json(url, path, timeout=1.5)
+
+    return hub_mod.assemble_perf(nodes, local, _fetch)
+
+
 @app.get("/api/system/perf")
 def api_system_perf():
     """当前服务器负载：负载/内存/磁盘（不阻塞采样）。"""

@@ -754,22 +754,60 @@
     });
   }
 
-  function renderNodeStrip(dash) {
+  let lastPerf = null;
+
+  function busiestNic(p) {
+    let best = null;
+    ((p && p.nics) || []).forEach((n) => {
+      const rx = Number(n.rx_kbps) || 0;
+      if (!best || rx > (Number(best.rx_kbps) || 0)) best = n;
+    });
+    return best;
+  }
+
+  function serverMini(label, pct, value) {
+    return `<div class="server-mini"><span>${escapeHtml(label)}</span>${perfBar(pct)}<span class="num">${escapeHtml(value)}</span></div>`;
+  }
+
+  function renderServerStrip(dash, perf) {
     const box = $("#node-strip");
     if (!box) return;
-    const hub = dash.hub || {};
-    const nodes = hub.nodes || dash.nodes || [];
+    const hub = (dash && dash.hub) || {};
+    const nodes = hub.nodes || (dash && dash.nodes) || [];
     if (!hub.active || !nodes.length) {
       box.classList.add("hidden");
       box.innerHTML = "";
       return;
     }
+    const byId = {};
+    ((perf && perf.nodes) || []).forEach((n) => {
+      byId[n.id] = n;
+    });
     box.classList.remove("hidden");
     box.innerHTML = nodes
       .map((n) => {
-        const cls = n.ok ? "node-pill" : "node-pill bad";
-        const st = n.ok ? (n.cards || 0) + " 路" : "离线";
-        return `<span class="${cls}">${escapeHtml(n.name || n.id)} · ${escapeHtml(st)}</span>`;
+        const extra = byId[n.id];
+        const p = extra && extra.perf;
+        const online = n.ok !== false && (!extra || extra.ok !== false);
+        const head = `<div class="server-card-top"><b><i class="dot ${online ? "green" : "red"}"></i>${escapeHtml(
+          n.name || n.id
+        )}</b><span>${n.ok === false ? "离线" : (n.cards || 0) + " 路"}</span></div>`;
+        if (!p) {
+          return `<article class="server-card${online ? "" : " bad"}">${head}<div class="hint">${
+            online ? "正在读取性能" : "网页无响应"
+          }</div></article>`;
+        }
+        const mem = p.memory || {};
+        const nic = busiestNic(p);
+        const nicLabel = nic ? nic.name || "网卡" : "网卡";
+        const nicVal = nic ? fmtBitrate(nic.rx_kbps) || "-" : "-";
+        const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
+        const memPct = mem.used_percent != null ? mem.used_percent + "%" : "-";
+        return `<article class="server-card">${head}
+          ${serverMini("CPU", p.cpu_percent, cpu)}
+          ${serverMini("内存", mem.used_percent, memPct)}
+          ${serverMini(nicLabel, nic && nic.occupancy_percent, nicVal)}
+        </article>`;
       })
       .join("");
   }
@@ -784,7 +822,7 @@
     if ($("#sum-gray")) $("#sum-gray").textContent = sum.gray ?? 0;
 
     const all = (dash.cards || []).filter((c) => c.enabled !== false);
-    renderNodeStrip(dash);
+    renderServerStrip(dash, lastPerf);
     renderCategoryTabs(all);
     const bad = all.filter((c) => c.lamp === "red" || c.lamp === "yellow");
     const okAll = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
@@ -1211,8 +1249,8 @@
       loadEventsPage().catch(() => {});
       const manageVisible =
         $("#view-manage") && !$("#view-manage").classList.contains("hidden");
+      refreshPerf().catch(() => {});
       if (manageVisible) {
-        refreshPerf().catch(() => {});
         refreshStorageDetail().catch(() => {});
         loadHubEditor().catch(() => {});
       }
@@ -1271,63 +1309,83 @@
     </div>`;
   }
 
+  function perfDetailHtml(p) {
+    const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
+    const mem = p.memory || {};
+    const disk = p.disk || {};
+    const memPct = mem.used_percent != null ? mem.used_percent + "%" : "-";
+    const diskPct = disk.used_percent != null ? disk.used_percent + "%" : "-";
+    const load1 = p.loadavg && p.loadavg["1"] != null ? Number(p.loadavg["1"]).toFixed(2) : "-";
+    const load5 = p.loadavg && p.loadavg["5"] != null ? Number(p.loadavg["5"]).toFixed(2) : "-";
+    const cores = p.cpu_cores != null ? p.cpu_cores + " 核" : "-";
+    const nicCards = (p.nics || [])
+      .map((n) => {
+        const car =
+          n.carrier === true ? "有载波" : n.carrier === false ? "无载波" : n.operstate || "-";
+        const link = fmtLink(n.speed_mbps);
+        const ip = n.ipv4 || "无地址";
+        const rx = fmtBitrate(n.rx_kbps) || "-";
+        const tx = fmtBitrate(n.tx_kbps) || "-";
+        const occ =
+          n.occupancy_percent != null ? Number(n.occupancy_percent).toFixed(1) + "%" : "速率未知";
+        const bits = [car, link, ip, "占用 " + occ, "发送 " + tx].filter(Boolean);
+        return `<div class="perf-nic">
+          <div class="perf-nic-top">
+            <span><span class="dot${n.up ? " on" : ""}">●</span>${escapeHtml(n.name || "")}</span>
+            <b>${escapeHtml(rx)}</b>
+          </div>
+          ${perfBar(n.occupancy_percent)}
+          <div class="perf-foot">${bits.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>
+        </div>`;
+      })
+      .join("");
+    const monBr = fmtBitrate(p.monitor_bitrate_kbps) || "-";
+    return `
+      <div class="perf-meters">
+        ${perfMeter("CPU", cpu, p.cpu_percent, cores + " · 负载 " + load1 + " / " + load5)}
+        ${perfMeter("内存", memPct, mem.used_percent, fmtBytes(mem.used_bytes) + " / " + fmtBytes(mem.total_bytes))}
+        ${perfMeter("磁盘", diskPct, disk.used_percent, "已用 " + fmtBytes(disk.used_bytes) + " · 剩余 " + fmtBytes(disk.free_bytes))}
+      </div>
+      <div class="perf-net-head"><span>网络</span><span>监测节目合计 <b>${escapeHtml(monBr)}</b></span></div>
+      <div class="perf-nics">${nicCards || '<div class="empty">没有读到网卡</div>'}</div>
+    `;
+  }
+
   async function refreshPerf() {
     const box = $("#perf-detail");
-    if (!box) return;
     try {
-      const p = await fetchJSON("/api/system/perf");
-      const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
-      const mem = p.memory || {};
-      const disk = p.disk || {};
-      const memPct = mem.used_percent != null ? mem.used_percent + "%" : "-";
-      const diskPct = disk.used_percent != null ? disk.used_percent + "%" : "-";
-      const load1 = p.loadavg && p.loadavg["1"] != null ? Number(p.loadavg["1"]).toFixed(2) : "-";
-      const load5 = p.loadavg && p.loadavg["5"] != null ? Number(p.loadavg["5"]).toFixed(2) : "-";
-      const cores = p.cpu_cores != null ? p.cpu_cores + " 核" : "-";
-      const nicCards = (p.nics || [])
-        .map((n) => {
-          const car =
-            n.carrier === true ? "有载波" : n.carrier === false ? "无载波" : n.operstate || "-";
-          const link = fmtLink(n.speed_mbps);
-          const ip = n.ipv4 || "无地址";
-          const rx = fmtBitrate(n.rx_kbps) || "-";
-          const tx = fmtBitrate(n.tx_kbps) || "-";
-          const occ =
-            n.occupancy_percent != null ? Number(n.occupancy_percent).toFixed(1) + "%" : "速率未知";
-          const bits = [car, link, ip, "占用 " + occ, "发送 " + tx].filter(Boolean);
-          return `<div class="perf-nic">
-            <div class="perf-nic-top">
-              <span><span class="dot${n.up ? " on" : ""}">●</span>${escapeHtml(n.name || "")}</span>
-              <b>${escapeHtml(rx)}</b>
-            </div>
-            ${perfBar(n.occupancy_percent)}
-            <div class="perf-foot">${bits.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>
-          </div>`;
+      let data = null;
+      try {
+        data = await fetchJSON("/api/hub/perf");
+      } catch (e) {
+        const p = await fetchJSON("/api/system/perf");
+        data = { active: false, nodes: [{ id: "local", name: "本机", ok: true, perf: p }] };
+      }
+      lastPerf = data;
+      if (lastDash) renderServerStrip(lastDash, data);
+      if (!box) return;
+      const nodes = (data && data.nodes) || [];
+      const multi = !!(data && data.active && nodes.length > 1);
+      if (!nodes.length) {
+        box.textContent = "没有性能数据";
+        return;
+      }
+      box.innerHTML = nodes
+        .map((node) => {
+          const body =
+            node.ok && node.perf
+              ? perfDetailHtml(node.perf)
+              : '<div class="empty">离线，读不到这台的性能</div>';
+          if (!multi) return body;
+          return `<section class="perf-node"><div class="perf-node-name"><i class="dot ${
+            node.ok ? "green" : "red"
+          }"></i>${escapeHtml(node.name || node.id)}</div><div class="perf-node-body">${body}</div></section>`;
         })
         .join("");
-      const monBr = fmtBitrate(p.monitor_bitrate_kbps) || "-";
-      box.innerHTML = `
-        <div class="perf-meters">
-          ${perfMeter("CPU", cpu, p.cpu_percent, cores + " · 负载 " + load1 + " / " + load5)}
-          ${perfMeter(
-            "内存",
-            memPct,
-            mem.used_percent,
-            fmtBytes(mem.used_bytes) + " / " + fmtBytes(mem.total_bytes)
-          )}
-          ${perfMeter(
-            "磁盘",
-            diskPct,
-            disk.used_percent,
-            "已用 " + fmtBytes(disk.used_bytes) + " · 剩余 " + fmtBytes(disk.free_bytes)
-          )}
-        </div>
-        <div class="perf-net-head"><span>网络</span><span>监测节目合计 <b>${escapeHtml(monBr)}</b></span></div>
-        <div class="perf-nics">${nicCards || '<div class="empty">没有读到网卡</div>'}</div>
-      `;
-      if ($("#perf-time")) $("#perf-time").textContent = p.time ? "更新于 " + p.time : "";
+      const stamp = nodes.map((n) => n.perf && n.perf.time).filter(Boolean)[0];
+      if ($("#perf-time")) $("#perf-time").textContent = stamp ? "更新于 " + stamp : "";
     } catch (e) {
-      box.textContent = "无法读取性能：" + (e.message || e);
+      if (box) box.textContent = "无法读取性能：" + (e.message || e);
     }
   }
 

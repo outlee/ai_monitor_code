@@ -48,6 +48,15 @@ def _is_alarm_snapshot_name(name: str) -> bool:
     return is_alarm_snapshot(name)
 
 
+def alarm_frame_max_age_sec(latest_max_age_sec: float) -> float:
+    """大屏合格画面大约 20 秒一张。告警截图要能用到上一张，不能只认几秒内的。"""
+    try:
+        age = float(latest_max_age_sec or 0)
+    except (TypeError, ValueError):
+        age = 0.0
+    return max(age, 45.0)
+
+
 # 可选 AI 模块：导入失败也不影响主流程
 try:
     from ai_detector import AIDetector, create_detector
@@ -252,6 +261,7 @@ class StreamMonitor:
         self._status_lock = threading.Lock()
         self._snapshot_inflight = False
         self._snapshot_lock = threading.Lock()
+        self._ring_grab_lock = threading.Lock()
         self._thumb_thread: Optional[threading.Thread] = None
         self._thumb_proc: Optional[subprocess.Popen] = None
         self._thumb_feeder = None
@@ -880,6 +890,19 @@ class StreamMonitor:
         return True, last
 
     def _refresh_latest_from_ring(self) -> bool:
+        lock = getattr(self, "_ring_grab_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._ring_grab_lock = lock
+        if not lock.acquire(timeout=20):
+            self.logger.warning("[thumb] 收包缓冲正在抽帧，跳过本次")
+            return False
+        try:
+            return self._refresh_latest_from_ring_unlocked()
+        finally:
+            lock.release()
+
+    def _refresh_latest_from_ring_unlocked(self) -> bool:
         """
         从抓包 TS 环形缓冲落盘，再用 GStreamer tsdemux 抽一帧。
         监测 FFmpeg 不参与出图。
@@ -1869,48 +1892,71 @@ class StreamMonitor:
             self.logger.warning("独立抽帧异常: %s" % e)
             return False
 
+    def _jpeg_ok_for_alarm(self, data: bytes) -> bool:
+        if not data or len(data) < 2048 or not self._is_complete_jpeg(data):
+            return False
+        try:
+            from frame_quality import jpeg_looks_displayable
+        except ImportError:
+            try:
+                from workers.frame_quality import jpeg_looks_displayable
+            except ImportError:
+                jpeg_looks_displayable = None
+        if jpeg_looks_displayable is None:
+            return True
+        good, _reason = jpeg_looks_displayable(data)
+        return bool(good)
+
+    def _read_alarm_jpeg(self) -> Optional[bytes]:
+        """用最近一张合格画面。大屏约 20 秒才更新，不能套用 5 秒新鲜度。"""
+        max_age = alarm_frame_max_age_sec(self.latest_max_age_sec)
+        now = _now_ts()
+        for path in (self.snapshot_dir / "latest_ok.jpg", self.latest_frame_path):
+            try:
+                if not path.is_file():
+                    continue
+                if now - path.stat().st_mtime > max_age:
+                    continue
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if self._jpeg_ok_for_alarm(data):
+                return data
+        return None
+
+    def _store_alarm_jpeg(self, dest: Path, data: bytes) -> bool:
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            os.replace(str(tmp), str(dest))
+            return dest.is_file() and dest.stat().st_size >= 2048
+        except OSError as e:
+            self.logger.warning("写入告警截图失败: %s" % e)
+            try:
+                if tmp.is_file():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
+
     def _take_snapshot(self, event_type: str) -> Optional[Path]:
         """
-        告警截图策略（降低花屏误截）：
-        - 无伴音/断流：默认不截（画面参考价值低，且易截到损坏帧）
-        - 黑场/静帧：优先用很新的旁路 latest；否则后台抽关键帧
+        黑场/静帧留下告警图。优先复制最近合格画面；没有则从收包缓冲抽一帧。
+        网卡收流时不再另开一路 UDP，那个口已经被监测进程占着。
         """
-        # 断流/结束事件不截；黑场/静帧/无伴音等异常仍截（保留异常截图）
         if event_type in ("stream_down",) or str(event_type).endswith("_end"):
             return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = self.snapshot_dir / f"{event_type}_{ts}.jpg"
+        visual = event_type in ("black", "freeze") or str(event_type).startswith("ai_")
 
-        def _unlink_quiet(p):
-            try:
-                if p.is_file():
-                    os.unlink(str(p))
-            except OSError:
-                pass
-
-        # 实时 latest 够新则直接复制（黑场/静帧/AI）；无伴音也可留一张当时画面
-        age = self._latest_frame_age()
-        max_age = max(float(self.frame_interval_sec) * 2.5, 3.0)
-        visual = event_type in ("black", "freeze") or str(event_type).startswith(
-            "ai_"
-        )
-        prefer = (
-            self.snapshot_prefer_latest
-            and age is not None
-            and age <= max_age
-            and (visual or event_type == "silence")
-        )
-        if prefer and self._copy_latest_frame(out_path):
-            try:
-                if out_path.stat().st_size >= 8 * 1024:
-                    self.logger.info(f"截图已保存(旁路): {out_path}")
-                    self._prune_snapshots()
-                    return out_path
-            except OSError:
-                pass
-            _unlink_quiet(out_path)
-
+        data = self._read_alarm_jpeg()
+        if data and self._store_alarm_jpeg(out_path, data):
+            self.logger.info("截图已保存(最近合格画面): %s" % out_path)
+            self._prune_snapshots()
+            return out_path
         if not visual:
             return None
 
@@ -1920,28 +1966,27 @@ class StreamMonitor:
                     return
                 self._snapshot_inflight = True
             try:
-                time.sleep(0.5)
-                if self._copy_latest_frame(out_path):
-                    try:
-                        if out_path.stat().st_size >= 8 * 1024:
-                            self.logger.info(f"截图已保存(旁路延迟): {out_path}")
-                            self._prune_snapshots()
-                            return
-                    except OSError:
-                        pass
-                    _unlink_quiet(out_path)
+                if self._capture_key:
+                    self._refresh_latest_from_ring()
+                    again = self._read_alarm_jpeg()
+                    if again and self._store_alarm_jpeg(out_path, again):
+                        self.logger.info("截图已保存(收包缓冲): %s" % out_path)
+                        self._prune_snapshots()
+                        return
+                    self.logger.warning("截图失败: 收包缓冲没有合格画面 %s" % out_path)
+                    return
                 if self._grab_frame_ffmpeg(out_path, quality=3, keyframe_only=True):
                     try:
-                        if out_path.stat().st_size < 8 * 1024:
-                            _unlink_quiet(out_path)
+                        if out_path.stat().st_size < 2048:
+                            out_path.unlink()
                             self.logger.warning("截图过小已丢弃（可能花屏）")
                             return
                     except OSError:
                         pass
-                    self.logger.info(f"截图已保存(关键帧): {out_path}")
+                    self.logger.info("截图已保存(关键帧): %s" % out_path)
                     self._prune_snapshots()
                 else:
-                    self.logger.warning(f"截图失败: {out_path}")
+                    self.logger.warning("截图失败: %s" % out_path)
             finally:
                 with self._snapshot_lock:
                     self._snapshot_inflight = False
