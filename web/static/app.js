@@ -574,39 +574,47 @@
     }
   }
 
+  function cardFault(c) {
+    const bits = [];
+    if (c.status && c.status !== "ok") bits.push(statusText(c.status));
+    const alarms = (c.active_alarms || []).filter(Boolean);
+    if (alarms.length) bits.push(alarms.map(typeLabel).join("、"));
+    return bits.join(" · ");
+  }
+
   function channelCardHtml(c, large) {
-    const alarms = formatAlarmTags(c.active_alarms, c.last_type);
-    const prog =
-      c.program !== undefined && c.program !== null && c.program !== ""
-        ? "P" + c.program
-        : "";
-    const stream = streamLabel(c);
+    const fault = cardFault(c);
+    const rate = fmtBitrate(c.bitrate_kbps);
     const thumb = c.thumb_url
       ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
-    const media = `<div class="ch-media">${thumb}${vuMeterHtml(
-      c.id,
-      c.audio_db,
-      c.audio_state
-    )}</div>`;
     const tags = [];
     if (c.node_name) tags.push(c.node_name);
     cardTags(c).forEach((t) => tags.push(t));
     const tagHtml = tags.length
       ? `<div class="ch-tags">${escapeHtml(tags.join(" · "))}</div>`
       : "";
+    const chip = fault
+      ? `<div class="ch-chip">${escapeHtml(fault)}</div>`
+      : "";
     const cls = large ? "ch-card ch-card-lg" : "ch-card";
     const snap = c.preview_base || ("/api/snapshots/" + (c.channel_id || c.id));
+    const name = c.name || c.id;
     return `<div class="${cls} lamp-${escapeHtml(c.lamp || "gray")}" data-id="${escapeHtml(
       c.id
-    )}" data-snap="${escapeHtml(snap)}" title="${escapeHtml(c.name || c.id)}">
-      ${tagHtml}
-      ${media}
-      <div class="ch-body">
-        <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
-        <div class="ch-id">${escapeHtml(c.channel_id || c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
-        <div class="ch-rate">${stream ? escapeHtml(stream) : "码流 —"}</div>
-        <div class="ch-meta">${escapeHtml(statusText(c.status))} · ${escapeHtml(alarms)}</div>
+    )}" data-snap="${escapeHtml(snap)}" title="${escapeHtml(name)}">
+      <div class="ch-media">
+        <div class="ch-shot">
+          ${thumb}
+          <div class="ch-overlay">
+            <div class="ch-overlay-top">${tagHtml}${chip}</div>
+            <div class="ch-overlay-bottom">
+              <div class="ch-name">${escapeHtml(name)}</div>
+              ${rate ? `<div class="ch-rate">${escapeHtml(rate)}</div>` : ""}
+            </div>
+          </div>
+        </div>
+        ${vuMeterHtml(c.id, c.audio_db, c.audio_state)}
       </div>
     </div>`;
   }
