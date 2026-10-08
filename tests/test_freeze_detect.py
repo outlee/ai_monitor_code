@@ -13,7 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "workers"))
 sys.path.insert(0, str(ROOT))
 
-from monitor_worker import StreamMonitor  # noqa: E402
+from monitor_worker import (  # noqa: E402
+    StreamMonitor,
+    map_is_program,
+    skip_other_program_map,
+    thumb_tail_nbytes,
+    thumb_video_maps,
+)
 
 
 def _mon(defaults=None, channel=None, work_dir=None):
@@ -37,6 +43,38 @@ def _mon(defaults=None, channel=None, work_dir=None):
         ch.update(channel)
     wd = work_dir or tempfile.mkdtemp(prefix="amc-freeze-")
     return StreamMonitor(ch, d, wd)
+
+
+class ThumbTailTests(unittest.TestCase):
+    def test_fast_mux_gets_about_eight_seconds(self):
+        # 33Mbps * 8s = 33MB，落在 12MB 和 40MB 之间
+        n = thumb_tail_nbytes(33000)
+        self.assertEqual(n, int(33000 * 1000 / 8 * 8))
+        self.assertGreater(n, 12 * 1024 * 1024)
+        self.assertLess(n, 40 * 1024 * 1024)
+
+    def test_slow_or_unknown_stays_at_twelve_megabytes(self):
+        floor = 12 * 1024 * 1024
+        self.assertEqual(thumb_tail_nbytes(0), floor)
+        self.assertEqual(thumb_tail_nbytes(8000), floor)
+
+    def test_very_fast_mux_caps_at_forty_megabytes(self):
+        self.assertEqual(thumb_tail_nbytes(80000), 40 * 1024 * 1024)
+
+
+class ProgramMapTests(unittest.TestCase):
+    def test_decoded_program_does_not_fall_through_to_another(self):
+        self.assertTrue(map_is_program(["-map", "0:p:109:v:0"]))
+        self.assertFalse(map_is_program(["-map", "0:v:0"]))
+        self.assertFalse(map_is_program([]))
+        self.assertFalse(skip_other_program_map(["-map", "0:p:109:v"], True))
+        self.assertTrue(skip_other_program_map(["-map", "0:v:0"], True))
+        self.assertFalse(skip_other_program_map(["-map", "0:v:1"], False))
+        scoped = thumb_video_maps(110)
+        self.assertTrue(all(map_is_program(m) for m in scoped))
+        self.assertFalse(any(item == "0:v:0" for m in scoped for item in m))
+        plain = thumb_video_maps(None)
+        self.assertEqual(plain[0], ["-map", "0:v:0"])
 
 
 class FreezeDetectConfigTests(unittest.TestCase):

@@ -94,6 +94,68 @@ def alarm_tail_nbytes(bitrate_kbps: float, span_sec: float) -> int:
     return max(188 * 40, min(nbytes, 3 * 1024 * 1024))
 
 
+_THUMB_TAIL_SEC = 8.0
+_THUMB_TAIL_MIN = 12 * 1024 * 1024
+_THUMB_TAIL_MAX = 40 * 1024 * 1024
+
+
+def thumb_tail_nbytes(bitrate_kbps: float) -> int:
+    """实时截图用的尾部。按整路码率留约 8 秒，至少 12MB，最多 40MB。
+
+    不知道码率时保持 12MB。慢流本来就盖得住好几秒，不必把几十 MB 送去解。
+    """
+    try:
+        kbps = float(bitrate_kbps or 0)
+    except (TypeError, ValueError):
+        kbps = 0.0
+    if kbps < 200:
+        return _THUMB_TAIL_MIN
+    nbytes = int(kbps * 1000.0 / 8.0 * _THUMB_TAIL_SEC)
+    if nbytes < _THUMB_TAIL_MIN:
+        return _THUMB_TAIL_MIN
+    if nbytes > _THUMB_TAIL_MAX:
+        return _THUMB_TAIL_MAX
+    return nbytes
+
+
+_FRAME_REJECT_REASONS = (
+    "smear",
+    "conceal",
+    "green",
+    "flat",
+    "gray",
+    "too_small",
+    "undecodable",
+    "not_jpeg",
+    "bad_rgb",
+)
+
+
+def thumb_video_maps(program):
+    """有节目号时只抽这一套。0:v:0 是整路第一套，会把旁边的节目贴到这张卡片上。"""
+    if program is not None:
+        p = int(program)
+        return [
+            ["-map", "0:p:%d:v:0" % p],
+            ["-map", "0:p:%d:v" % p],
+            ["-map", "0:p:%d:v:1" % p],
+        ]
+    return [["-map", "0:v:0"], ["-map", "0:v:1"], []]
+
+
+def map_is_program(maps) -> bool:
+    """0:p:N 是这一套节目。0:v:0 是整路里的第一路，会抽到旁边的节目。"""
+    for item in maps or []:
+        if isinstance(item, str) and item.startswith("0:p:"):
+            return True
+    return False
+
+
+def skip_other_program_map(maps, program_frame_seen: bool) -> bool:
+    """本节目已经解出过画面时，不再改去抽别的节目。"""
+    return bool(program_frame_seen) and not map_is_program(maps)
+
+
 def alarm_ring_tail(data: bytes, bitrate_kbps: float, span_sec: float) -> bytes:
     """只留缓冲最新的一段。解的是这段里的第一帧，所以段不能伸到异常开始之前。"""
     if not data:
@@ -1079,8 +1141,21 @@ class StreamMonitor:
         if not data:
             return False
         data = align_ts_sync(data)
-        # 只落盘尾部，解完整 64MB 会把 CPU 打满；约 3s@32Mbps / 10s@8Mbps
-        max_grab = 12 * 1024 * 1024
+        # 按整路码率留约 8 秒，让后面还有完整关键帧。不解完整 64MB。
+        try:
+            from iface_mcast import hub_stats
+        except ImportError:
+            try:
+                from workers.iface_mcast import hub_stats
+            except ImportError:
+                hub_stats = None
+        bitrate = 0.0
+        if hub_stats is not None:
+            try:
+                bitrate = float((hub_stats(iface, group, port) or {}).get("bitrate_kbps") or 0)
+            except (TypeError, ValueError):
+                bitrate = 0.0
+        max_grab = thumb_tail_nbytes(bitrate)
         if len(data) > max_grab:
             data = align_ts_sync(data[-max_grab:])
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -1094,20 +1169,35 @@ class StreamMonitor:
             self.logger.warning("写 TS ring 失败: %s" % e)
             return False
 
-        map_list = []
-        if self.program is not None:
-            map_list.append(["-map", "0:p:%d:v:0" % int(self.program)])
-            map_list.append(["-map", "0:p:%d:v" % int(self.program)])
-        map_list.append(["-map", "0:v:0"])
-        map_list.append(["-map", "0:v:1"])
-        map_list.append([])
+        map_list = thumb_video_maps(self.program)
 
-        def _run(maps, skip_key):
+        grab_prefix = ".gf_%s_" % self.id
+
+        def _clear_grab_frames():
             try:
-                if jpg_tmp.is_file():
-                    jpg_tmp.unlink()
+                for old in self.snapshot_dir.glob(grab_prefix + "*.jpg"):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
             except OSError:
                 pass
+
+        def _displayable(blob):
+            try:
+                from frame_quality import jpeg_looks_displayable
+            except ImportError:
+                try:
+                    from workers.frame_quality import jpeg_looks_displayable
+                except ImportError:
+                    return True, ""
+            return jpeg_looks_displayable(blob)
+
+        def _run(maps, skip_key):
+            # 开头那张常是半截。连抽几张关键帧，用靠后的一张已经见过参数集的。
+            n_frames = 6 if skip_key else 1
+            _clear_grab_frames()
+            pattern = str(self.snapshot_dir / (grab_prefix + "%02d.jpg"))
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -1131,55 +1221,84 @@ class StreamMonitor:
                 [
                     "-an",
                     "-frames:v",
-                    "1",
+                    str(n_frames),
                     "-q:v",
                     "5",
-                    str(jpg_tmp),
+                    "-start_number",
+                    "1",
+                    pattern,
                 ]
             )
             try:
                 r = subprocess.run(
                     cmd,
-                    timeout=12,
+                    timeout=18,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
             except subprocess.TimeoutExpired:
+                _clear_grab_frames()
                 return False, "timeout", b""
             err = (r.stderr or b"").decode("utf-8", "replace").strip()
             last = err.splitlines()[-1][:200] if err else ""
-            if not (jpg_tmp.is_file() and jpg_tmp.stat().st_size > 1024):
-                return False, last, b""
+            paths = []
             try:
-                blob = jpg_tmp.read_bytes()
+                paths = sorted(self.snapshot_dir.glob(grab_prefix + "*.jpg"))
             except OSError:
-                return False, last, b""
+                paths = []
+            chosen = b""
+            tear = b""
+            reason = last
             try:
-                from frame_quality import jpeg_looks_displayable
-            except ImportError:
-                try:
-                    from workers.frame_quality import jpeg_looks_displayable
-                except ImportError:
-                    jpeg_looks_displayable = None
-            if jpeg_looks_displayable is not None:
-                good, reason = jpeg_looks_displayable(blob)
-                if not good:
-                    # 先不送去告警。同一段缓冲里还可能抽到正常画面。
-                    return False, reason or last, blob
-            return True, last, blob
+                for path in reversed(paths):
+                    try:
+                        blob = path.read_bytes()
+                    except OSError:
+                        continue
+                    if len(blob) <= 1024:
+                        continue
+                    good, why = _displayable(blob)
+                    if good:
+                        chosen = blob
+                        break
+                    reason = why or reason
+                    # 竖彩条是截图切坏的，不当花屏。绿条仍留给检测。
+                    if why in ("conceal", "green") and blob and not tear:
+                        tear = blob
+            finally:
+                _clear_grab_frames()
+            if not chosen:
+                return False, reason or last, tear
+            try:
+                jpg_tmp.write_bytes(chosen)
+            except OSError:
+                return False, "write", b""
+            return True, last, b""
+
+        def _map_label(maps):
+            for item in maps or []:
+                if isinstance(item, str) and item.startswith("0:"):
+                    return item
+            return ""
 
         def _try_maps(skip_key):
             found_ok = False
             found_err = ""
             found_tear = b""
+            saw_program = False
             for maps in map_list:
+                # 这一套已经解出竖条时，0:v:0 会抽成旁边的节目，停在这里。
+                if skip_other_program_map(maps, saw_program):
+                    break
                 good, err, blob = _run(maps, skip_key)
                 if good:
-                    return True, err, b""
+                    return True, err, b"", _map_label(maps)
                 found_err = err
                 if err in ("conceal", "green") and blob:
                     found_tear = blob
-            return found_ok, found_err, found_tear
+                if map_is_program(maps) and err in _FRAME_REJECT_REASONS:
+                    saw_program = True
+            return found_ok, found_err, found_tear, ""
 
         last_err = ""
         ok = False
@@ -1188,14 +1307,18 @@ class StreamMonitor:
         try:
             # 先抽关键帧。参考帧丢了才会被涂成绿条，关键帧本身通常还是正常画面。
             # 关键帧不行再抽任意帧。两张都不正常，才把绿图留给花屏检测。
-            # 东方卫视等 MPEG-2 常有 0x0 占位流，0:v:0 抽不出，需试 v:1
+            # 节目号对上但解不出流时，才试 0:v:1。已经解出废图就不再换节目。
             via = "ffmpeg_key"
-            ok, last_err, tear = _try_maps(True)
+            ok, last_err, tear, map_used = _try_maps(True)
+            if map_used:
+                via = "ffmpeg_key/" + map_used
             if not ok:
                 via = "ffmpeg"
-                ok, err2, tear2 = _try_maps(False)
+                ok, err2, tear2, map_used = _try_maps(False)
                 if ok:
                     tear = b""
+                    if map_used:
+                        via = "ffmpeg/" + map_used
                 else:
                     last_err = err2 or last_err
                     if tear2:
@@ -2181,15 +2304,12 @@ class StreamMonitor:
 
     def _ffmpeg_alarm_jpeg(self, ts_path: Path, jpg_tmp: Path):
         """从已经截短的 TS 里解一帧。文件本身就是异常时段的尾部。"""
-        map_list = []
-        if self.program is not None:
-            map_list.append(["-map", "0:p:%d:v:0" % int(self.program)])
-            map_list.append(["-map", "0:p:%d:v" % int(self.program)])
-        map_list.append(["-map", "0:v:0"])
-        map_list.append(["-map", "0:v:1"])
-        map_list.append([])
+        map_list = thumb_video_maps(self.program)
         last = ""
+        saw_program = False
         for maps in map_list:
+            if skip_other_program_map(maps, saw_program):
+                break
             try:
                 if jpg_tmp.is_file():
                     jpg_tmp.unlink()
@@ -2236,6 +2356,8 @@ class StreamMonitor:
                 continue
             if self._jpeg_ok_for_alarm(blob):
                 return blob, last
+            if map_is_program(maps):
+                saw_program = True
             last = last or "not_displayable"
         return None, last
 

@@ -22,6 +22,7 @@ from frame_quality import (  # noqa: E402
     concealment_rgb_bytes,
     jpeg_looks_displayable,
     pure_green_ratio_bytes,
+    vertical_smear_hwc,
 )
 
 
@@ -111,6 +112,92 @@ def _picture_with_green_bar(w, h, bar_rows):
         o = i * 3
         buf[o : o + 3] = pix
     return bytes(buf)
+
+
+class VerticalSmearTests(unittest.TestCase):
+    def test_striped_bottom_is_rejected(self):
+        import numpy as np
+
+        h, w = 180, 320
+        rng = np.random.RandomState(3)
+        img = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        y0 = int(h * 0.62)
+        for x in range(w):
+            img[y0:, x, :] = (x * 17) % 256
+        self.assertTrue(vertical_smear_hwc(img))
+
+    def test_noise_stays_and_full_frame_bars_do_not(self):
+        import numpy as np
+
+        rng = np.random.RandomState(4)
+        noise = rng.randint(0, 255, size=(180, 320, 3), dtype=np.uint8)
+        self.assertFalse(vertical_smear_hwc(noise))
+        bars = np.zeros((180, 320, 3), dtype=np.uint8)
+        for x in range(320):
+            bars[:, x, :] = ((x // 20) * 30) % 256
+        self.assertTrue(vertical_smear_hwc(bars))
+
+    def test_jpeg_smear_stays_off_the_wall(self):
+        try:
+            from PIL import Image
+            import io
+            import numpy as np
+        except ImportError:
+            self.skipTest("no PIL")
+        h, w = 180, 320
+        rng = np.random.RandomState(6)
+        img = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        y0 = int(h * 0.62)
+        for x in range(w):
+            img[y0:, x, :] = ((x // 16) * 40) % 256
+        im = Image.fromarray(img, "RGB")
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=95)
+        ok, reason = jpeg_looks_displayable(out.getvalue(), min_bytes=64)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "smear")
+
+    def test_pale_stripes_and_thin_bottom_bar_are_rejected(self):
+        import numpy as np
+
+        h, w = 180, 320
+        rng = np.random.RandomState(8)
+        pale = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        y0 = h // 2
+        for x in range(w):
+            pale[y0:, x, :] = 210 + (x % 40)
+        self.assertTrue(vertical_smear_hwc(pale))
+
+        wash = np.empty((h, w, 3), dtype=np.uint8)
+        for x in range(w):
+            wash[:, x, :] = 188 + (x % 16)
+        self.assertTrue(vertical_smear_hwc(wash))
+
+        thin = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        y1 = int(h * 0.88)
+        for x in range(w):
+            thin[y1:, x, :] = ((x // 12) * 28) % 256
+        self.assertTrue(vertical_smear_hwc(thin))
+
+        sky = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        y2 = int(h * 0.40)
+        y3 = int(h * 0.58)
+        for x in range(w):
+            sky[y2:y3, x, :] = 200 + (x % 30)
+        self.assertFalse(vertical_smear_hwc(sky))
+
+    def test_letterbox_and_flat_card_stay(self):
+        import numpy as np
+
+        rng = np.random.RandomState(9)
+        h, w = 180, 320
+        img = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        bar = int(h * 0.20)
+        img[:bar, :, :] = 0
+        img[h - bar :, :, :] = 0
+        self.assertFalse(vertical_smear_hwc(img))
+        card = np.full((h, w, 3), 235, dtype=np.uint8)
+        self.assertFalse(vertical_smear_hwc(card))
 
 
 class ConcealmentTests(unittest.TestCase):

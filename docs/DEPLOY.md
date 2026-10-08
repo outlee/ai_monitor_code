@@ -781,7 +781,7 @@ sudo systemctl restart ai-monitor-web   # 若启用了 Web
 | 无静音检测 / FFmpeg 退出 | 流无音轨导致 filter 失败（后续可做无音轨兼容）；暂只测有声道节目 |
 | 状态 `stale` | Worker 挂了或机器卡顿；看 `worker-N.log`、systemd |
 | Web 看不到新频道 | 是否写到正确 workdir 的 `config/channels.yaml`；Manager 是否在同一目录启动 |
-| 截图花屏/半帧 | 先抽关键帧，能解出正常画面就用正常的那张。两张都是绿才告警，纯绿小块也算。大块绿条不上大屏。已加固 latest 读取；仍差可关旁路 `frame_interval_sec: 0` 试对比 |
+| 截图花屏/半帧 | 实时图按整路码率从收包环尾部取约 8 秒（最少 12MB，最多 40MB），连抽几张关键帧，用靠后的一张能看的。竖彩条、发白竖条和画面下沿的彩条不上大屏，也不当花屏告警。整段 64MB 不拿去解。单套、码率不高时仍约 12MB。告警截图仍只用异常那几秒。大块绿条不上大屏 |
 | AI 不工作 | `enabled`、依赖、`mode`、模型路径；看频道日志 AI 状态行 |
 | 改配置不生效 | 是否 `--no-reload`；mtime 是否更新；看 Manager 日志「热重载完成」 |
 

@@ -15,6 +15,7 @@ def jpeg_looks_displayable(data, min_bytes=2048):
     Return (ok, reason).
     ok=False for green-screen decode errors and low-contrast gray wash.
     A picture with a pure-green horizontal bar is decode concealment, not a thumb.
+    A vertical color smear from a mid-GOP cut is not a thumb either.
     Real black (very dark) is allowed so 黑场 still shows.
     """
     if not data or len(data) < int(min_bytes):
@@ -25,11 +26,56 @@ def jpeg_looks_displayable(data, min_bytes=2048):
     if rgb is None:
         # 解不开像素时不当绿灯，避免半截图上屏
         return False, "undecodable"
-    buf, w, h, full_conceal = rgb
-    # 细绿条缩成 96x54 会粘成一整片绿，所以先看原图
-    if full_conceal:
-        return False, "conceal"
+    buf, w, h, full_reason = rgb
+    # 细绿条缩成 96x54 会粘成一整片绿，竖彩条也会被缩小抹平，所以先看原图
+    if full_reason:
+        return False, full_reason
     return _judge_rgb(buf, w, h)
+
+
+def vertical_smear_hwc(img):
+    """竖彩条：某一横带里每一列几乎不变，列和列的颜色却差得开。
+
+    缓存从半路切开、参数集还没到时，会吐出整幅竖条，或者画面底下拖一条彩条。
+    发白、对比很低的竖条也算。纯黑边和整幅纯色的列与列没有色差，不算。
+    正常画面每一列里还有纹理。
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return False
+    arr = np.ascontiguousarray(img)
+    if getattr(arr, "ndim", 0) != 3 or arr.shape[2] < 3:
+        return False
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if h < 40 or w < 40:
+        return False
+    rgb = arr[:, :, :3].astype(np.float32)
+    luma = (rgb[:, :, 0] * 3 + rgb[:, :, 1] * 6 + rgb[:, :, 2]) / 10.0
+    # 整幅高对比竖条。列内几乎不变，列与列差很多。
+    if float(luma.std(axis=0).mean()) < 12.0 and float(luma.mean(axis=0).std()) > 22.0:
+        return True
+    # 彩条有时只占最底下大约一成，发白的竖条列与列只差几个亮度。
+    # 用大约 12% 的高度来扫：列内很平且列均值散开，就是竖条。
+    # 纯黑边的列均值几乎一样，不在这里。
+    band_h = max(12, int(h * 0.12))
+    if band_h >= h:
+        return False
+    step = max(1, band_h // 3)
+    last = h - band_h
+    starts = list(range(0, last + 1, step))
+    if not starts or starts[-1] != last:
+        starts.append(last)
+    flat_wash = 0
+    for y0 in starts:
+        sl = luma[y0 : y0 + band_h]
+        col_std = float(sl.std(axis=0).mean())
+        spread = float(sl.mean(axis=0).std())
+        if col_std < 1.2 and spread > 18.0:
+            return True
+        if col_std < 1.0 and spread > 4.0:
+            flat_wash += 1
+    return flat_wash * 3 >= len(starts)
 
 
 def concealment_hwc(img):
@@ -329,8 +375,17 @@ def _concealment_python(buf, w, h):
     return _rows_are_concealment(fill, picture)
 
 
+def _full_frame_reject_reason(img):
+    """原图上的解码废图。竖彩条和绿横条都要在缩小之前看。"""
+    if concealment_hwc(img):
+        return "conceal"
+    if vertical_smear_hwc(img):
+        return "smear"
+    return None
+
+
 def _decode_rgb_small(data):
-    """返回 (小图 RGB, 宽, 高, 原图是不是解码绿条)。最后一项未知时是 None。"""
+    """返回 (小图 RGB, 宽, 高, 原图废图原因)。看不出来时最后一项是 None。"""
     try:
         import cv2
         import numpy as np
@@ -340,9 +395,9 @@ def _decode_rgb_small(data):
         if bgr is None:
             return None
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        conceal = concealment_hwc(rgb)
+        reason = _full_frame_reject_reason(rgb)
         small = cv2.resize(rgb, (96, 54))
-        return bytes(small.tobytes()), 96, 54, bool(conceal)
+        return bytes(small.tobytes()), 96, 54, reason
     except Exception:
         pass
     try:
@@ -351,16 +406,17 @@ def _decode_rgb_small(data):
 
         im = Image.open(io.BytesIO(data)).convert("RGB")
         w, h = im.size
-        conceal = False
+        reason = None
         try:
             import numpy as np
 
-            conceal = concealment_hwc(np.asarray(im))
+            reason = _full_frame_reject_reason(np.asarray(im))
         except Exception:
-            conceal = concealment_rgb_bytes(im.tobytes(), w, h)
+            if concealment_rgb_bytes(im.tobytes(), w, h):
+                reason = "conceal"
         im.thumbnail((96, 54))
         sw, sh = im.size
-        return im.tobytes(), sw, sh, bool(conceal)
+        return im.tobytes(), sw, sh, reason
     except Exception:
         pass
     try:
