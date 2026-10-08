@@ -356,8 +356,18 @@
         <button class="lb-close" id="preview-close" type="button">×</button>
       </div>
       <div class="modal-body">
+        <div id="preview-stage" class="preview-stage" style="display:none">
+          <img id="preview-thumb" alt="" />
+          <div class="vu-col">
+            <div class="vu vu-lg" id="preview-vu" data-id="">
+              <div class="vu-scale"></div>
+              <div class="vu-mask"></div>
+            </div>
+            <div class="vu-db" id="preview-vu-db">--</div>
+          </div>
+        </div>
         <video id="preview-video" controls muted autoplay playsinline style="width:100%;background:#000;max-height:70vh;display:none"></video>
-        <p class="hint" id="preview-hint" style="margin-top:8px">实时截图预览（约每秒刷新）。需该路监测 running 且已有 latest.jpg</p>
+        <p class="hint" id="preview-hint" style="margin-top:8px">实时截图预览（约每秒刷新）。右侧音柱是当前音量。</p>
       </div>
     </div>
   </div>

@@ -411,6 +411,9 @@ def _channel_stats(
             info["reconnect_count"] = st.get("reconnect_count") or 0
             info["pkt_rate"] = st.get("pkt_rate")
             info["bitrate_kbps"] = st.get("bitrate_kbps")
+            info["audio_db"] = st.get("audio_db")
+            info["audio_state"] = st.get("audio_state") or "idle"
+            info["audio_db_ts"] = st.get("audio_db_ts")
             info["capture_skip"] = st.get("capture_skip")
             info["capture_dests"] = st.get("capture_dests")
             info["capture_ring_kb"] = st.get("capture_ring_kb")
@@ -765,6 +768,26 @@ def api_health():
     return info
 
 
+@app.get("/api/audio-levels")
+def api_audio_levels():
+    """各路当前峰值，给大屏音柱用。不带截图和统计。"""
+    cfg = _load_config()
+    levels = {}
+    for ch in cfg.get("channels") or []:
+        if not ch.get("enabled", True):
+            continue
+        cid = str(ch.get("id") or "")
+        if not cid:
+            continue
+        st = _read_status_file(cid) or {}
+        levels[cid] = {
+            "audio_db": st.get("audio_db"),
+            "audio_state": st.get("audio_state") or "idle",
+            "audio_db_ts": st.get("audio_db_ts"),
+        }
+    return {"levels": levels}
+
+
 @app.get("/api/dashboard")
 def api_dashboard():
     """大屏数据：频道交通灯 + 24h 统计。"""
@@ -817,6 +840,9 @@ def api_dashboard():
                 "thumb_url": thumb,
                 "pkt_rate": s.get("pkt_rate"),
                 "bitrate_kbps": s.get("bitrate_kbps"),
+                "audio_db": s.get("audio_db"),
+                "audio_state": s.get("audio_state") or "idle",
+                "audio_db_ts": s.get("audio_db_ts"),
                 "iface": s.get("iface"),
                 "category": s.get("category") or [],
                 "preview_base": f"/api/snapshots/{s['id']}",

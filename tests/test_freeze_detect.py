@@ -131,7 +131,34 @@ class FreezeDetectConfigTests(unittest.TestCase):
         fc = m._build_filter_complex()
         self.assertIn("silencedetect=", fc)
         self.assertIn(":d=1.0", fc)
+        self.assertIn("Overall.Peak_level", fc)
         self.assertNotIn("silence_duration", fc)
+
+    def test_level_meter_uses_real_audio_and_skips_null_source(self):
+        m = _mon()
+        fc = m._build_filter_complex()
+        self.assertIn("astats=metadata=1", fc)
+        self.assertIn("Overall.Peak_level", fc)
+        m._audio_unavailable = True
+        m.detect_silence = True
+        m.freeze_mode = "video_silence"
+        fc = m._build_filter_complex()
+        self.assertIn("anullsrc=", fc)
+        self.assertNotIn("astats=", fc)
+
+    def test_peak_line_sets_level_without_raising_an_alarm(self):
+        m = _mon()
+        m._parse_ffmpeg_line(
+            "[Parsed_ametadata_1] lavfi.astats.Overall.Peak_level=-18.063656"
+        )
+        self.assertEqual(m._audio_db, -18.1)
+        self.assertEqual(m._audio_state(), "level")
+        self.assertFalse(m._active_alarms)
+        m._parse_ffmpeg_line(
+            "[Parsed_ametadata_1] lavfi.astats.Overall.Peak_level=-inf"
+        )
+        self.assertEqual(m._audio_db, -120.0)
+        self.assertEqual(m._audio_state(), "level")
 
     def test_video_silence_holds_while_audio_present(self):
         m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8, "alarm_confirm_sec": 3})

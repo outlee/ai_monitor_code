@@ -241,6 +241,9 @@ class StreamMonitor:
         self._audio_unavailable = False
         self._silence_active = False
         self._silence_since = None
+        self._audio_db: Optional[float] = None
+        self._audio_db_ts = 0.0
+        self._audio_status_ts = 0.0
         # 同类告警冷却，避免静帧/恢复来回刷
         self.alarm_cooldown_sec = float(
             defaults.get("alarm_cooldown_sec", 90.0)
@@ -538,14 +541,20 @@ class StreamMonitor:
         )
         if meter and self._audio_unavailable:
             # 这一路没有音频 PID。静帧退回只看画面，图仍然要有一路音频输出。
+            # 不在空音频上计量，避免音柱一直跳。
             audio = "anullsrc=channel_layout=stereo:sample_rate=8000[aout]"
         elif meter:
             audio = (
-                "[%s]silencedetect=noise=%sdB:d=%.1f[aout]"
-                % (ain, self.silence_threshold, self._silence_probe_d)
+                "[%s]silencedetect=noise=%sdB:d=%.1f,%s[aout]"
+                % (
+                    ain,
+                    self.silence_threshold,
+                    self._silence_probe_d,
+                    self._audio_level_filter(),
+                )
             )
         else:
-            audio = f"[{ain}]volume=1[aout]"
+            audio = "[%s]%s[aout]" % (ain, self._audio_level_filter())
 
         dw = self.detect_width
         # 监测只走 null。同一张图上再挂 FIFO/image2/pipe:1 时，这台
@@ -559,6 +568,55 @@ class StreamMonitor:
         else:
             v = f"[{vin}]{detect}[vout]"
         return f"{v};{audio}"
+
+    @staticmethod
+    def _audio_level_filter() -> str:
+        """峰值电平。每 0.5 秒只打一两行，不按音频帧刷日志。"""
+        return (
+            "astats=metadata=1:reset=0:length=0.3:"
+            "measure_perchannel=none:measure_overall=Peak_level,"
+            "ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:"
+            "enable='lt(mod(t\\,0.5)\\,0.03)'"
+        )
+
+    def _audio_level_value(self) -> Optional[float]:
+        if self._audio_unavailable or self._audio_db is None:
+            return None
+        return self._audio_db
+
+    def _audio_state(self) -> str:
+        if self._audio_unavailable:
+            return "none"
+        if not self._audio_db_ts or (_now_ts() - self._audio_db_ts) > 8.0:
+            return "idle"
+        return "level"
+
+    def _note_peak_line(self, line: str) -> bool:
+        """读到峰值就更新音柱。返回 True 表示这行不是告警。"""
+        matched = self._RE_PEAK.search(line)
+        if not matched:
+            return False
+        raw = matched.group(1).lower()
+        if raw == "nan":
+            return True
+        if raw.endswith("inf"):
+            db = 0.0 if raw.startswith("+") else -120.0
+        else:
+            try:
+                db = float(raw)
+            except ValueError:
+                return True
+        if db > 0:
+            db = 0.0
+        if db < -120:
+            db = -120.0
+        self._audio_db = round(db, 1)
+        self._audio_db_ts = _now_ts()
+        now = self._audio_db_ts
+        if now - self._audio_status_ts >= 1.0:
+            self._audio_status_ts = now
+            self._write_status()
+        return True
 
     def _build_ffmpeg_cmd(self) -> List[str]:
         """规则检测；frame_interval>0 时同一解码器旁路写 latest.jpg。"""
@@ -653,6 +711,9 @@ class StreamMonitor:
             if latest_age is not None
             else None,
             "ai_async": self.ai_async,
+            "audio_db": self._audio_level_value(),
+            "audio_state": self._audio_state(),
+            "audio_db_ts": self._audio_db_ts or None,
         }
         cap = self._capture_stats()
         if cap:
@@ -2222,6 +2283,10 @@ class StreamMonitor:
 
     # ---------- FFmpeg 行解析 ----------
 
+    _RE_PEAK = re.compile(
+        r"lavfi\.astats\.Overall\.Peak_level=(-?\d+(?:\.\d+)?|-?inf|nan)",
+        re.IGNORECASE,
+    )
     _RE_DURATION = re.compile(
         r"(?:black_duration|freeze_duration|silence_duration)\s*[:=]\s*([0-9.]+)",
         re.I,
@@ -2301,7 +2366,10 @@ class StreamMonitor:
             "stream specifier" in lower and ":a" in lower
         ):
             self._audio_unavailable = True
+            self._audio_db = None
+            self._audio_db_ts = 0.0
             self.logger.warning("未找到音频，下一轮静帧只看画面")
+            self._write_status()
 
     def _emit_alarm_event(
         self,
@@ -2373,6 +2441,8 @@ class StreamMonitor:
             return
 
         self._last_ffmpeg_activity_ts = _now_ts()
+        if self._note_peak_line(line):
+            return
         now = _now_str()
         lower = line.lower()
         self._note_audio_missing(lower)
@@ -2806,7 +2876,8 @@ class StreamMonitor:
                 continue
             if line is None:
                 break
-            last_lines.append(line.rstrip())
+            if "Overall.Peak_level" not in line and "Parsed_ametadata" not in line:
+                last_lines.append(line.rstrip())
             self._parse_ffmpeg_line(line)
             self._maybe_run_ai_inline()
             self._maybe_heartbeat()

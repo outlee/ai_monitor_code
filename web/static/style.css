@@ -132,12 +132,89 @@ body {
   flex-direction: column;
 }
 .ch-card:hover { transform: translateY(-1px); border-color: #475569; }
+.ch-media {
+  display: flex;
+  align-items: stretch;
+  gap: 3px;
+  padding-right: 3px;
+  background: #0b1220;
+}
+.ch-media .ch-thumb {
+  flex: 1 1 auto;
+  width: 1px;
+  min-width: 0;
+}
 .ch-thumb {
   width: 100%;
   aspect-ratio: 16 / 9;
   background: #0b1220;
   object-fit: cover;
   display: block;
+}
+.vu {
+  position: relative;
+  flex: 0 0 12px;
+  width: 12px;
+  align-self: stretch;
+  border-radius: 3px;
+  overflow: hidden;
+  background: #020617;
+  margin: 3px 0;
+}
+.vu-scale {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to top,
+    #15803d 0%,
+    #15803d 62%,
+    #ca8a04 62%,
+    #ca8a04 85%,
+    #dc2626 85%,
+    #dc2626 100%
+  );
+}
+.vu-mask {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 100%;
+  background: rgba(2, 6, 23, 0.88);
+}
+.vu-none .vu-scale { opacity: 0.2; }
+.vu-idle .vu-scale { opacity: 0.35; }
+.preview-stage {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  background: #000;
+}
+.preview-stage img {
+  flex: 1 1 auto;
+  width: 1px;
+  min-width: 0;
+  max-height: 70vh;
+  object-fit: contain;
+  background: #000;
+}
+.vu-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 52px;
+  flex: 0 0 52px;
+}
+.vu.vu-lg {
+  flex: 1 1 auto;
+  width: 22px;
+  margin: 0;
+}
+.vu-db {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #e5e7eb;
+  font-variant-numeric: tabular-nums;
 }
 .ch-thumb.placeholder {
   display: flex; align-items: center; justify-content: center;

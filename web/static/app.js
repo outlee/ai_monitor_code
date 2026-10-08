@@ -531,6 +531,49 @@
     return parts.join(" · ");
   }
 
+  function vuPercent(db) {
+    const v = Math.max(-60, Math.min(0, Number(db)));
+    if (!isFinite(v)) return 0;
+    return ((v + 60) / 60) * 100;
+  }
+
+  function vuTitle(db, state) {
+    if (state === "none") return "这一路没有音频";
+    if (db == null || db === "" || !isFinite(Number(db))) return "暂无电平";
+    return Math.round(Math.max(-60, Math.min(0, Number(db)))) + " dB";
+  }
+
+  function vuMeterHtml(id, db, state) {
+    const view = state || "idle";
+    const pct = view === "none" || db == null || db === "" ? 0 : vuPercent(db);
+    const mask = Math.max(0, Math.min(100, 100 - pct));
+    const cls = ["vu"];
+    if (view === "none") cls.push("vu-none");
+    if (view === "idle") cls.push("vu-idle");
+    return `<div class="${cls.join(" ")}" data-id="${escapeHtml(
+      id || ""
+    )}" title="${escapeHtml(vuTitle(db, view))}"><div class="vu-scale"></div><div class="vu-mask" style="height:${mask.toFixed(
+      1
+    )}%"></div></div>`;
+  }
+
+  function paintVu(el, row) {
+    if (!el) return;
+    const state = (row && row.audio_state) || "idle";
+    const db = row && row.audio_db != null && row.audio_db !== "" ? row.audio_db : null;
+    el.classList.toggle("vu-none", state === "none");
+    el.classList.toggle("vu-idle", state === "idle");
+    const pct = state === "none" || db == null ? 0 : vuPercent(db);
+    const mask = el.querySelector(".vu-mask");
+    if (mask) mask.style.height = Math.max(0, Math.min(100, 100 - pct)).toFixed(1) + "%";
+    const title = vuTitle(db, state);
+    el.title = title;
+    if (el.id === "preview-vu") {
+      const num = document.getElementById("preview-vu-db");
+      if (num) num.textContent = state === "none" ? "无" : title === "暂无电平" ? "--" : title.replace(" dB", "");
+    }
+  }
+
   function channelCardHtml(c, large) {
     const alarms = formatAlarmTags(c.active_alarms, c.last_type);
     const prog =
@@ -541,6 +584,11 @@
     const thumb = c.thumb_url
       ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
+    const media = `<div class="ch-media">${thumb}${vuMeterHtml(
+      c.id,
+      c.audio_db,
+      c.audio_state
+    )}</div>`;
     const tags = [];
     if (c.node_name) tags.push(c.node_name);
     cardTags(c).forEach((t) => tags.push(t));
@@ -553,7 +601,7 @@
       c.id
     )}" data-snap="${escapeHtml(snap)}" title="${escapeHtml(c.name || c.id)}">
       ${tagHtml}
-      ${thumb}
+      ${media}
       <div class="ch-body">
         <div class="ch-name">${escapeHtml(c.name || c.id)}</div>
         <div class="ch-id">${escapeHtml(c.channel_id || c.id)}${prog ? " · " + escapeHtml(prog) : ""}</div>
@@ -948,23 +996,25 @@
         v.style.display = "block";
       } catch (e) {}
     }
-    const img = document.getElementById("preview-thumb");
-    if (img) img.style.display = "none";
+    const stage = document.getElementById("preview-stage");
+    if (stage) stage.style.display = "none";
+    const vu = document.getElementById("preview-vu");
+    if (vu) vu.dataset.id = "";
   }
 
   function startThumbFallback(channelId, hint, snapBase) {
     const video = $("#preview-video");
     if (!video) return;
-    // 用图片轮询代替直播（内网更稳）
-    let img = document.getElementById("preview-thumb");
-    if (!img) {
-      img = document.createElement("img");
-      img.id = "preview-thumb";
-      img.style.cssText = "width:100%;max-height:70vh;object-fit:contain;background:#000";
-      video.style.display = "none";
-      video.parentNode.insertBefore(img, video);
+    const stage = document.getElementById("preview-stage");
+    const img = document.getElementById("preview-thumb");
+    const vu = document.getElementById("preview-vu");
+    video.style.display = "none";
+    if (stage) stage.style.display = "flex";
+    if (vu) {
+      vu.dataset.id = channelId || "";
+      paintVu(vu, { audio_db: null, audio_state: "idle" });
     }
-    img.style.display = "block";
+    if (!img) return;
     const base = snapBase || ("/api/snapshots/" + encodeURIComponent(channelId));
     const tick = () => {
       img.src = base.replace(/\/$/, "") + "/latest.jpg?t=" + Date.now();
@@ -972,7 +1022,7 @@
     tick();
     previewThumbTimer = setInterval(tick, 1000);
     if (hint) {
-      hint.textContent = "当前为实时截图预览（每秒刷新）。直播播放失败时自动降级。";
+      hint.textContent = "实时画面每秒刷新。右侧音柱是当前音量，大约每秒跟着变。";
     }
   }
 
@@ -1816,6 +1866,22 @@
       closeImportModal();
     }
   });
+
+  let levelTimer = null;
+  async function refreshAudioLevels() {
+    if (!document.querySelector(".vu[data-id]")) return;
+    try {
+      const data = await fetchJSON("/api/audio-levels", 4000);
+      const levels = (data && data.levels) || {};
+      document.querySelectorAll(".vu[data-id]").forEach((el) => {
+        const id = el.dataset.id;
+        if (!id || !levels[id]) return;
+        paintVu(el, levels[id]);
+      });
+    } catch (e) {}
+  }
+  if (levelTimer) clearInterval(levelTimer);
+  levelTimer = setInterval(refreshAudioLevels, 1500);
 
   refresh();
   setupAuto();
