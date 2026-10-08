@@ -504,6 +504,211 @@ def _hub_map_for_iface(iface):
     return mapping, ips
 
 
+def _psi_sections(pkt):
+    """PSI sections that fit entirely in this 188-byte packet."""
+    if not pkt or len(pkt) < 188 or pkt[0] != 0x47:
+        return
+    adapt = (pkt[3] >> 4) & 0x03
+    off = 4
+    if adapt & 0x02:
+        if off >= 188:
+            return
+        alen = pkt[off]
+        off += 1 + alen
+    if not (adapt & 0x01) or off >= 188:
+        return
+    if pkt[1] & 0x40:
+        pointer = pkt[off]
+        off += 1 + pointer
+    while off + 3 <= 188:
+        if pkt[off] == 0xFF:
+            return
+        seclen = ((pkt[off + 1] & 0x0F) << 8) | pkt[off + 2]
+        total = 3 + seclen
+        if seclen < 1 or off + total > 188:
+            return
+        yield pkt[off : off + total]
+        off += total
+
+
+def _parse_pat(section):
+    """Return (version, {program_number: pmt_pid}) or None."""
+    if not section or section[0] != 0x00 or len(section) < 12:
+        return None
+    if (section[1] & 0x80) == 0 or (section[5] & 0x01) == 0:
+        return None
+    seclen = ((section[1] & 0x0F) << 8) | section[2]
+    if seclen < 9 or 3 + seclen > len(section):
+        return None
+    version = (section[5] >> 1) & 0x1F
+    body_end = 3 + seclen - 4
+    progs = {}
+    i = 8
+    while i + 4 <= body_end:
+        pnum = (section[i] << 8) | section[i + 1]
+        pid = ((section[i + 2] & 0x1F) << 8) | section[i + 3]
+        i += 4
+        if pnum == 0 or pid == 0 or pid == 0x1FFF:
+            continue
+        progs[pnum] = pid
+    return version, progs
+
+
+def _parse_pmt(section):
+    """Return (version, program_number, pcr_pid, [es_pid, ...]) or None."""
+    if not section or section[0] != 0x02 or len(section) < 16:
+        return None
+    if (section[1] & 0x80) == 0 or (section[5] & 0x01) == 0:
+        return None
+    seclen = ((section[1] & 0x0F) << 8) | section[2]
+    if seclen < 13 or 3 + seclen > len(section):
+        return None
+    version = (section[5] >> 1) & 0x1F
+    program = (section[3] << 8) | section[4]
+    pcr = ((section[8] & 0x1F) << 8) | section[9]
+    pil = ((section[10] & 0x0F) << 8) | section[11]
+    body_end = 3 + seclen - 4
+    i = 12 + pil
+    if i > body_end:
+        return None
+    es = []
+    while i + 5 <= body_end:
+        epid = ((section[i + 1] & 0x1F) << 8) | section[i + 2]
+        esil = ((section[i + 3] & 0x0F) << 8) | section[i + 4]
+        if epid and epid != 0x1FFF:
+            es.append(epid)
+        i += 5 + esil
+    return version, program, pcr, es
+
+
+class _ProgramMeter(object):
+    """Bytes of each service: its PMT, PCR and elementary PIDs. Not the whole mux."""
+
+    def __init__(self):
+        self.pmt_of = {}
+        self.pids = {}
+        self.pat_ver = None
+        self.pmt_ver = {}
+        self._by_pid = {}
+        self._pmt_pids = set()
+        self._win = {}
+        self.rates = {}
+
+    def _reindex(self):
+        by = {}
+        for prog, pids in self.pids.items():
+            for pid in pids:
+                by.setdefault(pid, []).append(prog)
+        self._by_pid = {pid: tuple(progs) for pid, progs in by.items()}
+        self._pmt_pids = set(self.pmt_of.values())
+
+    def _take_pat(self, section):
+        parsed = _parse_pat(section)
+        if not parsed:
+            return
+        version, progs = parsed
+        if version == self.pat_ver and progs == self.pmt_of:
+            return
+        self.pat_ver = version
+        self.pmt_of = progs
+        for prog in list(self.pids):
+            if prog not in progs:
+                del self.pids[prog]
+        for pid in list(self.pmt_ver):
+            if pid not in progs.values():
+                del self.pmt_ver[pid]
+        self._reindex()
+
+    def _take_pmt(self, section, pid):
+        parsed = _parse_pmt(section)
+        if not parsed:
+            return
+        version, program, pcr, es = parsed
+        if program <= 0:
+            return
+        known = self.pmt_of.get(program)
+        if known is not None and known != pid:
+            return
+        if self.pmt_ver.get(pid) == version and program in self.pids:
+            return
+        pids = set(es)
+        if pcr and pcr != 0x1FFF:
+            pids.add(pcr)
+        pids.add(pid)
+        pids.discard(0)
+        pids.discard(0x1FFF)
+        self.pids[program] = pids
+        self.pmt_ver[pid] = version
+        if known is None:
+            self.pmt_of[program] = pid
+        self._reindex()
+
+    def feed(self, payload):
+        if not payload:
+            return
+        n = len(payload) // 188
+        data = payload
+        win = self._win
+        by = self._by_pid
+        pmt_pids = self._pmt_pids
+        for i in range(n):
+            off = i * 188
+            if data[off] != 0x47:
+                continue
+            pid = ((data[off + 1] & 0x1F) << 8) | data[off + 2]
+            if pid == 0 or pid in pmt_pids:
+                pkt = data[off : off + 188]
+                for sec in _psi_sections(pkt):
+                    if pid == 0:
+                        self._take_pat(sec)
+                    else:
+                        self._take_pmt(sec, pid)
+                by = self._by_pid
+                pmt_pids = self._pmt_pids
+            if pid == 0 or pid == 0x1FFF:
+                continue
+            owners = by.get(pid)
+            if not owners:
+                continue
+            for prog in owners:
+                win[prog] = win.get(prog, 0) + 188
+
+    def roll(self, dt):
+        dt = dt if dt and dt > 0 else 1e-6
+        rates = {}
+        for prog in self.pids:
+            nbytes = self._win.get(prog, 0)
+            rates[prog] = round(nbytes * 8.0 / dt / 1000.0, 1)
+        self.rates = rates
+        self._win = {}
+        return rates
+
+
+def pick_program_bitrate(programs, program):
+    """kbps for one service. None if this channel's program is not in the map yet.
+
+    A channel with no program number uses the rate only when the mux has one service.
+    """
+    if not programs:
+        return None
+    if program is None:
+        if len(programs) != 1:
+            return None
+        return next(iter(programs.values()))
+    if program in programs:
+        return programs[program]
+    text = str(program)
+    if text in programs:
+        return programs[text]
+    try:
+        key = int(program)
+    except (TypeError, ValueError):
+        return None
+    if key in programs:
+        return programs[key]
+    return None
+
+
 def _deliver(hub, payload, out_sock):
     ring = hub.get("ring")
     if ring is not None:
@@ -532,6 +737,14 @@ def _deliver(hub, payload, out_sock):
     st["b"] += len(payload)
     st["pkts"] += 1
     st["bytes"] += len(payload)
+    meter = hub.get("prog")
+    if meter is None:
+        meter = _ProgramMeter()
+        hub["prog"] = meter
+    try:
+        meter.feed(payload)
+    except Exception:
+        pass
     now = time.time()
     if now - st["t"] >= 1.0:
         dt = max(now - st["t"], 1e-6)
@@ -540,6 +753,10 @@ def _deliver(hub, payload, out_sock):
             rsz = hub.get("ring").size() if hub.get("ring") else 0
         except Exception:
             pass
+        try:
+            programs = meter.roll(dt)
+        except Exception:
+            programs = {}
         with hub["dest_lock"]:
             nd = len(list(_all_local_ports(hub)))
         hub["stats"] = {
@@ -551,6 +768,7 @@ def _deliver(hub, payload, out_sock):
             "bytes": st["bytes"],
             "pkt_rate": round(st["n"] / dt, 1),
             "bitrate_kbps": round(st["b"] * 8.0 / dt / 1000.0, 1),
+            "programs": programs,
             "dests": nd,
             "ring_kb": int(rsz / 1024),
             "updated_ts": now,
@@ -801,6 +1019,7 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
                 "dest_lock": threading.Lock(),
                 "logger": logger,
                 "ring": _TsRing(_DEFAULT_RING_BYTES),
+                "prog": _ProgramMeter(),
             }
             _hubs[key] = hub
         else:

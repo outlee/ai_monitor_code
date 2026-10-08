@@ -719,6 +719,8 @@ class StreamMonitor:
         if cap:
             payload["pkt_rate"] = cap.get("pkt_rate")
             payload["bitrate_kbps"] = cap.get("bitrate_kbps")
+            if cap.get("program_bitrate_kbps") is not None:
+                payload["program_bitrate_kbps"] = cap.get("program_bitrate_kbps")
             payload["capture_skip"] = cap.get("skip")
             payload["capture_dests"] = cap.get("dests")
             payload["capture_ring_kb"] = cap.get("ring_kb")
@@ -751,10 +753,10 @@ class StreamMonitor:
         if not self._capture_key:
             return {}
         try:
-            from iface_mcast import hub_stats
+            from iface_mcast import hub_stats, pick_program_bitrate
         except ImportError:
             try:
-                from workers.iface_mcast import hub_stats
+                from workers.iface_mcast import hub_stats, pick_program_bitrate
             except ImportError:
                 return {}
         try:
@@ -762,9 +764,16 @@ class StreamMonitor:
         except Exception:
             return {}
         try:
-            return hub_stats(iface, group, port) or {}
+            st = hub_stats(iface, group, port) or {}
         except Exception:
             return {}
+        if not st:
+            return {}
+        chosen = pick_program_bitrate(st.get("programs") or {}, self.program)
+        if chosen is not None:
+            st = dict(st)
+            st["program_bitrate_kbps"] = chosen
+        return st
 
     def _media_timeout_sec(self) -> float:
         return max(float(self.defaults.get("input_timeout_sec", 15.0)), 20.0)

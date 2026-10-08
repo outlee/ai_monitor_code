@@ -521,9 +521,22 @@
     return "0";
   }
 
+  function shownBitrate(c) {
+    // 填了节目号就只显示这一套。整路组播码率留在 bitrate_kbps，不写到卡片上。
+    const hasProg = c.program !== undefined && c.program !== null && c.program !== "";
+    if (hasProg) {
+      if (c.program_bitrate_kbps == null || c.program_bitrate_kbps === "") return "";
+      return fmtBitrate(c.program_bitrate_kbps);
+    }
+    if (c.program_bitrate_kbps != null && c.program_bitrate_kbps !== "") {
+      return fmtBitrate(c.program_bitrate_kbps);
+    }
+    return fmtBitrate(c.bitrate_kbps);
+  }
+
   function streamLabel(c) {
     const parts = [];
-    const br = fmtBitrate(c.bitrate_kbps);
+    const br = shownBitrate(c);
     if (br) parts.push(br);
     if (c.pkt_rate != null && c.pkt_rate !== "") {
       parts.push(Number(c.pkt_rate).toFixed(0) + " pkt/s");
@@ -584,7 +597,7 @@
 
   function channelCardHtml(c, large) {
     const fault = cardFault(c);
-    const rate = fmtBitrate(c.bitrate_kbps);
+    const rate = shownBitrate(c);
     const thumb = c.thumb_url
       ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;

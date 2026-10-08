@@ -411,6 +411,7 @@ def _channel_stats(
             info["reconnect_count"] = st.get("reconnect_count") or 0
             info["pkt_rate"] = st.get("pkt_rate")
             info["bitrate_kbps"] = st.get("bitrate_kbps")
+            info["program_bitrate_kbps"] = st.get("program_bitrate_kbps")
             info["audio_db"] = st.get("audio_db")
             info["audio_state"] = st.get("audio_state") or "idle"
             info["audio_db_ts"] = st.get("audio_db_ts")
@@ -840,6 +841,7 @@ def api_dashboard():
                 "thumb_url": thumb,
                 "pkt_rate": s.get("pkt_rate"),
                 "bitrate_kbps": s.get("bitrate_kbps"),
+                "program_bitrate_kbps": s.get("program_bitrate_kbps"),
                 "audio_db": s.get("audio_db"),
                 "audio_state": s.get("audio_state") or "idle",
                 "audio_db_ts": s.get("audio_db_ts"),
