@@ -327,6 +327,14 @@ class FreezeDetectConfigTests(unittest.TestCase):
         self.assertEqual(saved[0]["message"], "检测到花屏")
         self.assertEqual(saved[0]["type"], "ai_green_screen")
 
+    def test_conceal_bar_is_not_sent_to_ai(self):
+        m = _mon()
+        blob = b"\xff\xd8" + b"g" * 3000 + b"\xff\xd9"
+        m._stash_rejected_thumb(blob, "conceal")
+        self.assertFalse((m.snapshot_dir / "latest_ai.jpg").is_file())
+        m._stash_rejected_thumb(blob, "green")
+        self.assertEqual((m.snapshot_dir / "latest_ai.jpg").read_bytes(), blob)
+
     def test_stashed_green_does_not_replace_dashboard_frame(self):
         m = _mon()
         good = b"\xff\xd8" + b"o" * 3000 + b"\xff\xd9"

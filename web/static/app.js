@@ -5,7 +5,7 @@
   let editMode = null;
   let channelCache = {};
   const REFRESH_MS = 8000;
-  // 本地提醒：记录已见事件，避免刷新时重复吵
+  // 本地提醒：记录已见事件，避免刷新时把同一条新告警再播一遍
   let seenEventKeys = new Set();
   let alertsPrimed = false; // 首次加载只建基线，不提醒
   const LS_SOUND = "ai_monitor_sound";
@@ -13,13 +13,16 @@
   const LS_TTS = "ai_monitor_tts";
   const LS_VIEW = "ai_monitor_view";
 
-  // TTS + 抑制（借鉴 igmp_monitor）
+  // TTS + 抑制（借鉴 igmp_monitor）。抑制只挡住「新发生」的重复播报。
   const SUPPRESSION_MS = 5 * 60 * 1000;
   const AGGREGATION_N = 5;
   const AGGREGATION_MS = 10 * 1000;
+  const OPEN_REMIND_MS = 20 * 1000;
   const suppressionMap = new Map();
   let pendingTts = [];
   let aggregationTimer = null;
+  let lastOpenRemindAt = 0;
+  let alertedThisPass = false;
 
   const TYPE_LABELS = {
     black: "黑场",
@@ -41,6 +44,10 @@
   let evOffset = 0;
   const EV_PAGE = 20;
   let evTotal = 0;
+  let snapOffset = 0;
+  const SNAP_PAGE = 24;
+  let snapTotal = 0;
+  let snapReq = 0;
   let orderDirty = false;
   let lastOrderIds = [];
   let lastDashCardIds = [];
@@ -222,13 +229,13 @@
     return p === "granted";
   }
 
-  function desktopNotify(title, body) {
+  function desktopNotify(title, body, tag) {
     if (!("Notification" in window)) return;
     if (Notification.permission !== "granted") return;
     try {
       const n = new Notification(title, {
         body: body,
-        tag: "ai-monitor-alarm",
+        tag: tag || "ai-monitor-alarm",
         renotify: true,
       });
       setTimeout(() => n.close(), 8000);
@@ -266,10 +273,14 @@
     });
     if (!alarms.length) return;
 
-    if ($("#sw-sound") && $("#sw-sound").checked) playBeep();
+    const soundOn = $("#sw-sound") && $("#sw-sound").checked;
+    const ttsOn = $("#sw-tts") && $("#sw-tts").checked;
+    const deskOn = $("#sw-desktop") && $("#sw-desktop").checked;
+    if (soundOn || ttsOn || deskOn) alertedThisPass = true;
+    if (soundOn) playBeep();
     enqueueTts(alarms);
 
-    if ($("#sw-desktop") && $("#sw-desktop").checked) {
+    if (deskOn) {
       ensureNotifyPermission().then((ok) => {
         if (!ok) return;
         const first = alarms[0];
@@ -308,6 +319,78 @@
         (alarms[0].channel_name ? " · " + alarms[0].channel_name : ""),
       "err"
     );
+  }
+
+  function collectOpenAlarms(dash) {
+    const out = [];
+    ((dash && dash.cards) || []).forEach((c) => {
+      if (!c || c.enabled === false) return;
+      const id = c.id || "";
+      const name = c.name || id || "节目";
+      const alarms = (c.active_alarms || []).filter(Boolean);
+      alarms.forEach((t) => {
+        out.push({ type: t, channel_id: id, channel_name: name });
+      });
+      // 断流重连时监测侧会清掉未恢复标记，节目还没回来也要继续提醒
+      if (c.status === "reconnecting" && alarms.indexOf("stream_down") < 0) {
+        out.push({ type: "stream_down", channel_id: id, channel_name: name });
+      }
+    });
+    return out;
+  }
+
+  function openRemindText(list) {
+    if (list.length >= AGGREGATION_N) {
+      return "警告：" + list.length + "路节目仍未恢复，请立即检查";
+    }
+    const byName = new Map();
+    list.forEach((a) => {
+      const name = a.channel_name || a.channel_id || "节目";
+      if (!byName.has(name)) byName.set(name, []);
+      const label = typeLabel(a.type);
+      const arr = byName.get(name);
+      if (arr.indexOf(label) < 0) arr.push(label);
+    });
+    const parts = [];
+    byName.forEach((types, name) => {
+      parts.push(name + types.join("、") + "仍未恢复");
+    });
+    let text = parts.slice(0, 3).join("，");
+    if (parts.length > 3) text += "，另有" + (parts.length - 3) + "路仍未恢复";
+    return text;
+  }
+
+  function remindStillOpen(dash) {
+    const open = collectOpenAlarms(dash);
+    if (!open.length) {
+      lastOpenRemindAt = 0;
+      alertedThisPass = false;
+      return;
+    }
+    // 这一轮已经为新告警响过，20 秒后再重复，避免同一刷新响两声
+    if (alertedThisPass) {
+      alertedThisPass = false;
+      lastOpenRemindAt = Date.now();
+      return;
+    }
+    const soundOn = $("#sw-sound") && $("#sw-sound").checked;
+    const ttsOn = $("#sw-tts") && $("#sw-tts").checked;
+    const deskOn = $("#sw-desktop") && $("#sw-desktop").checked;
+    if (!soundOn && !ttsOn && !deskOn) return;
+    const now = Date.now();
+    if (lastOpenRemindAt && now - lastOpenRemindAt < OPEN_REMIND_MS) return;
+    lastOpenRemindAt = now;
+    if (soundOn) playBeep();
+    if (ttsOn) speak(openRemindText(open));
+    if (deskOn) {
+      const title =
+        open.length === 1
+          ? "仍未恢复: " + typeLabel(open[0].type)
+          : "仍未恢复 × " + open.length;
+      ensureNotifyPermission().then((ok) => {
+        if (ok) desktopNotify(title, openRemindText(open), "ai-monitor-open");
+      });
+    }
   }
 
   function typeClass(t) {
@@ -1255,6 +1338,49 @@
     });
   }
 
+  function paintSnapPager() {
+    const page = Math.floor(snapOffset / SNAP_PAGE) + 1;
+    const pages = Math.max(1, Math.ceil(snapTotal / SNAP_PAGE));
+    if ($("#snap-page-info")) {
+      $("#snap-page-info").textContent = `第 ${page}/${pages} 页 · 共 ${snapTotal} 张`;
+    }
+    const prev = $("#snap-prev");
+    const next = $("#snap-next");
+    if (prev) prev.disabled = snapOffset <= 0;
+    if (next) next.disabled = snapOffset + SNAP_PAGE >= snapTotal;
+  }
+
+  async function loadSnapshotsPage() {
+    const grid = $("#snap-grid");
+    if (!grid) return;
+    const req = ++snapReq;
+    const params = new URLSearchParams();
+    params.set("limit", String(SNAP_PAGE));
+    params.set("offset", String(snapOffset));
+    try {
+      const data = await fetchJSON("/api/snapshots?" + params.toString(), 12000);
+      if (req !== snapReq) return;
+      const snaps = data.snapshots || [];
+      snapTotal = data.total != null ? Number(data.total) : snaps.length;
+      if (!Number.isFinite(snapTotal) || snapTotal < 0) snapTotal = snaps.length;
+      if (snapOffset > 0 && snapOffset >= snapTotal) {
+        const next =
+          snapTotal <= 0
+            ? 0
+            : Math.floor((snapTotal - 1) / SNAP_PAGE) * SNAP_PAGE;
+        snapOffset = next === snapOffset ? 0 : next;
+        return loadSnapshotsPage();
+      }
+      renderSnapshots(data);
+      paintSnapPager();
+    } catch (e) {
+      if (req !== snapReq) return;
+      if (!grid.querySelector(".snap-card")) {
+        grid.innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
+      }
+    }
+  }
+
   function openLightbox(url, cap) {
     $("#lb-img").src = url;
     $("#lb-cap").textContent = cap || "";
@@ -1293,7 +1419,12 @@
       });
       handleNewEvents(overview.recent_events || []);
       renderOverview(overview);
-      if (dash) renderDashboard(dash);
+      if (dash) {
+        renderDashboard(dash);
+        remindStillOpen(dash);
+      } else {
+        alertedThisPass = false;
+      }
       if ($("#stat-storage") && health.sqlite) {
         const mb = ((health.sqlite.db_size_bytes || 0) / 1024 / 1024).toFixed(2);
         $("#stat-storage").textContent =
@@ -1308,9 +1439,7 @@
       $("#health").textContent = h;
 
       // 次要数据：失败不挡住主界面
-      fetchJSON("/api/snapshots?limit=24", 12000)
-        .then((snaps) => renderSnapshots(snaps))
-        .catch(() => {});
+      loadSnapshotsPage().catch(() => {});
       loadEventsPage().catch(() => {});
       const manageVisible =
         $("#view-manage") && !$("#view-manage").classList.contains("hidden");
@@ -1838,6 +1967,8 @@
         toast("清理完成", "ok");
         await refreshStorageDetail();
         await loadEventsPage();
+        if (body.snapshots) snapOffset = 0;
+        await loadSnapshotsPage();
       } catch (e) {
         toast("清理失败: " + (e.message || e), "err");
       } finally {
@@ -1868,6 +1999,16 @@
           loadEventsPage();
         }
       });
+    });
+  }
+  if ($("#snap-prev")) {
+    $("#snap-prev").addEventListener("click", () => {
+      snapOffset = Math.max(0, snapOffset - SNAP_PAGE);
+      loadSnapshotsPage();
+    });
+    $("#snap-next").addEventListener("click", () => {
+      if (snapOffset + SNAP_PAGE < snapTotal) snapOffset += SNAP_PAGE;
+      loadSnapshotsPage();
     });
   }
   if ($("#btn-save-order")) {

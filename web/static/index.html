@@ -22,20 +22,20 @@
         <button type="button" class="btn view-btn active" data-view="dash" id="btn-view-dash">大屏</button>
         <button type="button" class="btn view-btn" data-view="manage" id="btn-view-manage">管理</button>
       </div>
-      <label class="auto-refresh" title="蜂鸣">
+      <label class="auto-refresh" title="新告警立刻蜂鸣；未恢复大约每 20 秒再响一次">
         <input type="checkbox" id="sw-sound" checked />
         声音
       </label>
-      <label class="auto-refresh" title="浏览器语音播报（Web Speech）">
+      <label class="auto-refresh" title="新告警语音播报。同类型 5 分钟内不重复播新发生的；未恢复大约每 20 秒再报一次">
         <input type="checkbox" id="sw-tts" checked />
         TTS
       </label>
-      <label class="auto-refresh" title="需浏览器允许通知权限">
+      <label class="auto-refresh" title="需浏览器允许通知权限。未恢复大约每 20 秒再通知一次">
         <input type="checkbox" id="sw-desktop" checked />
         桌面通知
       </label>
       <button type="button" class="btn" id="btn-tts-test" title="测试语音">测TTS</button>
-      <button type="button" class="btn" id="btn-tts-clear" title="清除抑制窗口">清抑制</button>
+      <button type="button" class="btn" id="btn-tts-clear" title="清除新告警的 5 分钟抑制。未恢复的重复提醒不受这个按钮影响">清抑制</button>
       <label class="auto-refresh">
         <input type="checkbox" id="auto-refresh" checked />
         自动刷新
@@ -87,7 +87,7 @@
     <div id="alarm-strip" class="alarm-strip hidden">
       <div class="panel-head alarm-strip-head">
         <h2>异常节目</h2>
-        <span class="hint">置顶放大 · 点击全屏预览</span>
+        <span class="hint">置顶放大 · 点击全屏预览 · 未恢复大约每 20 秒再提醒</span>
       </div>
       <div class="alarm-grid" id="alarm-grid"></div>
     </div>
@@ -120,7 +120,7 @@
 
     <div class="panel-head" style="margin-top:16px" id="events-anchor">
       <h2>未恢复告警</h2>
-      <span class="hint">仅显示当前仍在持续的异常 · 完整日志在「管理 → 最近事件」</span>
+      <span class="hint">仍在持续的会大约每 20 秒再响一次，直到恢复 · 完整日志在「管理 → 最近事件」</span>
     </div>
     <div class="event-list" id="event-list-dash">
       <div class="empty">加载中…</div>
@@ -159,14 +159,14 @@
           <span>花屏确认 (秒)</span>
           <input type="number" id="inp-ai-confirm" min="1" max="60" step="1" title="连续这么多秒都像花屏或马赛克才告警" />
         </label>
-        <p class="hint">连续这么多秒都像花屏或马赛克才告警。马赛克要画面上真有成片的方块，模型分数单独偏高不算。花屏看绿色占比。</p>
+        <p class="hint">这里填的秒数会在几秒内生效，最短 1 秒。连续这么久都像花屏或马赛克才告警。抽帧先要一张正常画面，解出来仍是花屏或绿屏才报。纯绿连成大约 8×8 的一小块也算，零散像素不算；马赛克要画面上真有成片的方块，模型分数单独偏高不算。</p>
         <label class="field-row">
           <span>模型分数记录</span>
           <input type="number" id="inp-ai-threshold" min="0" max="1" step="0.05" title="只记在明细里，单独偏高不会报马赛克" />
         </label>
         <label class="field-row">
           <span>绿屏占比阈值</span>
-          <input type="number" id="inp-green-th" min="0" max="1" step="0.05" title="绿色像素占比，默认 0.35。花屏和内置检测都用这个值" />
+          <input type="number" id="inp-green-th" min="0" max="1" step="0.05" title="偏绿的画面要占到这个比例才算。另外，连成大约 8×8 的纯绿小块也会报" />
         </label>
         <label class="field-row">
           <span>块状分数阈值</span>
@@ -311,6 +311,12 @@
     <div class="panel-head">
       <h2>异常截图</h2>
       <span class="hint">只显示告警当时留下的画面，不含大屏实时图</span>
+    </div>
+    <div class="event-toolbar snap-toolbar">
+      <button type="button" class="btn" id="snap-prev">上一页</button>
+      <button type="button" class="btn" id="snap-next">下一页</button>
+      <span class="hint" id="snap-page-info">-</span>
+      <span class="hint">每路节目大约只保留最近 100 张，更早的会自动删掉</span>
     </div>
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>

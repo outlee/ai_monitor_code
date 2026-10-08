@@ -25,7 +25,8 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
@@ -290,10 +291,15 @@ def _channel_name_map() -> Dict[str, str]:
     return m
 
 
-def _list_snapshots(channel_id: Optional[str] = None, limit: int = 40) -> List[Dict]:
+def _list_snapshots(
+    channel_id: Optional[str] = None,
+    limit: int = 40,
+    offset: int = 0,
+) -> Tuple[List[Dict], int]:
+    """告警截图按时间从新到旧。返回本页和总数，总数含尚未翻到的旧图。"""
     items: List[Dict] = []
     if not SNAPSHOT_DIR.is_dir():
-        return items
+        return items, 0
 
     names = _channel_name_map()
     if channel_id:
@@ -324,7 +330,10 @@ def _list_snapshots(channel_id: Optional[str] = None, limit: int = 40) -> List[D
                 continue
 
     items.sort(key=lambda x: x["mtime_ts"], reverse=True)
-    return items[:limit]
+    total = len(items)
+    start = max(0, int(offset or 0))
+    end = start + max(0, int(limit or 0))
+    return items[start:end], total
 
 
 def _read_status_file(channel_id: str) -> Optional[Dict[str, Any]]:
@@ -637,23 +646,47 @@ def api_events(
 
 @app.get("/api/snapshots")
 def api_snapshots(
-    limit: int = Query(40, ge=1, le=200),
+    limit: int = Query(40, ge=1, le=5000),
+    offset: int = Query(0, ge=0, le=50000),
     channel_id: Optional[str] = None,
 ):
     nodes = _load_hub_nodes()
     if not hub_mod.hub_is_active(nodes):
-        return {"snapshots": _list_snapshots(channel_id=channel_id, limit=limit)}
+        items, total = _list_snapshots(
+            channel_id=channel_id, limit=limit, offset=offset
+        )
+        return {
+            "snapshots": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }
+    # 全局第 N 张一定落在各台自己的前 N 张里，所以每台取够 offset+limit 再合并。
+    need = int(offset) + int(limit)
+    per = min(5000, max(need, 1))
     items: List[Dict[str, Any]] = []
-    per = max(int(limit), 24)
+    total = 0
     for node in nodes:
         if node.get("url"):
+            qs = "limit=%d&offset=0" % per
+            if channel_id:
+                qs += "&channel_id=%s" % quote(str(channel_id), safe="")
             try:
                 data = hub_mod.fetch_json(
-                    node["url"], "/api/snapshots?limit=%d" % per, timeout=2.5
+                    node["url"], "/api/snapshots?" + qs, timeout=2.5
                 )
             except Exception:
                 data = None
-            for snap in (data or {}).get("snapshots") or []:
+            if not data:
+                continue
+            if data.get("total") is not None:
+                try:
+                    total += int(data["total"])
+                except (TypeError, ValueError):
+                    total += len(data.get("snapshots") or [])
+            else:
+                total += len(data.get("snapshots") or [])
+            for snap in data.get("snapshots") or []:
                 fn = str(snap.get("filename") or "")
                 cid = str(snap.get("channel_id") or "")
                 if channel_id and cid != channel_id:
@@ -666,13 +699,22 @@ def api_snapshots(
                 row["url"] = "/api/hub/snap/%s/%s/%s" % (node["id"], cid, fn)
                 items.append(row)
         else:
-            for snap in _list_snapshots(channel_id=channel_id, limit=per):
+            page, node_total = _list_snapshots(
+                channel_id=channel_id, limit=per, offset=0
+            )
+            total += node_total
+            for snap in page:
                 row = dict(snap)
                 row["node_id"] = node["id"]
                 row["node_name"] = node["name"]
                 items.append(row)
     items.sort(key=lambda x: x.get("mtime_ts") or x.get("mtime") or "", reverse=True)
-    return {"snapshots": items[:limit]}
+    return {
+        "snapshots": items[int(offset) : int(offset) + int(limit)],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 @app.get("/api/hub/nodes")

@@ -1040,7 +1040,7 @@ class StreamMonitor:
         if jpeg_looks_displayable is not None:
             good, reason = jpeg_looks_displayable(blob)
             if not good:
-                self._stash_ai_frame(blob)
+                self._stash_rejected_thumb(blob, reason)
                 return False, reason or last
         return True, last
 
@@ -1102,7 +1102,7 @@ class StreamMonitor:
         map_list.append(["-map", "0:v:1"])
         map_list.append([])
 
-        def _run(maps, skip_key, ss):
+        def _run(maps, skip_key):
             try:
                 if jpg_tmp.is_file():
                     jpg_tmp.unlink()
@@ -1125,8 +1125,6 @@ class StreamMonitor:
             ]
             if skip_key:
                 cmd.extend(["-skip_frame", "nokey"])
-            if ss:
-                cmd.extend(["-ss", str(ss)])
             cmd.extend(["-f", "mpegts", "-i", str(ts_path)])
             cmd.extend(list(maps))
             cmd.extend(
@@ -1147,15 +1145,15 @@ class StreamMonitor:
                     stderr=subprocess.PIPE,
                 )
             except subprocess.TimeoutExpired:
-                return False, "timeout"
+                return False, "timeout", b""
             err = (r.stderr or b"").decode("utf-8", "replace").strip()
             last = err.splitlines()[-1][:200] if err else ""
             if not (jpg_tmp.is_file() and jpg_tmp.stat().st_size > 1024):
-                return False, last
+                return False, last, b""
             try:
                 blob = jpg_tmp.read_bytes()
             except OSError:
-                return False, last
+                return False, last, b""
             try:
                 from frame_quality import jpeg_looks_displayable
             except ImportError:
@@ -1166,21 +1164,42 @@ class StreamMonitor:
             if jpeg_looks_displayable is not None:
                 good, reason = jpeg_looks_displayable(blob)
                 if not good:
-                    self._stash_ai_frame(blob)
-                    return False, reason or last
-            return True, last
+                    # 先不送去告警。同一段缓冲里还可能抽到正常画面。
+                    return False, reason or last, blob
+            return True, last, blob
+
+        def _try_maps(skip_key):
+            found_ok = False
+            found_err = ""
+            found_tear = b""
+            for maps in map_list:
+                good, err, blob = _run(maps, skip_key)
+                if good:
+                    return True, err, b""
+                found_err = err
+                if err in ("conceal", "green") and blob:
+                    found_tear = blob
+            return found_ok, found_err, found_tear
 
         last_err = ""
         ok = False
         via = "gst"
+        tear = b""
         try:
-            # 收包满了以后 ffmpeg 抽 1 帧更省 CPU；gst 作 H.264 兜底
+            # 先抽关键帧。参考帧丢了才会被涂成绿条，关键帧本身通常还是正常画面。
+            # 关键帧不行再抽任意帧。两张都不正常，才把绿图留给花屏检测。
             # 东方卫视等 MPEG-2 常有 0x0 占位流，0:v:0 抽不出，需试 v:1
-            via = "ffmpeg"
-            for maps in map_list:
-                ok, last_err = _run(maps, False, None)
+            via = "ffmpeg_key"
+            ok, last_err, tear = _try_maps(True)
+            if not ok:
+                via = "ffmpeg"
+                ok, err2, tear2 = _try_maps(False)
                 if ok:
-                    break
+                    tear = b""
+                else:
+                    last_err = err2 or last_err
+                    if tear2:
+                        tear = tear2
             if not ok:
                 via = "gst"
                 ok, last_err = self._gst_grab_jpeg(ts_path, jpg_tmp)
@@ -1206,6 +1225,8 @@ class StreamMonitor:
                     )
                     self._last_gst_ok_log = now
                 return True
+            if tear:
+                self._stash_ai_frame(tear)
             self.logger.warning(
                 "[thumb] ring_grab fail ring=%dKB program=%s %s"
                 % (int(len(data) / 1024), self.program, last_err or "no frame")
@@ -1524,7 +1545,7 @@ class StreamMonitor:
         if jpeg_looks_displayable is not None:
             good, reason = jpeg_looks_displayable(data)
             if not good:
-                self._stash_ai_frame(data)
+                self._stash_rejected_thumb(data, reason)
                 now = time.time()
                 last = getattr(self, "_last_bad_thumb_log", 0.0)
                 if now - last >= 30:
@@ -1750,7 +1771,7 @@ class StreamMonitor:
         if jpeg_looks_displayable is not None:
             ok, reason = jpeg_looks_displayable(data)
             if not ok:
-                self._stash_ai_frame(data)
+                self._stash_rejected_thumb(data, reason)
                 now = time.time()
                 last = getattr(self, "_last_bad_thumb_log", 0.0)
                 if now - last >= 30:
@@ -1809,7 +1830,7 @@ class StreamMonitor:
                         if jpeg_looks_displayable is not None:
                             good, reason = jpeg_looks_displayable(data)
                             if not good:
-                                self._stash_ai_frame(data)
+                                self._stash_rejected_thumb(data, reason)
                                 now = time.time()
                                 last = getattr(self, "_last_bad_thumb_log", 0.0)
                                 if now - last >= 30:
@@ -2539,6 +2560,12 @@ class StreamMonitor:
         return None
 
     # ---------- AI（旁路线程，不堵 stderr） ----------
+
+    def _stash_rejected_thumb(self, data: bytes, reason: str) -> None:
+        """整幅花屏留给检测。带画面的纯绿横条是解码补块，不送去报花屏。"""
+        if reason == "conceal":
+            return
+        self._stash_ai_frame(data)
 
     def _stash_ai_frame(self, data: bytes) -> None:
         """大屏不显示的完整画面留给花屏检测。不改 latest.jpg / latest_ok.jpg。"""

@@ -55,6 +55,8 @@ body {
   font-size: 13px;
 }
 .btn:hover { border-color: var(--accent); color: #fff; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn:disabled:hover { border-color: var(--border); color: var(--text); }
 .auto-refresh { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
 
 .cards {
@@ -521,6 +523,7 @@ td.url { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-spac
 .event-msg { color: #c5d0e0; font-size: 12px; word-break: break-all; }
 
 .snapshots-panel { margin: 0 24px 24px; }
+.snap-toolbar { padding: 10px 14px 0; margin-bottom: 0; }
 .snap-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));

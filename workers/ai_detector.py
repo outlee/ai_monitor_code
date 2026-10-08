@@ -28,6 +28,8 @@ logger = logging.getLogger("ai_detector")
 
 # 内置马赛克：平坦小块且和邻居色差大的占比。不用启发式那条 0.12，那条会把正常画面报出去。
 BUILTIN_MOSAIC_RATIO = 0.34
+# 一整块 8x8 纯绿就报。高清上这一块只占画面的大约十万分之三，零散像素不算。
+PURE_GREEN_PATCH = 0.00001
 
 
 def rgb_green_ratio(buf: bytes, w: int, h: int) -> float:
@@ -105,43 +107,80 @@ def rgb_mosaic_ratio(buf: bytes, w: int, h: int, block: int = 8) -> float:
     return hit / float(total)
 
 
+def _frame_concealment(img) -> bool:
+    """原图上是不是「画面还在 + 纯绿横条」。看失败就不当成补块，花屏逻辑照旧。"""
+    try:
+        from frame_quality import concealment_hwc
+    except ImportError:
+        try:
+            from workers.frame_quality import concealment_hwc
+        except ImportError:
+            return False
+    try:
+        return bool(concealment_hwc(img))
+    except Exception:
+        return False
+
+
+def _pure_green_ratio(img) -> float:
+    try:
+        from frame_quality import pure_green_ratio_hwc
+    except ImportError:
+        try:
+            from workers.frame_quality import pure_green_ratio_hwc
+        except ImportError:
+            return 0.0
+    try:
+        return float(pure_green_ratio_hwc(img))
+    except Exception:
+        return 0.0
+
+
 def decide_picture_alarm(
     green_ratio: float,
     mosaic_ratio: float,
     onnx_score: float = 0.0,
     green_th: float = 0.35,
     mosaic_th: float = BUILTIN_MOSAIC_RATIO,
+    concealment: bool = False,
+    pure_ratio: float = 0.0,
 ) -> Dict[str, Any]:
     """花屏看绿色占比，马赛克看方块占比。
 
     ONNX 异常分只记在明细里。这路节目上正常画面也会到 0.5～0.9，
     单靠分数会把新闻和动画报成马赛克。
+    纯绿只要占到一小块也算绿屏。抽帧会先换一张能看的画面，
+    换不到时这张绿才送进来。
     """
     green = float(green_ratio or 0.0)
     mosaic = float(mosaic_ratio or 0.0)
     score = float(onnx_score or 0.0)
-    is_green = green >= float(green_th)
+    pure = float(pure_ratio or 0.0)
+    concealed = bool(concealment)
+    is_green = green >= float(green_th) or pure >= PURE_GREEN_PATCH
     is_block = mosaic >= float(mosaic_th)
     if is_green and is_block:
         label = "green_screen+mosaic"
-        shown = max(green, mosaic, score)
+        shown = max(green, pure, mosaic, score)
     elif is_green:
         label = "green_screen"
-        shown = max(green, score)
+        shown = max(green, pure, score)
     elif is_block:
         label = "mosaic"
         shown = max(mosaic, score)
     else:
         label = "normal"
-        shown = max(green, mosaic)
+        shown = max(green, mosaic, pure)
     return {
         "is_anomaly": label != "normal",
         "score": round(shown, 4),
         "label": label,
         "detail": {
             "green_ratio": round(green, 4),
+            "pure_ratio": round(pure, 4),
             "mosaic_ratio": round(mosaic, 4),
             "onnx_score": round(score, 4),
+            "concealment": concealed,
         },
         "message": label,
     }
@@ -201,33 +240,37 @@ def judge_rgb_alarm(
     green_th: float = 0.35,
     mosaic_th: float = BUILTIN_MOSAIC_RATIO,
 ) -> Dict[str, Any]:
-    """用原始 RGB 判断花屏和马赛克。"""
+    """用原始 RGB 判断花屏和马赛克。纯绿小块也算绿屏。"""
     green = rgb_green_ratio(buf, w, h)
     mosaic = rgb_mosaic_ratio(buf, w, h)
-    is_green = green >= float(green_th)
-    is_mosaic = mosaic >= float(mosaic_th)
-    if is_green and is_mosaic:
-        label = "green_screen+mosaic"
-        score = min(1.0, max(green, mosaic))
-    elif is_green:
-        label = "green_screen"
-        score = min(1.0, green)
-    elif is_mosaic:
-        label = "mosaic"
-        score = min(1.0, mosaic)
-    else:
-        label = "normal"
-        score = max(green, mosaic)
-    return {
-        "is_anomaly": label != "normal",
-        "score": round(float(score), 4),
-        "label": label,
-        "detail": {
-            "green_ratio": round(green, 4),
-            "mosaic_ratio": round(mosaic, 4),
-        },
-        "message": label,
-    }
+    conceal = False
+    pure = 0.0
+    try:
+        from frame_quality import concealment_rgb_bytes, pure_green_ratio_bytes
+    except ImportError:
+        try:
+            from workers.frame_quality import concealment_rgb_bytes, pure_green_ratio_bytes
+        except ImportError:
+            concealment_rgb_bytes = None
+            pure_green_ratio_bytes = None
+    if concealment_rgb_bytes is not None:
+        try:
+            conceal = bool(concealment_rgb_bytes(buf, w, h))
+        except Exception:
+            conceal = False
+    if pure_green_ratio_bytes is not None:
+        try:
+            pure = float(pure_green_ratio_bytes(buf, w, h))
+        except Exception:
+            pure = 0.0
+    return decide_picture_alarm(
+        green,
+        mosaic,
+        green_th=green_th,
+        mosaic_th=mosaic_th,
+        concealment=conceal,
+        pure_ratio=pure,
+    )
 
 
 def _open_rgb(path: Path):
@@ -509,12 +552,16 @@ class AIDetector:
             mosaic_ratio = mosaic_ratio_hwc(full)
         except Exception:
             mosaic_ratio = 0.0
+        # 绿条要在缩图之前看。缩到 224 后，一条条绿会粘成整幅花屏。
+        pure = _pure_green_ratio(full)
         judged = decide_picture_alarm(
             g_ratio,
             mosaic_ratio,
             onnx_score=score,
             green_th=self.green_ratio_th,
             mosaic_th=BUILTIN_MOSAIC_RATIO,
+            concealment=_frame_concealment(full),
+            pure_ratio=pure,
         )
         judged["detail"]["raw"] = float(np.ravel(out)[0]) if out.size else score
         judged["message"] = "画面判定: %s (onnx=%.3f, mosaic=%.3f, green=%.3f)" % (
@@ -544,6 +591,8 @@ class AIDetector:
                     mosaic,
                     green_th=self.green_ratio_th,
                     mosaic_th=BUILTIN_MOSAIC_RATIO,
+                    concealment=_frame_concealment(full),
+                    pure_ratio=_pure_green_ratio(full),
                 )
                 base.update(judged)
                 base["backend"] = "builtin"
@@ -583,6 +632,9 @@ class AIDetector:
             return base
 
         h, w = img.shape[:2]
+        full_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        conceal = _frame_concealment(full_rgb)
+        pure = _pure_green_ratio(full_rgb)
         # 缩小加速
         scale = 320 / max(h, w)
         if scale < 1.0:
@@ -615,8 +667,8 @@ class AIDetector:
 
         block_score = float(np.mean(block_diffs) / 255.0) if block_diffs else 0.0
 
-        # 综合判定
-        is_green = green_ratio >= self.green_ratio_th
+        # 综合判定。纯绿小块也算绿屏。
+        is_green = green_ratio >= self.green_ratio_th or pure >= PURE_GREEN_PATCH
         is_blocky = block_score >= self.block_score_th
         is_anomaly = is_green or is_blocky
 
@@ -640,7 +692,9 @@ class AIDetector:
                 "label": label,
                 "detail": {
                     "green_ratio": round(green_ratio, 4),
+                    "pure_ratio": round(float(pure), 4),
                     "block_score": round(block_score, 4),
+                    "concealment": bool(conceal),
                 },
                 "message": (
                     f"启发式判定: {label} "
