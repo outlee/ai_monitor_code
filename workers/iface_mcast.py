@@ -14,10 +14,14 @@ Also maintains:
 from __future__ import print_function
 
 import collections
+import json
+import mmap
 import os
 import re
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 
@@ -55,36 +59,176 @@ def align_ts_sync(data):
     return data
 
 
-class _TsRing(object):
-    """Packet deque ring; snapshot joins bytes. Avoids O(n) bytearray cuts."""
+class _MmapCounter(object):
+    """写指针放在映射最前面的 8 字节，父子进程读的是同一块。"""
 
-    def __init__(self, maxlen=_DEFAULT_RING_BYTES):
-        self.maxlen = int(maxlen)
-        self._q = collections.deque()
-        self._nbytes = 0
-        self._lock = threading.Lock()
+    def __init__(self, mm):
+        self._mm = mm
+
+    def get(self):
+        return struct.unpack_from("Q", self._mm, 0)[0]
+
+    def set(self, value):
+        struct.pack_into("Q", self._mm, 0, int(value))
+
+
+class _TsRing(object):
+    """一块预先分配的环形缓冲。收包只往里拷贝，不再为每个 UDP 包挂一个长期对象。"""
+
+    def __init__(self, maxlen=_DEFAULT_RING_BYTES, buf=None, lock=None, counter=None):
+        if buf is None:
+            cap = int(maxlen)
+            aligned = cap // 188 * 188
+            self.maxlen = aligned if aligned >= 188 else cap
+            if self.maxlen < 1:
+                self.maxlen = 188
+            self._buf = bytearray(self.maxlen)
+        else:
+            cap = len(buf)
+            aligned = cap // 188 * 188
+            self.maxlen = aligned if aligned >= 188 else cap
+            if self.maxlen < 1:
+                self.maxlen = max(cap, 1)
+            self._buf = buf
+        self._w = 0
+        self._counter = counter
+        if lock is None:
+            self._lock = threading.Lock()
+        else:
+            self._lock = lock
         self.packets = 0
+        if counter is not None:
+            try:
+                self._w = int(counter.get())
+            except Exception:
+                self._w = 0
+
+    def _load_w(self):
+        if self._counter is None:
+            return self._w
+        try:
+            return int(self._counter.get())
+        except Exception:
+            return self._w
+
+    def _store_w(self, value):
+        value = int(value)
+        self._w = value
+        if self._counter is not None:
+            self._counter.set(value)
+
+    def _write_at(self, data):
+        n = len(data)
+        cap = self.maxlen
+        w = self._load_w()
+        if n >= cap:
+            self._buf[:] = data[-cap:]
+            w = cap
+        else:
+            pos = w % cap
+            end = pos + n
+            buf = self._buf
+            if end <= cap:
+                buf[pos:end] = data
+            else:
+                first = cap - pos
+                buf[pos:] = data[:first]
+                buf[: n - first] = data[first:]
+            w += n
+        self._store_w(w)
+        self.packets += 1
 
     def write(self, data):
         if not data:
             return
+        # 共享环只有一个写进程。先写字节再发布写指针，读侧不拿锁。
+        if self._counter is not None:
+            self._write_at(data)
+            return
         with self._lock:
-            self._q.append(data)
-            self._nbytes += len(data)
-            self.packets += 1
-            while self._nbytes > self.maxlen and self._q:
-                old = self._q.popleft()
-                self._nbytes -= len(old)
+            self._write_at(data)
+
+    def _compose(self, raw, w, min_bytes, torn):
+        cap = self.maxlen
+        avail = cap if w >= cap else w
+        if avail < 0:
+            return None
+        if w <= cap:
+            logical = raw[:avail]
+        else:
+            pos = w % cap
+            logical = raw[pos:] + raw[:pos]
+        if torn:
+            if torn >= len(logical):
+                return None
+            logical = logical[torn:]
+        if len(logical) < int(min_bytes):
+            return None
+        if not isinstance(logical, bytes):
+            logical = bytes(logical)
+        return logical
 
     def snapshot(self, min_bytes=0):
-        with self._lock:
-            if self._nbytes < int(min_bytes):
-                return None
-            return b"".join(self._q)
+        if self._counter is None:
+            with self._lock:
+                cap = self.maxlen
+                w = self._load_w()
+                return self._compose(self._buf, w, min_bytes, 0)
+        # 拷贝期间写进程仍往最旧的位置覆盖。丢掉这段，留下的尾部是完整的。
+        cap = self.maxlen
+        w1 = self._load_w()
+        raw = bytes(self._buf[:cap])
+        w2 = self._load_w()
+        if w2 < w1 or (w2 - w1) >= cap:
+            return None
+        if w1 <= cap:
+            torn = w2 - cap if w2 > cap else 0
+        else:
+            torn = w2 - w1
+        torn = (int(torn) + 187) // 188 * 188
+        return self._compose(raw, w1, min_bytes, torn)
 
     def size(self):
-        with self._lock:
-            return self._nbytes
+        if self._counter is None:
+            with self._lock:
+                cap = self.maxlen
+                w = self._load_w()
+                return cap if w >= cap else w
+        cap = self.maxlen
+        w = self._load_w()
+        return cap if w >= cap else w
+
+
+class _PayloadQueue(object):
+    """收包线程只把整包放进来。转发慢时丢掉最旧的转发副本，环形缓冲里已经有了。"""
+
+    def __init__(self, max_bytes):
+        self.max_bytes = int(max_bytes)
+        self._q = collections.deque()
+        self._nbytes = 0
+        self._cv = threading.Condition()
+        self.dropped = 0
+
+    def put(self, hub, payload):
+        size = len(payload)
+        with self._cv:
+            self._q.append((size, hub, payload))
+            self._nbytes += size
+            while self._nbytes > self.max_bytes and len(self._q) > 1:
+                old_size, _hub, _payload = self._q.popleft()
+                self._nbytes -= old_size
+                self.dropped += 1
+            self._cv.notify()
+
+    def get(self, timeout=0.5):
+        with self._cv:
+            if not self._q:
+                self._cv.wait(timeout)
+            if not self._q:
+                return None
+            size, hub, payload = self._q.popleft()
+            self._nbytes -= size
+            return hub, payload
 
 
 class TsFeeder(object):
@@ -384,6 +528,83 @@ def _strip_rtp(payload):
     return payload
 
 
+# 分片不能在快路径里当完整 UDP 用，交给重组。
+_NEED_REASM = object()
+
+
+def _udp_from_frame(frame):
+    """从一个以太网帧里取出未分片的 IPv4/UDP 负载。
+
+    返回 (目的地址 4 字节, 端口, 负载副本)。分片返回 _NEED_REASM。
+    负载按 188 字节对齐，调用方可以立刻收下一帧。
+    """
+    n = len(frame)
+    if n < 42:
+        return None
+    et = (frame[12] << 8) | frame[13]
+    off = 14
+    if et == 0x8100:
+        if n < 46:
+            return None
+        et = (frame[16] << 8) | frame[17]
+        off = 18
+    if et != 0x0800:
+        return None
+    if n < off + 28:
+        return None
+    vihl = frame[off]
+    if (vihl >> 4) != 4:
+        return None
+    ihl = (vihl & 0x0F) * 4
+    if ihl < 20 or n < off + ihl + 8:
+        return None
+    frag = (frame[off + 6] << 8) | frame[off + 7]
+    if frag & 0x3FFF:
+        return _NEED_REASM
+    if frame[off + 9] != 17:
+        return None
+    total = (frame[off + 2] << 8) | frame[off + 3]
+    if total < ihl + 8:
+        return None
+    ip_end = off + total
+    if ip_end > n:
+        ip_end = n
+    udp_off = off + ihl
+    if udp_off + 8 > ip_end:
+        return None
+    dport = (frame[udp_off + 2] << 8) | frame[udp_off + 3]
+    ulen = (frame[udp_off + 4] << 8) | frame[udp_off + 5]
+    dst = bytes(frame[off + 16 : off + 20])
+    pay_off = udp_off + 8
+    pay_end = ip_end
+    if ulen >= 8:
+        want = udp_off + ulen
+        if want <= pay_end:
+            pay_end = want
+    if pay_off >= pay_end:
+        return None
+    # 同步字节对齐时直接返回视图，避免每个 UDP 包再分配一份长期字节。
+    if frame[pay_off] == 0x47:
+        payload = frame[pay_off:pay_end]
+        if len(payload) >= 188:
+            payload = payload[: (len(payload) // 188) * 188]
+        return (dst, dport, payload) if len(payload) else None
+    payload = bytes(frame[pay_off:pay_end])
+    if not payload:
+        return None
+    if payload[0] != 0x47:
+        payload = _strip_rtp(payload)
+        if payload and payload[0] != 0x47 and len(payload) >= 376:
+            aligned = align_ts_sync(payload)
+            if aligned and aligned[0] == 0x47:
+                payload = aligned
+    if not payload:
+        return None
+    if len(payload) >= 188:
+        payload = payload[: (len(payload) // 188) * 188]
+    return (dst, dport, payload) if payload else None
+
+
 def _extract_ip(frame):
     if len(frame) < 14:
         return None
@@ -472,19 +693,26 @@ def _all_local_ports(hub):
     return ports
 
 
-def _raise_rmem_max(nbytes=128 * 1024 * 1024):
-    """SO_RCVBUF 被 rmem_max(~208KB) 卡住时，16MB 形同虚设。"""
-    path = "/proc/sys/net/core/rmem_max"
+def _raise_core_max(path, nbytes):
     try:
-        cur = int(open(path, "r").read().strip())
+        with open(path, "r") as fh:
+            cur = int(fh.read().strip())
     except Exception:
         return
     if cur >= int(nbytes):
         return
     try:
-        open(path, "w").write("%d\n" % int(nbytes))
+        with open(path, "w") as fh:
+            fh.write("%d\n" % int(nbytes))
     except Exception:
         pass
+
+
+def _raise_rmem_max(nbytes=128 * 1024 * 1024):
+    """SO_RCVBUF / SO_SNDBUF 被系统上限卡住时，套接字缓冲形同虚设。"""
+    _raise_core_max("/proc/sys/net/core/rmem_max", nbytes)
+    # 发送缓冲默认只有约 208KB。满了以后非阻塞 sendto 每个包都抛错，收包线程就慢下来。
+    _raise_core_max("/proc/sys/net/core/wmem_max", 16 * 1024 * 1024)
 
 
 def _hub_map_for_iface(iface):
@@ -555,8 +783,73 @@ def _parse_pat(section):
     return version, progs
 
 
+# 广播里常见的 stream_type。0x06 私有流要再看描述符，避免把字幕当成伴音。
+_VIDEO_STREAM = {
+    0x01: "MPEG-1",
+    0x02: "MPEG-2",
+    0x10: "MPEG-4",
+    0x1B: "H.264",
+    0x24: "H.265",
+    0x42: "AVS",
+    0xD2: "AVS2",
+}
+_AUDIO_STREAM = {
+    0x03: "MP2",
+    0x04: "MP2",
+    0x0F: "AAC",
+    0x11: "AAC",
+    0x81: "AC3",
+    0x87: "EAC3",
+}
+
+
+def _private_audio_label(blob):
+    """PES 私有流里的伴音名。没有已知音频描述符就返回空。"""
+    data = blob if isinstance(blob, (bytes, bytearray)) else b""
+    found = ""
+    i = 0
+    while i + 2 <= len(data):
+        tag = data[i]
+        ln = data[i + 1]
+        if i + 2 + ln > len(data):
+            break
+        body = data[i + 2 : i + 2 + ln]
+        i += 2 + ln
+        if tag == 0x6A:
+            found = "AC3"
+        elif tag == 0x7A:
+            found = "EAC3"
+        elif tag == 0x7C:
+            found = "AAC"
+        elif tag == 0x05 and len(body) >= 4:
+            reg = bytes(body[:4])
+            if reg == b"AC-3":
+                found = "AC3"
+            elif reg in (b"EAC3", b"EC-3"):
+                found = "EAC3"
+            elif reg == b"DRA1":
+                found = "DRA"
+    return found
+
+
+def _classify_es(stream_type, desc):
+    """返回 (video|audio|'', 显示名)。"""
+    if stream_type in _VIDEO_STREAM:
+        return "video", _VIDEO_STREAM[stream_type]
+    if stream_type in _AUDIO_STREAM:
+        return "audio", _AUDIO_STREAM[stream_type]
+    if stream_type == 0x06:
+        label = _private_audio_label(desc)
+        if label:
+            return "audio", label
+    return "", ""
+
+
 def _parse_pmt(section):
-    """Return (version, program_number, pcr_pid, [es_pid, ...]) or None."""
+    """Return (version, program_number, pcr_pid, [es_pid, ...], codec) or None.
+
+    codec is {"video": name, "audio": name}. Audio may join two tracks with /.
+    """
     if not section or section[0] != 0x02 or len(section) < 16:
         return None
     if (section[1] & 0x80) == 0 or (section[5] & 0x01) == 0:
@@ -573,13 +866,23 @@ def _parse_pmt(section):
     if i > body_end:
         return None
     es = []
+    video = ""
+    audios = []
     while i + 5 <= body_end:
+        stream_type = section[i]
         epid = ((section[i + 1] & 0x1F) << 8) | section[i + 2]
         esil = ((section[i + 3] & 0x0F) << 8) | section[i + 4]
+        desc_end = i + 5 + esil
+        desc = section[i + 5 : desc_end] if desc_end <= body_end else b""
         if epid and epid != 0x1FFF:
             es.append(epid)
+            kind, label = _classify_es(stream_type, desc)
+            if kind == "video" and label and not video:
+                video = label
+            elif kind == "audio" and label and label not in audios and len(audios) < 2:
+                audios.append(label)
         i += 5 + esil
-    return version, program, pcr, es
+    return version, program, pcr, es, {"video": video, "audio": "/".join(audios)}
 
 
 class _ProgramMeter(object):
@@ -588,6 +891,7 @@ class _ProgramMeter(object):
     def __init__(self):
         self.pmt_of = {}
         self.pids = {}
+        self.codecs = {}
         self.pat_ver = None
         self.pmt_ver = {}
         self._by_pid = {}
@@ -615,6 +919,7 @@ class _ProgramMeter(object):
         for prog in list(self.pids):
             if prog not in progs:
                 del self.pids[prog]
+                self.codecs.pop(prog, None)
         for pid in list(self.pmt_ver):
             if pid not in progs.values():
                 del self.pmt_ver[pid]
@@ -624,7 +929,7 @@ class _ProgramMeter(object):
         parsed = _parse_pmt(section)
         if not parsed:
             return
-        version, program, pcr, es = parsed
+        version, program, pcr, es, codec = parsed
         if program <= 0:
             return
         known = self.pmt_of.get(program)
@@ -639,6 +944,10 @@ class _ProgramMeter(object):
         pids.discard(0)
         pids.discard(0x1FFF)
         self.pids[program] = pids
+        self.codecs[program] = {
+            "video": (codec or {}).get("video") or "",
+            "audio": (codec or {}).get("audio") or "",
+        }
         self.pmt_ver[pid] = version
         if known is None:
             self.pmt_of[program] = pid
@@ -659,6 +968,8 @@ class _ProgramMeter(object):
             pid = ((data[off + 1] & 0x1F) << 8) | data[off + 2]
             if pid == 0 or pid in pmt_pids:
                 pkt = data[off : off + 188]
+                if not isinstance(pkt, (bytes, bytearray)):
+                    pkt = bytes(pkt)
                 for sec in _psi_sections(pkt):
                     if pid == 0:
                         self._take_pat(sec)
@@ -674,15 +985,51 @@ class _ProgramMeter(object):
             for prog in owners:
                 win[prog] = win.get(prog, 0) + 188
 
-    def roll(self, dt):
+    def roll(self, dt, scale=1):
         dt = dt if dt and dt > 0 else 1e-6
+        scale = scale if scale and scale > 0 else 1
         rates = {}
         for prog in self.pids:
             nbytes = self._win.get(prog, 0)
-            rates[prog] = round(nbytes * 8.0 / dt / 1000.0, 1)
+            rates[prog] = round(nbytes * scale * 8.0 / dt / 1000.0, 1)
         self.rates = rates
         self._win = {}
         return rates
+
+    def codec_snapshot(self):
+        out = {}
+        for prog, info in (self.codecs or {}).items():
+            info = info or {}
+            out[prog] = {
+                "video": info.get("video") or "",
+                "audio": info.get("audio") or "",
+            }
+        return out
+
+
+def pick_program_codec(codecs, program):
+    """{"video", "audio"} for one service. None until that service is known.
+
+    A channel with no program number uses the map only when the mux has one service.
+    """
+    if not codecs:
+        return None
+    if program is None:
+        if len(codecs) != 1:
+            return None
+        return next(iter(codecs.values()))
+    if program in codecs:
+        return codecs[program]
+    text = str(program)
+    if text in codecs:
+        return codecs[text]
+    try:
+        key = int(program)
+    except (TypeError, ValueError):
+        return None
+    if key in codecs:
+        return codecs[key]
+    return None
 
 
 def pick_program_bitrate(programs, program):
@@ -750,6 +1097,17 @@ def apply_carrier_sample(hub, up, now):
     """
     if up is None or hub is None:
         return None
+    lock = hub.get("stat_lock")
+    if lock is not None:
+        lock.acquire()
+    try:
+        return _apply_carrier_sample(hub, up, now)
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _apply_carrier_sample(hub, up, now):
     st = hub.get("stats")
     if up:
         if not isinstance(st, dict):
@@ -821,26 +1179,52 @@ def note_iface_link(iface, hubs, now, logger=None, state=None, sysfs_root="/sys/
     return up
 
 
-def _deliver(hub, payload, out_sock):
+def _remember_payload(hub, payload):
+    """先写入截图环。这一步必须在转发之前完成，转发堵住时环里仍然连续。"""
     ring = hub.get("ring")
-    if ring is not None:
-        try:
-            ring.write(payload)
-        except Exception:
-            pass
-    with hub["dest_lock"]:
-        dests = list(_all_local_ports(hub))
-        feeders = list((hub.get("feeders") or {}).values())
-    for lp in dests:
-        try:
-            out_sock.sendto(payload, ("127.0.0.1", lp))
-        except Exception:
-            pass
+    if ring is None:
+        return
+    try:
+        ring.write(payload)
+    except Exception:
+        pass
+
+
+def _fanout_send(hub, payload, out_sock):
+    """只把整包送给监测进程。码率在收包线程上计，避免和收包抢解释器。"""
+    left = hub.get("_dest_left") or 0
+    dests = hub.get("_dest_cache")
+    if dests is None or left <= 0:
+        with hub["dest_lock"]:
+            dests = tuple(_all_local_ports(hub))
+            feeders = tuple((hub.get("feeders") or {}).values())
+        hub["_dest_cache"] = dests
+        hub["_feeder_cache"] = feeders
+        left = 128
+    hub["_dest_left"] = left - 1
+    feeders = hub.get("_feeder_cache") or ()
+    if hub.get("_send_skip"):
+        hub["_send_skip"] = int(hub["_send_skip"]) - 1
+    else:
+        for lp in dests:
+            try:
+                out_sock.sendto(payload, ("127.0.0.1", lp))
+            except BlockingIOError:
+                # 监测进程一时读不走。跳过后续几包，避免每个包都走异常。
+                hub["_send_skip"] = 64
+                break
+            except Exception:
+                pass
     for feeder in feeders:
         try:
-            feeder.put(payload)
+            feeder.put(payload if isinstance(payload, (bytes, bytearray)) else bytes(payload))
         except Exception:
             pass
+    return True
+
+
+def _account_payload(hub, payload):
+    """按收到的包滚动整路和分节目码率。转发丢掉的副本不从这里扣。"""
     st = hub.get("_win")
     if st is None:
         st = {"n": 0, "b": 0, "t": time.time(), "pkts": 0, "bytes": 0}
@@ -853,44 +1237,84 @@ def _deliver(hub, payload, out_sock):
     if meter is None:
         meter = _ProgramMeter()
         hub["prog"] = meter
+    # 分节目码率抽样。整路字节每包都计。抽样倍数在 roll 里乘回去。
+    stride = int(hub.get("meter_stride") or 1)
+    if stride < 1:
+        stride = 1
     try:
-        meter.feed(payload)
+        if stride == 1 or not meter.pids or (st["pkts"] % stride) == 0:
+            meter.feed(payload)
     except Exception:
         pass
     now = time.time()
-    if now - st["t"] >= 1.0:
-        dt = max(now - st["t"], 1e-6)
-        rsz = 0
-        try:
-            rsz = hub.get("ring").size() if hub.get("ring") else 0
-        except Exception:
-            pass
-        try:
-            programs = meter.roll(dt)
-        except Exception:
-            programs = {}
-        with hub["dest_lock"]:
-            nd = len(list(_all_local_ports(hub)))
-        hub["stats"] = {
-            "iface": hub.get("iface"),
-            "group": hub.get("group"),
-            "mport": hub.get("mport"),
-            "pkts": st["pkts"],
-            "skip": 0,
-            "bytes": st["bytes"],
-            "pkt_rate": round(st["n"] / dt, 1),
-            "bitrate_kbps": round(st["b"] * 8.0 / dt / 1000.0, 1),
-            "programs": programs,
-            "dests": nd,
-            "ring_kb": int(rsz / 1024),
-            "updated_ts": now,
-            "carrier": True,
-            "link_was_down": False,
-        }
-        st["n"] = 0
-        st["b"] = 0
-        st["t"] = now
+    if now - st["t"] < 1.0:
+        return True
+    dt = max(now - st["t"], 1e-6)
+    rsz = 0
+    try:
+        rsz = hub.get("ring").size() if hub.get("ring") else 0
+    except Exception:
+        pass
+    try:
+        programs = meter.roll(dt, stride)
+    except Exception:
+        programs = {}
+    try:
+        codecs = meter.codec_snapshot()
+    except Exception:
+        codecs = {}
+    with hub["dest_lock"]:
+        nd = len(list(_all_local_ports(hub)))
+    stats = {
+        "iface": hub.get("iface"),
+        "group": hub.get("group"),
+        "mport": hub.get("mport"),
+        "pkts": st["pkts"],
+        "skip": 0,
+        "bytes": st["bytes"],
+        "pkt_rate": round(st["n"] / dt, 1),
+        "bitrate_kbps": round(st["b"] * 8.0 / dt / 1000.0, 1),
+        "programs": programs,
+        "codecs": codecs,
+        "dests": nd,
+        "ring_kb": int(rsz / 1024),
+        "updated_ts": now,
+        "carrier": True,
+        "link_was_down": False,
+    }
+    lock = hub.get("stat_lock")
+    if lock is not None:
+        lock.acquire()
+    try:
+        hub["stats"] = stats
+    finally:
+        if lock is not None:
+            lock.release()
+    st["n"] = 0
+    st["b"] = 0
+    st["t"] = now
     return True
+
+
+def _fanout_payload(hub, payload, out_sock):
+    _account_payload(hub, payload)
+    return _fanout_send(hub, payload, out_sock)
+
+
+def _deliver(hub, payload, out_sock):
+    _remember_payload(hub, payload)
+    return _fanout_payload(hub, payload, out_sock)
+
+
+def _kernel_packet_stats(raw):
+    """AF_PACKET 自上次读取后的到达数和丢包数。读取会把计数清零。"""
+    try:
+        blob = raw.getsockopt(getattr(socket, "SOL_PACKET", 263), 6, 8)
+    except Exception:
+        return 0, 0
+    if not blob or len(blob) < 8:
+        return 0, 0
+    return struct.unpack("II", blob[:8])
 
 
 def _apply_bpf(raw, ips, logger=None):
@@ -907,7 +1331,14 @@ def _apply_bpf(raw, ips, logger=None):
 def _iface_loop(iface, cap):
     logger = cap.get("logger")
     raw = None
+    _raise_rmem_max()
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        out.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+    except Exception:
+        pass
+    # 发送缓冲满了就丢掉这一份监测副本，不能把收包线程堵在 sendto 上。
+    out.setblocking(False)
     reasm = _IpReassembler()
     bpf_on = False
     try:
@@ -939,7 +1370,8 @@ def _iface_loop(iface, cap):
                 logger.warning("ip promisc skip: %s" % e)
         raw.settimeout(1.0)
         mapping, ips = _hub_map_for_iface(iface)
-        last_gen = cap.get("gen", 0)
+        # 配置可能刚好在这次读取之后才到。第一轮强制再装一次，避免空表被当成最新。
+        last_gen = int(cap.get("gen", 0) or 0) - 1
         try:
             bpf_on = _apply_bpf(raw, ips, logger)
         except Exception as e:
@@ -957,6 +1389,8 @@ def _iface_loop(iface, cap):
         last_log = t0
         last_match = t0
         bpf_since = t0
+        frame_buf = bytearray(2048)
+        frame_view = memoryview(frame_buf)
 
         while not cap["stop"]:
             gen = cap.get("gen", 0)
@@ -977,7 +1411,7 @@ def _iface_loop(iface, cap):
                     if logger:
                         logger.warning("bpf reload fail: %s" % e)
             try:
-                frame = raw.recv(2048)
+                nread = raw.recv_into(frame_buf)
             except socket.timeout:
                 now = time.time()
                 try:
@@ -1031,35 +1465,60 @@ def _iface_loop(iface, cap):
                 time.sleep(0.05)
                 continue
 
-            ip = _extract_ip(frame)
-            if ip is None:
+            if nread < 42:
                 n_skip += 1
                 continue
-            if reasm is not None:
-                ip = reasm.feed(ip)
+            got = _udp_from_frame(frame_view[:nread])
+            hub = None
+            payload = None
+            if got is _NEED_REASM:
+                frame = bytes(frame_view[:nread])
+                ip = _extract_ip(frame)
+                if ip is not None and reasm is not None:
+                    ip = reasm.feed(ip)
                 if ip is None:
                     continue
-            ihl = (ip[0] & 0x0F) * 4
-            if ihl < 20 or len(ip) < ihl + 8:
+                ihl = (ip[0] & 0x0F) * 4
+                if ihl < 20 or len(ip) < ihl + 8:
+                    n_skip += 1
+                    continue
+                dst = bytes(ip[16:20])
+                dport = struct.unpack("!H", ip[ihl + 2 : ihl + 4])[0]
+                hub = mapping.get((dst, dport))
+                if hub is not None:
+                    payload = _udp_payload_from_ip(ip, hub["group"], hub["mport"])
+            elif got is not None:
+                dst, dport, payload = got
+                hub = mapping.get((dst, dport))
+            if hub is None or not payload:
                 n_skip += 1
                 continue
-            dst = ip[16:20]
-            dport = struct.unpack("!H", ip[ihl + 2 : ihl + 4])[0]
-            hub = mapping.get((dst, dport))
-            if hub is None:
-                n_skip += 1
-                continue
-            payload = _udp_payload_from_ip(ip, hub["group"], hub["mport"])
-            if not payload:
-                n_skip += 1
-                continue
-            _deliver(hub, payload, out)
+            # 先入环再记账。监测副本非阻塞送出，送不走也不回头丢环里的包。
+            _remember_payload(hub, payload)
+            try:
+                _account_payload(hub, payload)
+            except Exception:
+                pass
+            try:
+                _fanout_send(hub, payload, out)
+            except Exception:
+                pass
             n_match += 1
-            last_match = time.time()
+            if (n_match & 4095) == 0:
+                now = time.time()
+                last_match = now
+                if logger and now - last_log >= 30.0:
+                    kpkts, kdrops = _kernel_packet_stats(raw)
+                    logger.info(
+                        "iface capture %s match=%d kernel_pkts=%d kernel_drops=%d skip=%d"
+                        % (iface, n_match, kpkts, kdrops, n_skip)
+                    )
+                    last_log = now
     except Exception as e:
         if logger:
             logger.error("iface capture thread error %s: %s" % (iface, e))
     finally:
+        cap["fan_stop"] = True
         try:
             out.close()
         except Exception:
@@ -1073,48 +1532,615 @@ def _iface_loop(iface, cap):
             logger.info("iface capture thread stopped %s" % iface)
 
 
+def _ring_path(iface, group, port):
+    safe_iface = re.sub(r"[^A-Za-z0-9]", "x", str(iface))
+    safe_group = re.sub(r"[^A-Za-z0-9]", "d", str(group))
+    return "/dev/shm/amcr_%d_%s_%s_%d" % (
+        os.getpid(),
+        safe_iface,
+        safe_group,
+        int(port),
+    )
+
+
+def _gc_ring_files():
+    """清掉已经退出的监测进程留在 /dev/shm 里的环。"""
+    try:
+        names = os.listdir("/dev/shm")
+    except Exception:
+        return
+    me = os.getpid()
+    for name in names:
+        if not name.startswith("amcr_"):
+            continue
+        parts = name.split("_")
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        if pid == me:
+            continue
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+        if alive:
+            continue
+        try:
+            os.unlink("/dev/shm/" + name)
+        except Exception:
+            pass
+
+
+def _open_shared_ring(path, create, nbytes=None):
+    cap = int(nbytes or _DEFAULT_RING_BYTES)
+    cap = cap // 188 * 188
+    if cap < 188:
+        cap = 188
+    size = cap + 8
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(path, flags, 0o600)
+    try:
+        if create:
+            os.ftruncate(fd, size)
+        mm = mmap.mmap(fd, size)
+        view = memoryview(mm)[8 : 8 + cap]
+        ring = _TsRing(buf=view, counter=_MmapCounter(mm))
+    except Exception:
+        os.close(fd)
+        raise
+    ring._fd = fd
+    ring._mm = mm
+    ring._view = view
+    ring._path = path
+    return ring
+
+
+def _close_ring(ring, unlink):
+    if ring is None:
+        return
+    mm = getattr(ring, "_mm", None)
+    fd = getattr(ring, "_fd", None)
+    path = getattr(ring, "_path", None)
+    try:
+        if mm is not None:
+            mm.close()
+    except Exception:
+        pass
+    try:
+        if fd is not None:
+            os.close(fd)
+    except Exception:
+        pass
+    if unlink and path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _make_hub_ring(iface, group, port):
+    try:
+        _gc_ring_files()
+        return _open_shared_ring(_ring_path(iface, group, port), True)
+    except Exception:
+        return _TsRing(_DEFAULT_RING_BYTES)
+
+
+def _read_exact(fh, n):
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = fh.read(n - len(buf))
+        except Exception:
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _write_msg(fh, obj, lock=None):
+    data = json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    blob = struct.pack("!I", len(data)) + data
+    if lock is None:
+        fh.write(blob)
+        fh.flush()
+        return
+    with lock:
+        fh.write(blob)
+        fh.flush()
+
+
+def _read_msg(fh):
+    hdr = _read_exact(fh, 4)
+    if not hdr:
+        return None
+    n = struct.unpack("!I", hdr)[0]
+    if n <= 0 or n > 1024 * 1024:
+        return None
+    blob = _read_exact(fh, n)
+    if blob is None:
+        return None
+    try:
+        return json.loads(blob.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _stats_for_json(st):
+    programs = st.get("programs") or {}
+    codecs = st.get("codecs") or {}
+    out = {}
+    for key, value in st.items():
+        if key in ("programs", "codecs"):
+            continue
+        out[key] = value
+    out["programs"] = dict((str(key), programs[key]) for key in programs)
+    coded = {}
+    for key, info in codecs.items():
+        info = info or {}
+        coded[str(key)] = {
+            "video": info.get("video") or "",
+            "audio": info.get("audio") or "",
+        }
+    out["codecs"] = coded
+    return out
+
+
+class _ProcLogger(object):
+    def __init__(self, fh, lock):
+        self._fh = fh
+        self._lock = lock
+
+    def _emit(self, level, msg):
+        try:
+            _write_msg(
+                self._fh,
+                {"op": "log", "level": level, "msg": str(msg)},
+                self._lock,
+            )
+        except Exception:
+            pass
+
+    def info(self, msg):
+        self._emit("info", msg)
+
+    def warning(self, msg):
+        self._emit("warning", msg)
+
+    def error(self, msg):
+        self._emit("error", msg)
+
+    def debug(self, msg):
+        self._emit("debug", msg)
+
+
+def _apply_capture_config(iface, items):
+    want = {}
+    for item in items or ():
+        try:
+            key = (iface, item.get("group"), int(item.get("mport") or 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        want[key] = item
+    with _lock:
+        for key in list(_hubs):
+            if key[0] != iface or key in want:
+                continue
+            hub = _hubs.pop(key, None)
+            if hub is not None:
+                _close_ring(hub.get("ring"), False)
+        for key, item in want.items():
+            hub = _hubs.get(key)
+            if hub is None:
+                try:
+                    ring = _open_shared_ring(item.get("ring"), False)
+                except Exception:
+                    continue
+                hub = {
+                    "iface": iface,
+                    "group": item.get("group"),
+                    "mport": int(item.get("mport") or 0),
+                    "ports": {},
+                    "feeders": {},
+                    "dest_lock": threading.Lock(),
+                    "stat_lock": threading.Lock(),
+                    "ring": ring,
+                    "prog": _ProgramMeter(),
+                    "meter_stride": int(item.get("meter_stride") or 8),
+                }
+                _hubs[key] = hub
+            ports = {}
+            for i, port in enumerate(item.get("ports") or []):
+                try:
+                    ports["p%d" % i] = {"mon": int(port)}
+                except (TypeError, ValueError):
+                    continue
+            with hub["dest_lock"]:
+                hub["ports"] = ports
+            hub["_dest_cache"] = None
+            hub["_dest_left"] = 0
+            try:
+                hub["meter_stride"] = int(item.get("meter_stride") or 8)
+            except (TypeError, ValueError):
+                hub["meter_stride"] = 8
+
+
+def capture_process_main(iface):
+    """单独进程收包。监测线程不再和收包抢同一个解释器。"""
+    import sys
+
+    try:
+        os.nice(-5)
+    except Exception:
+        pass
+    in_fh = sys.stdin.buffer
+    out_fh = sys.stdout.buffer
+    send_lock = threading.Lock()
+    logger = _ProcLogger(out_fh, send_lock)
+    cap = {"stop": False, "gen": 0, "logger": logger, "iface": iface}
+
+    def reader():
+        while not cap["stop"]:
+            msg = _read_msg(in_fh)
+            if not msg:
+                cap["stop"] = True
+                return
+            op = msg.get("op")
+            if op == "stop":
+                cap["stop"] = True
+                return
+            if op != "config":
+                continue
+            try:
+                _apply_capture_config(iface, msg.get("items") or [])
+            except Exception as exc:
+                logger.error("iface capture config %s: %s" % (iface, exc))
+            cap["gen"] = int(cap.get("gen") or 0) + 1
+
+    def publisher():
+        while not cap["stop"]:
+            time.sleep(0.5)
+            batch = []
+            with _lock:
+                for key, hub in list(_hubs.items()):
+                    if key[0] != iface:
+                        continue
+                    st = hub.get("stats")
+                    if not st:
+                        continue
+                    batch.append((key[1], int(key[2]), _stats_for_json(st)))
+            for group, mport, st in batch:
+                if cap["stop"]:
+                    return
+                try:
+                    _write_msg(
+                        out_fh,
+                        {
+                            "op": "stats",
+                            "group": group,
+                            "mport": mport,
+                            "stats": st,
+                        },
+                        send_lock,
+                    )
+                except Exception:
+                    return
+
+    threading.Thread(target=reader, name="mcap-cfg", daemon=True).start()
+    threading.Thread(target=publisher, name="mcap-stat", daemon=True).start()
+    _iface_loop(iface, cap)
+
+
+def _capture_config_items(iface):
+    with _lock:
+        hubs = [hub for key, hub in _hubs.items() if key[0] == iface]
+    items = []
+    for hub in hubs:
+        ring = hub.get("ring")
+        path = getattr(ring, "_path", None)
+        if not path:
+            continue
+        lock = hub.get("dest_lock")
+        if lock is not None:
+            lock.acquire()
+        try:
+            ports = [int(p) for p in _all_local_ports(hub)]
+        finally:
+            if lock is not None:
+                lock.release()
+        try:
+            stride = int(hub.get("meter_stride") or 8)
+        except (TypeError, ValueError):
+            stride = 8
+        items.append(
+            {
+                "group": hub.get("group"),
+                "mport": int(hub.get("mport") or 0),
+                "ring": path,
+                "ports": ports,
+                "meter_stride": stride,
+            }
+        )
+    return items
+
+
+def _rings_are_shared(iface):
+    found = False
+    for key, hub in _hubs.items():
+        if key[0] != iface:
+            continue
+        found = True
+        ring = hub.get("ring")
+        if ring is None or not getattr(ring, "_path", None):
+            return False
+    return found
+
+
+def _capture_alive(cap):
+    proc = cap.get("proc")
+    if proc is not None and proc.poll() is None:
+        return True
+    thread = cap.get("thread")
+    return thread is not None and thread.is_alive()
+
+
+def _close_proc_pipes(proc):
+    if proc is None:
+        return
+    for fh in (proc.stdin, proc.stdout):
+        try:
+            if fh is not None:
+                fh.close()
+        except Exception:
+            pass
+
+
+def _start_capture_thread(cap):
+    thread = cap.get("thread")
+    if thread is not None and thread.is_alive():
+        return
+    iface = cap["iface"]
+    t = threading.Thread(
+        target=_iface_loop,
+        args=(iface, cap),
+        name="mcap-%s" % iface,
+        daemon=True,
+    )
+    cap["thread"] = t
+    cap["proc"] = None
+    t.start()
+
+
+def _spawn_capture_proc(cap):
+    iface = cap["iface"]
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "from workers.iface_mcast import capture_process_main\n"
+        "capture_process_main(%r)\n"
+    ) % (root, iface)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    return subprocess.Popen(
+        [sys.executable, "-u", "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        cwd=root,
+        env=env,
+        bufsize=0,
+    )
+
+
+def _apply_parent_msg(cap, msg):
+    if not isinstance(msg, dict):
+        return
+    op = msg.get("op")
+    logger = cap.get("logger")
+    if op == "log":
+        if logger is None:
+            return
+        level = str(msg.get("level") or "info")
+        text = msg.get("msg") or ""
+        fn = getattr(logger, level, None)
+        if not callable(fn):
+            fn = getattr(logger, "info", None)
+        if not callable(fn):
+            return
+        try:
+            fn(text)
+        except Exception:
+            pass
+        return
+    if op != "stats":
+        return
+    try:
+        mport = int(msg.get("mport") or 0)
+    except (TypeError, ValueError):
+        return
+    st = msg.get("stats")
+    if not isinstance(st, dict):
+        return
+    key = (cap.get("iface"), msg.get("group"), mport)
+    with _lock:
+        hub = _hubs.get(key)
+    if hub is None:
+        return
+    lock = hub.get("stat_lock")
+    if lock is not None:
+        lock.acquire()
+    try:
+        hub["stats"] = st
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _send_capture_config(cap):
+    proc = cap.get("proc")
+    if proc is None or proc.poll() is not None:
+        return False
+    items = _capture_config_items(cap.get("iface"))
+    try:
+        _write_msg(
+            proc.stdin,
+            {"op": "config", "items": items},
+            cap.get("send_lock"),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _capture_reader(cap):
+    fails = 0
+    while not cap.get("stop"):
+        proc = cap.get("proc")
+        if proc is None:
+            return
+        while not cap.get("stop"):
+            msg = _read_msg(proc.stdout)
+            if msg is None:
+                break
+            fails = 0
+            _apply_parent_msg(cap, msg)
+        if cap.get("stop"):
+            return
+        code = proc.poll()
+        logger = cap.get("logger")
+        iface = cap.get("iface")
+        if logger:
+            try:
+                logger.error("iface capture process exit %s code=%s" % (iface, code))
+            except Exception:
+                pass
+        fails += 1
+        _close_proc_pipes(proc)
+        if fails >= 3:
+            if logger:
+                try:
+                    logger.error("iface capture process fallback thread %s" % iface)
+                except Exception:
+                    pass
+            _start_capture_thread(cap)
+            return
+        time.sleep(1.0)
+        if cap.get("stop"):
+            return
+        try:
+            cap["proc"] = _spawn_capture_proc(cap)
+        except Exception as exc:
+            if logger:
+                try:
+                    logger.error("iface capture process start %s: %s" % (iface, exc))
+                except Exception:
+                    pass
+            _start_capture_thread(cap)
+            return
+        _send_capture_config(cap)
+
+
 def _ensure_capturer(iface, logger=None):
     with _lock:
         cap = _capturers.get(iface)
-        if cap is not None and cap.get("thread") is not None and cap["thread"].is_alive():
+        if cap is not None and _capture_alive(cap):
             cap["gen"] = int(cap.get("gen") or 0) + 1
+            cap["iface"] = iface
             if logger:
                 cap["logger"] = logger
+            if cap.get("proc") is not None and cap["proc"].poll() is None:
+                _send_capture_config(cap)
             return cap
+        if cap is not None:
+            cap["stop"] = True
+            old = cap.get("proc")
+            if old is not None and old.poll() is None:
+                try:
+                    old.kill()
+                except Exception:
+                    pass
         cap = {
             "stop": False,
             "thread": None,
+            "proc": None,
             "gen": 1,
             "logger": logger,
+            "iface": iface,
+            "send_lock": threading.Lock(),
+            "reader_on": False,
         }
         _capturers[iface] = cap
-        t = threading.Thread(
-            target=_iface_loop,
-            args=(iface, cap),
-            name="mcap-%s" % iface,
-            daemon=True,
-        )
-        cap["thread"] = t
-        t.start()
-    time.sleep(0.2)
+        use_process = _rings_are_shared(iface)
+        spawned = None
+        if use_process:
+            try:
+                spawned = _spawn_capture_proc(cap)
+            except Exception as exc:
+                use_process = False
+                if logger:
+                    logger.error("iface capture process start %s: %s" % (iface, exc))
+        if not use_process or spawned is None:
+            _start_capture_thread(cap)
+        else:
+            cap["proc"] = spawned
+            cap["reader_on"] = True
+            t = threading.Thread(
+                target=_capture_reader,
+                args=(cap,),
+                name="mcap-rx-%s" % iface,
+                daemon=True,
+            )
+            cap["reader"] = t
+            t.start()
+            _send_capture_config(cap)
+            if logger:
+                logger.info(
+                    "iface capture process %s pid=%s" % (iface, spawned.pid)
+                )
+    if cap.get("thread") is not None:
+        time.sleep(0.2)
     return cap
 
 
 def _maybe_stop_capturer(iface, logger=None):
     with _lock:
         still = any(k[0] == iface for k in _hubs)
+        cap = _capturers.get(iface)
         if still:
-            cap = _capturers.get(iface)
             if cap is not None:
                 cap["gen"] = int(cap.get("gen") or 0) + 1
+                if cap.get("proc") is not None and cap["proc"].poll() is None:
+                    _send_capture_config(cap)
             return
         cap = _capturers.pop(iface, None)
     if cap is None:
         return
     cap["stop"] = True
-    t = cap.get("thread")
-    if t is not None and t.is_alive():
-        t.join(timeout=3)
+    proc = cap.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            _write_msg(proc.stdin, {"op": "stop"}, cap.get("send_lock"))
+        except Exception:
+            pass
+        _close_proc_pipes(proc)
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    thread = cap.get("thread")
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=3)
     if logger:
         logger.info("stopped iface capturer %s" % iface)
 
@@ -1138,16 +2164,21 @@ def acquire(work_dir, iface, group, port, consumer_id, logger=None):
                 "ports": {},
                 "feeders": {},
                 "dest_lock": threading.Lock(),
+                "stat_lock": threading.Lock(),
                 "logger": logger,
-                "ring": _TsRing(_DEFAULT_RING_BYTES),
+                "ring": _make_hub_ring(iface, group, int(port)),
                 "prog": _ProgramMeter(),
+                # 8 抽 1 记分节目码率，把收包线程的时间留给连续入环。
+                "meter_stride": 8,
             }
             _hubs[key] = hub
         else:
             if hub.get("ring") is None:
-                hub["ring"] = _TsRing(_DEFAULT_RING_BYTES)
+                hub["ring"] = _make_hub_ring(iface, group, int(port))
             if "feeders" not in hub:
                 hub["feeders"] = {}
+            if hub.get("stat_lock") is None:
+                hub["stat_lock"] = threading.Lock()
 
         def _listen_url(p):
             return "udp://@:%d" % int(p)
@@ -1189,7 +2220,9 @@ def release(iface, group, port, consumer_id, logger=None):
             except Exception:
                 pass
         if empty:
+            ring = hub.get("ring")
             del _hubs[key]
+            _close_ring(ring, True)
             if logger:
                 logger.info("stopped iface capture %s" % (key,))
         elif logger:
@@ -1199,6 +2232,11 @@ def release(iface, group, port, consumer_id, logger=None):
             )
     if empty:
         _maybe_stop_capturer(iface, logger)
+        return
+    with _lock:
+        cap = _capturers.get(iface)
+        if cap is not None and cap.get("proc") is not None and cap["proc"].poll() is None:
+            _send_capture_config(cap)
 
 
 def register_feeder(iface, group, port, consumer_id, feeder=None, logger=None):
