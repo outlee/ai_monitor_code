@@ -117,10 +117,54 @@ class HubTests(unittest.TestCase):
         self.assertEqual(remote["preview_base"], "/api/hub/snap/room2/hd_1")
         dead = [n for n in merged["nodes"] if n["id"] == "room3"][0]
         self.assertFalse(dead["ok"])
+        self.assertEqual(merged["summary"]["total"], 2)
         self.assertEqual(merged["summary"]["green"], 1)
         self.assertEqual(merged["summary"]["red"], 1)
         self.assertEqual(merged["stats_24h"]["total"], 3)
         self.assertEqual(merged["recent_events"][0]["node_name"], "机房2")
+
+    def test_remote_alarms_survive_a_full_local_event_list(self):
+        nodes = normalize_node_list(
+            [
+                {"id": "local", "name": "本机", "url": ""},
+                {"id": "room2", "name": "机房2", "url": "http://10.0.0.8:8080"},
+            ]
+        )
+        local_events = [
+            {
+                "time": "2026-10-09 08:00:%02d" % i,
+                "type": "no_signal_end",
+                "channel_id": "hd_%s" % i,
+                "channel_name": "本地%d" % i,
+            }
+            for i in range(40)
+        ]
+        local = {"cards": [], "recent_events": local_events, "stats_24h": None}
+
+        def fetch(url, path):
+            return {
+                "cards": [],
+                "recent_events": [
+                    {
+                        "time": "2026-10-09 08:45:09",
+                        "type": "ai_green_screen",
+                        "channel_id": "v30_jinying",
+                        "channel_name": "金鹰卡通HD",
+                        "message": "检测到花屏",
+                    }
+                ],
+                "stats_24h": None,
+            }
+
+        merged = assemble_hub(nodes, local, fetch)
+        remote = [
+            ev
+            for ev in merged["recent_events"]
+            if ev.get("node_id") == "room2" and ev.get("type") == "ai_green_screen"
+        ]
+        self.assertEqual(len(remote), 1)
+        self.assertEqual(remote[0]["channel_name"], "金鹰卡通HD")
+        self.assertEqual(merged["recent_events"][0]["node_id"], "room2")
 
     def test_alarm_tail_stays_inside_the_anomaly(self):
         # 静帧确认时已经持续约 12 秒。截图只取尾部两三秒，不能把整段缓冲头部的正常节目解进去。

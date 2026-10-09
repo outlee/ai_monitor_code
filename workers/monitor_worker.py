@@ -851,6 +851,12 @@ class StreamMonitor:
             payload["capture_port"] = cap.get("mport")
             if "carrier" in cap:
                 payload["capture_carrier"] = cap.get("carrier")
+            codec = cap.get("program_codec")
+            if isinstance(codec, dict):
+                if codec.get("video"):
+                    payload["video_codec"] = codec.get("video")
+                if codec.get("audio"):
+                    payload["audio_codec"] = codec.get("audio")
         if extra:
             payload.update(extra)
         path = self.status_dir / f"{self.id}.json"
@@ -878,10 +884,14 @@ class StreamMonitor:
         if not self._capture_key:
             return {}
         try:
-            from iface_mcast import hub_stats, pick_program_bitrate
+            from iface_mcast import hub_stats, pick_program_bitrate, pick_program_codec
         except ImportError:
             try:
-                from workers.iface_mcast import hub_stats, pick_program_bitrate
+                from workers.iface_mcast import (
+                    hub_stats,
+                    pick_program_bitrate,
+                    pick_program_codec,
+                )
             except ImportError:
                 return {}
         try:
@@ -895,9 +905,16 @@ class StreamMonitor:
         if not st:
             return {}
         chosen = pick_program_bitrate(st.get("programs") or {}, self.program)
-        if chosen is not None:
+        chosen_codec = pick_program_codec(st.get("codecs") or {}, self.program)
+        if chosen is not None or chosen_codec:
             st = dict(st)
+        if chosen is not None:
             st["program_bitrate_kbps"] = chosen
+        if isinstance(chosen_codec, dict):
+            video = str(chosen_codec.get("video") or "").strip()[:24]
+            audio = str(chosen_codec.get("audio") or "").strip()[:24]
+            if video or audio:
+                st["program_codec"] = {"video": video, "audio": audio}
         return st
 
     def _media_timeout_sec(self) -> float:

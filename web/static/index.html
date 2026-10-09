@@ -124,6 +124,11 @@
     <div class="event-list" id="event-list-dash">
       <div class="empty">加载中…</div>
     </div>
+    <div class="panel-head hidden" style="margin-top:16px" id="remote-events-head">
+      <h2>其他服务器最近告警</h2>
+      <span class="hint">花屏、马赛克和已经恢复的也会列在这里，并带上是哪一台</span>
+    </div>
+    <div class="event-list hidden" id="event-list-remote"></div>
     <div id="server-strip-wrap" class="server-strip-wrap hidden">
       <div class="panel-head">
         <h2>服务器性能</h2>
@@ -370,7 +375,14 @@
       </div>
       <div class="modal-body">
         <div id="preview-stage" class="preview-stage" style="display:none">
-          <img id="preview-thumb" alt="" />
+          <div class="preview-shot">
+            <img id="preview-thumb" alt="" />
+            <div class="ch-overlay">
+              <div class="ch-overlay-bottom">
+                <div class="ch-codec" id="preview-codec"></div>
+              </div>
+            </div>
+          </div>
           <div class="vu-col">
             <div class="vu vu-lg" id="preview-vu" data-id="">
               <div class="vu-scale"></div>

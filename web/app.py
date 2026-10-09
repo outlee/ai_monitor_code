@@ -421,6 +421,8 @@ def _channel_stats(
             info["pkt_rate"] = st.get("pkt_rate")
             info["bitrate_kbps"] = st.get("bitrate_kbps")
             info["program_bitrate_kbps"] = st.get("program_bitrate_kbps")
+            info["video_codec"] = st.get("video_codec") or ""
+            info["audio_codec"] = st.get("audio_codec") or ""
             info["audio_db"] = st.get("audio_db")
             info["audio_state"] = st.get("audio_state") or "idle"
             info["audio_db_ts"] = st.get("audio_db_ts")
@@ -884,6 +886,8 @@ def api_dashboard():
                 "pkt_rate": s.get("pkt_rate"),
                 "bitrate_kbps": s.get("bitrate_kbps"),
                 "program_bitrate_kbps": s.get("program_bitrate_kbps"),
+                "video_codec": s.get("video_codec") or "",
+                "audio_codec": s.get("audio_codec") or "",
                 "audio_db": s.get("audio_db"),
                 "audio_state": s.get("audio_state") or "idle",
                 "audio_db_ts": s.get("audio_db_ts"),

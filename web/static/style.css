@@ -190,13 +190,22 @@ body {
   gap: 10px;
   background: #000;
 }
-.preview-stage img {
+.preview-shot {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+}
+.preview-shot img {
   flex: 1 1 auto;
   width: 1px;
   min-width: 0;
   max-height: 70vh;
   object-fit: contain;
   background: #000;
+}
+.preview-shot .ch-codec {
+  font-size: 14px;
 }
 .vu-col {
   display: flex;
@@ -241,8 +250,11 @@ body {
   padding: 22px 6px 5px;
   background: linear-gradient(to top, rgba(0,0,0,.78), rgba(0,0,0,0));
 }
-.ch-card .ch-name {
+.ch-meta {
   flex: 1 1 auto;
+  min-width: 0;
+}
+.ch-card .ch-name {
   min-width: 0;
   color: #fff;
   font-size: 13px;
@@ -253,6 +265,17 @@ body {
   text-overflow: ellipsis;
   text-shadow: 0 1px 2px rgba(0,0,0,.85);
 }
+.ch-codec {
+  min-width: 0;
+  color: #d1fae5;
+  font-size: 11px;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 2px rgba(0,0,0,.85);
+}
+.ch-card.ch-card-lg .ch-codec { font-size: 13px; }
 .ch-card .ch-rate {
   flex: none;
   font-size: 11px;
@@ -297,7 +320,9 @@ body {
 .perf-compact .server-mini { grid-template-columns: 72px minmax(0, 1fr) 58px; }
 .perf-compact .perf-bar { height: 6px; margin: 2px 0; }
 .perf-row .perf-foot { margin-top: 4px; }
-.server-strip-wrap.hidden { display: none; }
+.server-strip-wrap.hidden,
+#remote-events-head.hidden,
+#event-list-remote.hidden { display: none; }
 .server-strip-wrap { margin-top: 18px; padding-top: 4px; border-top: 1px solid var(--border); }
 .server-strip-wrap .panel-head { padding-left: 0; padding-right: 0; border-bottom: none; }
 .server-strip-wrap .node-strip { margin-top: 0; padding-bottom: 4px; }

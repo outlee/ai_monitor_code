@@ -128,8 +128,8 @@
     if (save !== false) localStorage.setItem(LS_VIEW, name);
   }
 
-  function shouldSuppress(channelId, type) {
-    const key = channelId + ":" + type;
+  function shouldSuppress(channelId, type, nodeId) {
+    const key = (nodeId || "") + ":" + channelId + ":" + type;
     const exp = suppressionMap.get(key);
     if (exp && Date.now() < exp) return true;
     suppressionMap.set(key, Date.now() + SUPPRESSION_MS);
@@ -164,8 +164,7 @@
       return;
     }
     for (const a of list.slice(0, 3)) {
-      const name = a.channel_name || a.channel_id || "频道";
-      speak(name + "发生" + typeLabel(a.type) + "告警");
+      speak(placeName(a) + "发生" + typeLabel(a.type) + "告警");
     }
   }
 
@@ -173,7 +172,7 @@
     if (!$("#sw-tts") || !$("#sw-tts").checked) return;
     for (const a of alarms) {
       if (!a.type || String(a.type).endsWith("_end")) continue;
-      if (shouldSuppress(a.channel_id || "", a.type || "")) continue;
+      if (shouldSuppress(a.channel_id || "", a.type || "", a.node_id || "")) continue;
       pendingTts.push(a);
     }
     if (!pendingTts.length) return;
@@ -185,8 +184,28 @@
     aggregationTimer = setTimeout(flushTtsQueue, AGGREGATION_MS);
   }
 
+  function placeName(ev) {
+    const ch = (ev && (ev.channel_name || ev.channel_id)) || "节目";
+    const node = (ev && ev.node_name) || "";
+    if (node && ev.node_id && ev.node_id !== "local") return node + " " + ch;
+    return ch;
+  }
+
+  function isStartAlarm(ev) {
+    if (!ev || !ev.type) return false;
+    if (ev.phase === "end") return false;
+    if (String(ev.type).endsWith("_end")) return false;
+    return true;
+  }
+
   function eventKey(ev) {
-    return [ev.time || "", ev.type || "", ev.channel_id || "", ev.message || ev.msg || ""].join("|");
+    return [
+      ev.node_id || "",
+      ev.time || "",
+      ev.type || "",
+      ev.channel_id || "",
+      ev.message || ev.msg || "",
+    ].join("|");
   }
 
   function playBeep() {
@@ -286,14 +305,11 @@
         const first = alarms[0];
         const title =
           alarms.length === 1
-            ? "节目异常: " + (first.type || "")
+            ? "节目异常: " + typeLabel(first.type)
             : "节目异常 × " + alarms.length;
         const body = alarms
           .slice(0, 3)
-          .map((e) => {
-            const ch = e.channel_name || e.channel_id || "";
-            return (ch ? ch + " " : "") + (e.type || "") + " " + (e.time || "");
-          })
+          .map((e) => placeName(e) + " " + typeLabel(e.type) + " " + (e.time || ""))
           .join("\n");
         desktopNotify(title, body);
       });
@@ -311,12 +327,14 @@
       }
     }, 500);
 
+    const firstAlarm = alarms[0];
     toast(
       "新异常 " +
         alarms.length +
         " 条: " +
-        (alarms[0].type || "") +
-        (alarms[0].channel_name ? " · " + alarms[0].channel_name : ""),
+        typeLabel(firstAlarm.type) +
+        " · " +
+        placeName(firstAlarm),
       "err"
     );
   }
@@ -329,11 +347,23 @@
       const name = c.name || id || "节目";
       const alarms = (c.active_alarms || []).filter(Boolean);
       alarms.forEach((t) => {
-        out.push({ type: t, channel_id: id, channel_name: name });
+        out.push({
+          type: t,
+          channel_id: id,
+          channel_name: name,
+          node_id: c.node_id || "",
+          node_name: c.node_name || "",
+        });
       });
       // 断流重连时监测侧会清掉未恢复标记，节目还没回来也要继续提醒
       if (c.status === "reconnecting" && alarms.indexOf("stream_down") < 0) {
-        out.push({ type: "stream_down", channel_id: id, channel_name: name });
+        out.push({
+          type: "stream_down",
+          channel_id: id,
+          channel_name: name,
+          node_id: c.node_id || "",
+          node_name: c.node_name || "",
+        });
       }
     });
     return out;
@@ -341,11 +371,25 @@
 
   function openRemindText(list) {
     if (list.length >= AGGREGATION_N) {
-      return "警告：" + list.length + "路节目仍未恢复，请立即检查";
+      const others = [];
+      const seen = new Set();
+      list.forEach((a) => {
+        if (!a.node_id || a.node_id === "local") return;
+        const label = placeName(a) + typeLabel(a.type);
+        if (seen.has(label)) return;
+        seen.add(label);
+        others.push(label);
+      });
+      let text = "警告：" + list.length + "路节目仍未恢复，请立即检查";
+      if (others.length) {
+        text += "。其中" + others.slice(0, 3).join("，");
+        if (others.length > 3) text += "等" + others.length + "路";
+      }
+      return text;
     }
     const byName = new Map();
     list.forEach((a) => {
-      const name = a.channel_name || a.channel_id || "节目";
+      const name = placeName(a);
       if (!byName.has(name)) byName.set(name, []);
       const label = typeLabel(a.type);
       const arr = byName.get(name);
@@ -617,6 +661,21 @@
     return fmtBitrate(c.bitrate_kbps);
   }
 
+  function codecLabel(c) {
+    const v = String((c && c.video_codec) || "").trim();
+    const a = String((c && c.audio_codec) || "").trim();
+    if (v && a) return v + " · " + a;
+    return v || a || "";
+  }
+
+  function cardById(id) {
+    const cards = (lastDash && lastDash.cards) || [];
+    for (let i = 0; i < cards.length; i++) {
+      if (cards[i] && cards[i].id === id) return cards[i];
+    }
+    return null;
+  }
+
   function streamLabel(c) {
     const parts = [];
     const br = shownBitrate(c);
@@ -681,6 +740,7 @@
   function channelCardHtml(c, large) {
     const fault = cardFault(c);
     const rate = shownBitrate(c);
+    const codec = codecLabel(c);
     const thumb = c.thumb_url
       ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
@@ -705,7 +765,10 @@
           <div class="ch-overlay">
             <div class="ch-overlay-top">${tagHtml}${chip}</div>
             <div class="ch-overlay-bottom">
-              <div class="ch-name">${escapeHtml(name)}</div>
+              <div class="ch-meta">
+                <div class="ch-name">${escapeHtml(name)}</div>
+                ${codec ? `<div class="ch-codec">${escapeHtml(codec)}</div>` : ""}
+              </div>
               ${rate ? `<div class="ch-rate">${escapeHtml(rate)}</div>` : ""}
             </div>
           </div>
@@ -976,6 +1039,12 @@
     if ($("#sum-gray")) $("#sum-gray").textContent = sum.gray ?? 0;
 
     const all = (dash.cards || []).filter((c) => c.enabled !== false);
+    // 汇聚页的节目总数是各台正在监测的合计，不用本机频道表的条数
+    if (dash.hub && dash.hub.active && $("#stat-total")) {
+      $("#stat-total").textContent = String(all.length);
+      const totalCard = $("#card-total");
+      if (totalCard) totalCard.title = "各台正在监测的节目合计";
+    }
     renderServerStrip(dash, lastPerf);
     renderCategoryTabs(all);
     const bad = all.filter((c) => c.lamp === "red" || c.lamp === "yellow");
@@ -1004,7 +1073,12 @@
           open.push({
             type: t,
             channel_id: c.id,
-            channel_name: c.name || c.id,
+            channel_name: placeName({
+              channel_name: c.name || c.id,
+              channel_id: c.id,
+              node_id: c.node_id,
+              node_name: c.node_name,
+            }),
             message: "未恢复",
             time: dash.time || "",
           });
@@ -1016,6 +1090,7 @@
         evBox.innerHTML = open.map(renderEventItem).join("");
       }
     }
+    renderRemoteRecent(dash);
 
     const okHead = $("#ok-strip-head");
     if (okHead) {
@@ -1073,6 +1148,7 @@
         byCh.innerHTML = `<li class="empty">暂无</li>`;
       }
     }
+    paintPreviewCodec();
   }
 
   let previewPlayer = null;
@@ -1121,6 +1197,7 @@
       vu.dataset.id = channelId || "";
       paintVu(vu, { audio_db: null, audio_state: "idle" });
     }
+    paintPreviewCodec();
     if (!img) return;
     const base = snapBase || ("/api/snapshots/" + encodeURIComponent(channelId));
     const tick = () => {
@@ -1131,6 +1208,15 @@
     if (hint) {
       hint.textContent = "实时画面每秒刷新。右侧音柱是当前音量，大约每秒跟着变。";
     }
+  }
+
+  function paintPreviewCodec() {
+    const el = document.getElementById("preview-codec");
+    if (!el) return;
+    const vu = document.getElementById("preview-vu");
+    const id = vu && vu.dataset.id;
+    const card = id ? cardById(id) : null;
+    el.textContent = card ? codecLabel(card) : "";
   }
 
   function openPreview(channelId, name, snapBase) {
@@ -1144,6 +1230,42 @@
     if (title) title.textContent = "预览: " + (name || channelId);
     modal.classList.remove("hidden");
     startThumbFallback(channelId, hint, snapBase);
+  }
+
+  function renderRemoteRecent(dash) {
+    const head = $("#remote-events-head");
+    const box = $("#event-list-remote");
+    if (!head || !box) return;
+    const hubOn = dash && dash.hub && dash.hub.active;
+    const rows = [];
+    if (hubOn) {
+      (dash.recent_events || []).forEach((ev) => {
+        if (!ev || !ev.node_id || ev.node_id === "local") return;
+        if (!isStartAlarm(ev)) return;
+        rows.push(ev);
+      });
+      rows.sort((a, b) => String(b.time || "").localeCompare(String(a.time || "")));
+    }
+    if (!rows.length) {
+      head.classList.add("hidden");
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    head.classList.remove("hidden");
+    box.classList.remove("hidden");
+    box.innerHTML = rows
+      .slice(0, 12)
+      .map((ev) =>
+        renderEventItem({
+          type: ev.type,
+          channel_id: ev.channel_id,
+          channel_name: placeName(ev),
+          message: ev.message || ev.msg || "",
+          time: ev.time || "",
+        })
+      )
+      .join("");
   }
 
   function renderOverview(data) {
@@ -1420,7 +1542,11 @@
           } else if (!c.category) c.category = [];
         }
       });
-      handleNewEvents(overview.recent_events || []);
+      const alertEvents =
+        dash && dash.hub && dash.hub.active
+          ? dash.recent_events || []
+          : overview.recent_events || [];
+      handleNewEvents(alertEvents);
       renderOverview(overview);
       if (dash) {
         renderDashboard(dash);

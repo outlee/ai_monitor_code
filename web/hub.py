@@ -215,6 +215,8 @@ def assemble_hub(
             row["node_id"] = nid
             row["node_name"] = name
             events.append(row)
+    # 每台先各留 40 条，再按时间排到一起。不能先把本机占满再截断，否则别的机器的新告警进不了汇总。
+    events.sort(key=lambda ev: str(ev.get("time") or ""), reverse=True)
     summary = {
         "total": len(cards),
         "green": sum(1 for c in cards if c.get("lamp") == "green"),
@@ -226,7 +228,7 @@ def assemble_hub(
         "cards": cards,
         "summary": summary,
         "nodes": node_rows,
-        "recent_events": events[:40],
+        "recent_events": events[:120],
         "stats_24h": _merge_stats(stat_parts),
         "hub": {"active": True},
     }
