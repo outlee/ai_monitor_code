@@ -14,6 +14,7 @@ Also maintains:
 from __future__ import print_function
 
 import collections
+import os
 import re
 import socket
 import struct
@@ -709,6 +710,117 @@ def pick_program_bitrate(programs, program):
     return None
 
 
+def iface_carrier_up(iface, sysfs_root="/sys/class/net"):
+    """True if the NIC has carrier, False if it does not, None if unknown.
+
+    Unknown (missing iface, unreadable sysfs) must not raise a link-down alarm.
+    """
+    name = str(iface or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        return None
+    base = os.path.join(sysfs_root, name)
+    try:
+        with open(os.path.join(base, "carrier"), "r") as fh:
+            text = fh.read().strip()
+        if text == "1":
+            return True
+        if text == "0":
+            return False
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(base, "operstate"), "r") as fh:
+            state = fh.read().strip().lower()
+    except OSError:
+        return None
+    if state in ("down", "lowerlayerdown", "notpresent"):
+        return False
+    if state == "up":
+        return True
+    return None
+
+
+def apply_carrier_sample(hub, up, now):
+    """Fold one carrier reading into hub['stats'].
+
+    up True keeps the last rate. A real packet window is what clears
+    link_was_down. up False zeros live rates immediately and remembers the
+    first down timestamp. up None leaves the hub alone.
+    Returns 'down', 'up', or None (no transition).
+    """
+    if up is None or hub is None:
+        return None
+    st = hub.get("stats")
+    if up:
+        if not isinstance(st, dict):
+            return None
+        prev = st.get("carrier")
+        st = dict(st)
+        st["carrier"] = True
+        st["updated_ts"] = now
+        hub["stats"] = st
+        if prev is False:
+            return "up"
+        return None
+    if not isinstance(st, dict):
+        prev = None
+        st = {
+            "iface": hub.get("iface"),
+            "group": hub.get("group"),
+            "mport": hub.get("mport"),
+            "pkts": 0,
+            "skip": 0,
+            "bytes": 0,
+            "dests": 0,
+            "ring_kb": 0,
+        }
+    else:
+        prev = st.get("carrier")
+        st = dict(st)
+    if prev is not False or not st.get("carrier_down_since"):
+        st["carrier_down_since"] = now
+    st["carrier"] = False
+    st["link_was_down"] = True
+    st["pkt_rate"] = 0
+    st["bitrate_kbps"] = 0
+    st["programs"] = {}
+    st["updated_ts"] = now
+    hub["stats"] = st
+    if prev is False:
+        return None
+    return "down"
+
+
+def note_iface_link(iface, hubs, now, logger=None, state=None, sysfs_root="/sys/class/net"):
+    """Sample this NIC once and apply it to every hub. Log down/up once."""
+    up = iface_carrier_up(iface, sysfs_root=sysfs_root)
+    if up is None:
+        return None
+    seen = {}
+    for hub in hubs or ():
+        if hub is None:
+            continue
+        key = id(hub)
+        if key in seen:
+            continue
+        seen[key] = True
+        apply_carrier_sample(hub, up, now)
+    if state is not None:
+        prev = state.get("carrier_up")
+        if prev is None:
+            state["carrier_up"] = bool(up)
+            if up is False and logger:
+                logger.warning("iface capture %s link down" % iface)
+        elif bool(prev) != bool(up):
+            state["carrier_up"] = bool(up)
+            if logger:
+                if up:
+                    logger.info("iface capture %s link up" % iface)
+                else:
+                    logger.warning("iface capture %s link down" % iface)
+    return up
+
+
 def _deliver(hub, payload, out_sock):
     ring = hub.get("ring")
     if ring is not None:
@@ -772,6 +884,8 @@ def _deliver(hub, payload, out_sock):
             "dests": nd,
             "ring_kb": int(rsz / 1024),
             "updated_ts": now,
+            "carrier": True,
+            "link_was_down": False,
         }
         st["n"] = 0
         st["b"] = 0
@@ -866,6 +980,13 @@ def _iface_loop(iface, cap):
                 frame = raw.recv(2048)
             except socket.timeout:
                 now = time.time()
+                try:
+                    note_iface_link(
+                        iface, mapping.values(), now, logger=logger, state=cap
+                    )
+                except Exception as e:
+                    if logger:
+                        logger.debug("iface carrier check %s: %s" % (iface, e))
                 if bpf_on and n_match == 0 and now - bpf_since >= 8.0:
                     try:
                         raw.setsockopt(socket.SOL_SOCKET, SO_DETACH_FILTER, 0)

@@ -200,6 +200,66 @@ def _now_ts() -> float:
     return time.time()
 
 
+# 监测网口无载波满这么久，才把该网卡上的节目记为中断。
+# 载波刚回来但还没有新的收包窗口时，仍保持中断。
+LINK_DOWN_CONFIRM_SEC = 5.0
+
+
+def capture_link_down(stats, now) -> bool:
+    """载波已经落下，并且落下的时间达到确认窗。"""
+    if not stats or stats.get("carrier") is not False:
+        return False
+    since = stats.get("carrier_down_since")
+    if since is None:
+        return False
+    try:
+        age = float(now) - float(since)
+    except (TypeError, ValueError):
+        return False
+    return age >= LINK_DOWN_CONFIRM_SEC
+
+
+def link_blocks_media(stats, now) -> bool:
+    """无载波已确认，或载波已回但这一窗口还没有新包。"""
+    if capture_link_down(stats, now):
+        return True
+    if not stats or not stats.get("link_was_down"):
+        return False
+    if stats.get("carrier") is False:
+        return False
+    try:
+        rate = float(stats.get("pkt_rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    return rate <= 0
+
+
+def capture_status_rates(cap):
+    """写心跳用的码率。网口落下或尚未重新收到包时，卡片上的数归零。"""
+    if not cap:
+        return None
+    try:
+        rate = float(cap.get("pkt_rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    held = cap.get("carrier") is False or (
+        bool(cap.get("link_was_down")) and rate <= 0 and cap.get("carrier") is not False
+    )
+    if held:
+        return {
+            "pkt_rate": 0,
+            "bitrate_kbps": 0,
+            "program_bitrate_kbps": 0,
+        }
+    out = {
+        "pkt_rate": cap.get("pkt_rate"),
+        "bitrate_kbps": cap.get("bitrate_kbps"),
+    }
+    if cap.get("program_bitrate_kbps") is not None:
+        out["program_bitrate_kbps"] = cap.get("program_bitrate_kbps")
+    return out
+
+
 class StreamMonitor:
     def __init__(
         self,
@@ -779,15 +839,18 @@ class StreamMonitor:
         }
         cap = self._capture_stats()
         if cap:
-            payload["pkt_rate"] = cap.get("pkt_rate")
-            payload["bitrate_kbps"] = cap.get("bitrate_kbps")
-            if cap.get("program_bitrate_kbps") is not None:
-                payload["program_bitrate_kbps"] = cap.get("program_bitrate_kbps")
+            rates = capture_status_rates(cap) or {}
+            payload["pkt_rate"] = rates.get("pkt_rate")
+            payload["bitrate_kbps"] = rates.get("bitrate_kbps")
+            if "program_bitrate_kbps" in rates:
+                payload["program_bitrate_kbps"] = rates.get("program_bitrate_kbps")
             payload["capture_skip"] = cap.get("skip")
             payload["capture_dests"] = cap.get("dests")
             payload["capture_ring_kb"] = cap.get("ring_kb")
             payload["capture_group"] = cap.get("group")
             payload["capture_port"] = cap.get("mport")
+            if "carrier" in cap:
+                payload["capture_carrier"] = cap.get("carrier")
         if extra:
             payload.update(extra)
         path = self.status_dir / f"{self.id}.json"
@@ -840,7 +903,13 @@ class StreamMonitor:
     def _media_timeout_sec(self) -> float:
         return max(float(self.defaults.get("input_timeout_sec", 15.0)), 20.0)
 
+    def _link_blocks(self) -> bool:
+        return link_blocks_media(self._capture_stats(), _now_ts())
+
     def _media_ok(self) -> bool:
+        # 监测网口无载波时，进程还活着、缓冲里还有旧画面，也不算有信号
+        if self._link_blocks():
+            return False
         # -nostats 时解到流后几乎不再打 Video: 行；只要进程还在且曾经解到过，就算有信号
         if (
             self._last_media_ts
@@ -874,8 +943,34 @@ class StreamMonitor:
             self.logger.info("已解到音视频")
             self._write_status("running")
 
+    def _emit_link_down(self):
+        if "no_signal" in self._active_alarms:
+            return
+        self._active_alarms["no_signal"] = _now_ts()
+        iface = (self.iface or "").strip()
+        if iface:
+            message = "监测网口 %s 无载波，节目中断" % iface
+        else:
+            message = "监测网口无载波，节目中断"
+        ev = {
+            "type": "no_signal",
+            "phase": "start",
+            "channel_id": self.id,
+            "channel_name": self.name,
+            "message": message,
+            "time": _now_str(),
+        }
+        self.logger.warning(json.dumps(ev, ensure_ascii=False))
+        self._save_event(ev)
+        # 启动后网口已经是断的，不能一直停在「探测中」
+        self._write_status("running")
+
     def _check_no_signal(self):
         if self._state not in ("running", "starting"):
+            return
+        # 确认窗已经在 link_blocks_media 里算过，这里立刻记一条，不再看旧画面
+        if self._link_blocks():
+            self._emit_link_down()
             return
         if self._media_ok():
             if "no_signal" in self._active_alarms:

@@ -290,6 +290,7 @@ python3 -m uvicorn web.app:app --host 0.0.0.0 --port 8080
 - Worker 会**自动**按网卡抓包并喂给 FFmpeg，你**不必**再手动开 `mcast_iface_relay`
 - **同一** `url` + `iface` 的多个 `program` **共用一个**抓包进程
 - 进程需有权限抓包（一般用 **root** 跑 Manager，或具备 `CAP_NET_RAW`）
+- 监测网口没有载波约 5 秒后，这张网卡上的每一套节目都记为无信号（节目中断），卡片码率记 0。载波恢复并且重新收到组播后才记恢复。网口正常时，某一路组播安静不会因此整卡报中断
 - 日志：`logs/iface_capture_*.log`
 
 ## 6. 网络与组播检查（上线前必做）
