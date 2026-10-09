@@ -83,7 +83,6 @@
       <span><i class="dot red"></i>异常 <b id="sum-red">0</b></span>
       <span><i class="dot yellow"></i>离线/无信号 <b id="sum-yellow">0</b></span>
     </div>
-    <div id="node-strip" class="node-strip hidden"></div>
     <div id="alarm-strip" class="alarm-strip hidden">
       <div class="panel-head alarm-strip-head">
         <h2>异常节目</h2>
@@ -124,6 +123,13 @@
     </div>
     <div class="event-list" id="event-list-dash">
       <div class="empty">加载中…</div>
+    </div>
+    <div id="server-strip-wrap" class="server-strip-wrap hidden">
+      <div class="panel-head">
+        <h2>服务器性能</h2>
+        <span class="hint">各台路数、CPU、内存和最忙的网卡</span>
+      </div>
+      <div id="node-strip" class="node-strip"></div>
     </div>
   </section>
 
@@ -224,16 +230,6 @@
         </div>
       </div>
 
-      <div class="ctrl-block perf-panel" id="perf-panel">
-        <div class="perf-head">
-          <h3>服务器性能</h3>
-          <div class="perf-head-actions">
-            <span id="perf-time" class="hint"></span>
-            <button type="button" class="btn" id="btn-perf-refresh">刷新</button>
-          </div>
-        </div>
-        <div id="perf-detail" class="perf-board">加载中…</div>
-      </div>
     </div>
   </section>
 
@@ -321,6 +317,17 @@
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>
     </div>
+  </section>
+
+  <section class="panel perf-panel" id="perf-panel">
+    <div class="panel-head">
+      <h2>服务器性能</h2>
+      <div class="head-actions">
+        <span id="perf-time" class="hint"></span>
+        <button type="button" class="btn" id="btn-perf-refresh">刷新</button>
+      </div>
+    </div>
+    <div id="perf-detail" class="perf-board">加载中…</div>
   </section>
 
   <section class="panel" id="storage-anchor">

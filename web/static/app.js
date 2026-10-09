@@ -922,14 +922,17 @@
 
   function renderServerStrip(dash, perf) {
     const box = $("#node-strip");
+    const wrap = $("#server-strip-wrap");
     if (!box) return;
     const hub = (dash && dash.hub) || {};
     const nodes = hub.nodes || (dash && dash.nodes) || [];
     if (!hub.active || !nodes.length) {
-      box.classList.add("hidden");
+      if (wrap) wrap.classList.add("hidden");
+      else box.classList.add("hidden");
       box.innerHTML = "";
       return;
     }
+    if (wrap) wrap.classList.remove("hidden");
     const byId = {};
     ((perf && perf.nodes) || []).forEach((n) => {
       byId[n.id] = n;
@@ -1488,61 +1491,36 @@
     return `<div class="perf-bar"><span class="${perfLevel(pct)}" style="width:${n.toFixed(1)}%"></span></div>`;
   }
 
-  function fmtLink(mbps) {
-    const n = Number(mbps);
-    if (!n || n <= 0) return "";
-    if (n >= 1000 && n % 1000 === 0) return n / 1000 + " Gb/s";
-    return n + " Mb/s";
-  }
-
-  function perfMeter(label, value, pct, foot) {
-    return `<div class="perf-meter">
-      <div class="perf-meter-top"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>
-      ${perfBar(pct)}
-      <div class="perf-foot">${escapeHtml(foot)}</div>
-    </div>`;
-  }
-
-  function perfDetailHtml(p) {
-    const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
+  function perfCompactHtml(p) {
     const mem = p.memory || {};
     const disk = p.disk || {};
+    const cpu = p.cpu_percent != null ? p.cpu_percent + "%" : "-";
     const memPct = mem.used_percent != null ? mem.used_percent + "%" : "-";
     const diskPct = disk.used_percent != null ? disk.used_percent + "%" : "-";
     const load1 = p.loadavg && p.loadavg["1"] != null ? Number(p.loadavg["1"]).toFixed(2) : "-";
     const load5 = p.loadavg && p.loadavg["5"] != null ? Number(p.loadavg["5"]).toFixed(2) : "-";
-    const cores = p.cpu_cores != null ? p.cpu_cores + " 核" : "-";
-    const nicCards = (p.nics || [])
-      .map((n) => {
-        const car =
-          n.carrier === true ? "有载波" : n.carrier === false ? "无载波" : n.operstate || "-";
-        const link = fmtLink(n.speed_mbps);
-        const ip = n.ipv4 || "无地址";
-        const rx = fmtBitrate(n.rx_kbps) || "-";
-        const tx = fmtBitrate(n.tx_kbps) || "-";
-        const occ =
-          n.occupancy_percent != null ? Number(n.occupancy_percent).toFixed(1) + "%" : "速率未知";
-        const bits = [car, link, ip, "占用 " + occ, "发送 " + tx].filter(Boolean);
-        return `<div class="perf-nic">
-          <div class="perf-nic-top">
-            <span><span class="dot${n.up ? " on" : ""}">●</span>${escapeHtml(n.name || "")}</span>
-            <b>${escapeHtml(rx)}</b>
-          </div>
-          ${perfBar(n.occupancy_percent)}
-          <div class="perf-foot">${bits.map((t) => `<span>${escapeHtml(t)}</span>`).join("")}</div>
-        </div>`;
-      })
-      .join("");
+    const cores = p.cpu_cores != null ? p.cpu_cores + " 核" : "";
+    const nic = busiestNic(p);
+    const nicLabel = nic ? nic.name || "网卡" : "网卡";
+    const nicVal = nic ? fmtBitrate(nic.rx_kbps) || "-" : "-";
+    const nicBits = (p.nics || []).map((n) => {
+      const name = n.name || "网卡";
+      if (n.carrier === false) return name + " 无载波";
+      const rx = fmtBitrate(n.rx_kbps);
+      return rx ? name + " " + rx : name;
+    });
     const monBr = fmtBitrate(p.monitor_bitrate_kbps) || "-";
-    return `
-      <div class="perf-meters">
-        ${perfMeter("CPU", cpu, p.cpu_percent, cores + " · 负载 " + load1 + " / " + load5)}
-        ${perfMeter("内存", memPct, mem.used_percent, fmtBytes(mem.used_bytes) + " / " + fmtBytes(mem.total_bytes))}
-        ${perfMeter("磁盘", diskPct, disk.used_percent, "已用 " + fmtBytes(disk.used_bytes) + " · 剩余 " + fmtBytes(disk.free_bytes))}
+    const foot = [cores, "负载 " + load1 + " / " + load5, "监测合计 " + monBr]
+      .concat(nicBits)
+      .filter(Boolean)
+      .join(" · ");
+    return `<div class="perf-compact">
+        ${serverMini("CPU", p.cpu_percent, cpu)}
+        ${serverMini("内存", mem.used_percent, memPct)}
+        ${serverMini("磁盘", disk.used_percent, diskPct)}
+        ${serverMini(nicLabel, nic && nic.occupancy_percent, nicVal)}
       </div>
-      <div class="perf-net-head"><span>网络</span><span>监测节目合计 <b>${escapeHtml(monBr)}</b></span></div>
-      <div class="perf-nics">${nicCards || '<div class="empty">没有读到网卡</div>'}</div>
-    `;
+      <div class="perf-foot">${escapeHtml(foot)}</div>`;
   }
 
   async function refreshPerf() {
@@ -1559,7 +1537,6 @@
       if (lastDash) renderServerStrip(lastDash, data);
       if (!box) return;
       const nodes = (data && data.nodes) || [];
-      const multi = !!(data && data.active && nodes.length > 1);
       if (!nodes.length) {
         box.textContent = "没有性能数据";
         return;
@@ -1568,12 +1545,11 @@
         .map((node) => {
           const body =
             node.ok && node.perf
-              ? perfDetailHtml(node.perf)
+              ? perfCompactHtml(node.perf)
               : '<div class="empty">离线，读不到这台的性能</div>';
-          if (!multi) return body;
-          return `<section class="perf-node"><div class="perf-node-name"><i class="dot ${
+          return `<div class="perf-row"><div class="perf-row-name"><i class="dot ${
             node.ok ? "green" : "red"
-          }"></i>${escapeHtml(node.name || node.id)}</div><div class="perf-node-body">${body}</div></section>`;
+          }"></i>${escapeHtml(node.name || node.id)}</div><div class="perf-row-body">${body}</div></div>`;
         })
         .join("");
       const stamp = nodes.map((n) => n.perf && n.perf.time).filter(Boolean)[0];
