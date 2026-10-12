@@ -180,6 +180,10 @@
           <input type="number" id="inp-green-th" min="0" max="1" step="0.05" title="偏绿的画面要占到这个比例才算。另外，连成大约 8×8 的纯绿小块也会报" />
         </label>
         <label class="field-row">
+          <span>纯绿小块阈值</span>
+          <input type="number" id="inp-pure-green-th" min="0" max="1" step="0.00001" title="连成约 8×8 的纯绿小块占画面比例达到此值才报绿屏。默认 0.00001（约一块就报）。可调大以减少误报" />
+        </label>
+        <label class="field-row">
           <span>块状分数阈值</span>
           <input type="number" id="inp-block-th" min="0" max="1" step="0.01" title="只在检测模式为启发式时使用。内置花屏/马赛克不看这个值" />
         </label>

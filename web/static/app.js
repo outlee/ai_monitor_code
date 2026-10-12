@@ -542,6 +542,7 @@
     if ($("#inp-ai-confirm")) $("#inp-ai-confirm").value = ai.confirm_sec ?? 6;
     if ($("#inp-ai-threshold")) $("#inp-ai-threshold").value = ai.threshold ?? 0.55;
     if ($("#inp-green-th")) $("#inp-green-th").value = ai.green_ratio_th ?? 0.35;
+    if ($("#inp-pure-green-th")) $("#inp-pure-green-th").value = ai.pure_green_patch ?? 0.00001;
     if ($("#inp-block-th")) $("#inp-block-th").value = ai.block_score_th ?? 0.12;
     $("#sw-save-snapshot").checked = d.save_snapshot !== false;
     $("#inp-black").value = d.black_duration ?? 2;
@@ -1723,6 +1724,7 @@
         confirm_sec: parseFloat($("#inp-ai-confirm").value) || 6,
         threshold: parseFloat($("#inp-ai-threshold").value),
         green_ratio_th: parseFloat($("#inp-green-th").value),
+        pure_green_patch: parseFloat($("#inp-pure-green-th").value),
         block_score_th: parseFloat($("#inp-block-th").value),
       });
       toast(res.message || "AI 设置已保存", "ok");

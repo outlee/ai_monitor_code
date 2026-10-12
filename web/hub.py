@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from typing import Any, Callable, Dict, List, Optional
 from urllib.request import Request, urlopen
+
+_log = logging.getLogger(__name__)
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -234,15 +238,36 @@ def assemble_hub(
     }
 
 
-def fetch_json(base_url: str, path: str, timeout: float = 2.5) -> Optional[Dict[str, Any]]:
+def fetch_json(base_url: str, path: str, timeout: float = 6.0) -> Optional[Dict[str, Any]]:
+    """拉取远程 JSON。默认 6s（dashboard）；失败后短间隔重试 1 次并打 warning。"""
     url = base_url.rstrip("/") + path
-    req = Request(url, headers={"Accept": "application/json"})
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(2_000_000)
-    data = json.loads(raw.decode("utf-8"))
-    if not isinstance(data, dict):
-        return None
-    return data
+    last_exc: Optional[BaseException] = None
+    for attempt in range(2):
+        t0 = time.monotonic()
+        try:
+            req = Request(url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(2_000_000)
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            last_exc = exc
+            _log.warning(
+                "hub fetch failed node=%s path=%s attempt=%d timeout=%.1fs elapsed=%.2fs err=%s",
+                base_url,
+                path,
+                attempt + 1,
+                timeout,
+                elapsed,
+                exc,
+            )
+            if attempt == 0:
+                time.sleep(0.3)
+    assert last_exc is not None
+    raise last_exc
 
 
 def fetch_bytes(url: str, timeout: float = 4.0) -> Optional[bytes]:

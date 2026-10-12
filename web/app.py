@@ -478,6 +478,7 @@ class AIUpdate(BaseModel):
     threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
     green_ratio_th: Optional[float] = Field(None, ge=0.0, le=1.0)
     block_score_th: Optional[float] = Field(None, ge=0.0, le=1.0)
+    pure_green_patch: Optional[float] = Field(None, ge=0.0, le=1.0)
     confirm_sec: Optional[float] = Field(None, ge=1, le=60)
 
 
@@ -568,6 +569,7 @@ def api_overview():
             "threshold": float(ai.get("threshold", 0.55)),
             "green_ratio_th": float(ai.get("green_ratio_th", 0.35)),
             "block_score_th": float(ai.get("block_score_th", 0.12)),
+            "pure_green_patch": float(ai.get("pure_green_patch", 0.00001)),
             "confirm_sec": float(ai.get("confirm_sec", 6.0) or 6.0),
         },
         "defaults": _public_defaults(defaults, stale_sec),
@@ -1149,7 +1151,7 @@ def api_hub_perf():
     local = api_system_perf()
 
     def _fetch(url: str, path: str):
-        return hub_mod.fetch_json(url, path, timeout=1.5)
+        return hub_mod.fetch_json(url, path, timeout=3.0)
 
     return hub_mod.assemble_perf(nodes, local, _fetch)
 
@@ -1318,6 +1320,9 @@ def api_update_ai(body: AIUpdate):
     if body.block_score_th is not None:
         ai["block_score_th"] = float(body.block_score_th)
         changed.append(f"block_score_th={body.block_score_th}")
+    if body.pure_green_patch is not None:
+        ai["pure_green_patch"] = float(body.pure_green_patch)
+        changed.append("pure_green_patch=%s" % body.pure_green_patch)
     if body.confirm_sec is not None:
         ai["confirm_sec"] = float(body.confirm_sec)
         changed.append("confirm_sec=%s" % body.confirm_sec)

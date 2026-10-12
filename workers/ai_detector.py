@@ -144,6 +144,7 @@ def decide_picture_alarm(
     mosaic_th: float = BUILTIN_MOSAIC_RATIO,
     concealment: bool = False,
     pure_ratio: float = 0.0,
+    pure_th: float = PURE_GREEN_PATCH,
 ) -> Dict[str, Any]:
     """花屏看绿色占比，马赛克看方块占比。
 
@@ -157,7 +158,7 @@ def decide_picture_alarm(
     score = float(onnx_score or 0.0)
     pure = float(pure_ratio or 0.0)
     concealed = bool(concealment)
-    is_green = green >= float(green_th) or pure >= PURE_GREEN_PATCH
+    is_green = green >= float(green_th) or pure >= float(pure_th)
     is_block = mosaic >= float(mosaic_th)
     if is_green and is_block:
         label = "green_screen+mosaic"
@@ -239,6 +240,7 @@ def judge_rgb_alarm(
     h: int,
     green_th: float = 0.35,
     mosaic_th: float = BUILTIN_MOSAIC_RATIO,
+    pure_th: float = PURE_GREEN_PATCH,
 ) -> Dict[str, Any]:
     """用原始 RGB 判断花屏和马赛克。纯绿小块也算绿屏。"""
     green = rgb_green_ratio(buf, w, h)
@@ -270,6 +272,7 @@ def judge_rgb_alarm(
         mosaic_th=mosaic_th,
         concealment=conceal,
         pure_ratio=pure,
+        pure_th=pure_th,
     )
 
 
@@ -344,6 +347,15 @@ class AIDetector:
         self.threshold = float(ai_config.get("threshold", 0.55))
         self.green_ratio_th = float(ai_config.get("green_ratio_th", 0.35))
         self.block_score_th = float(ai_config.get("block_score_th", 0.12))
+        try:
+            pgp = float(ai_config.get("pure_green_patch", PURE_GREEN_PATCH))
+        except (TypeError, ValueError):
+            pgp = float(PURE_GREEN_PATCH)
+        if pgp < 0.0:
+            pgp = 0.0
+        if pgp > 1.0:
+            pgp = 1.0
+        self.pure_green_patch = pgp
         try:
             confirm = float(ai_config.get("confirm_sec", 6.0))
         except (TypeError, ValueError):
@@ -451,6 +463,7 @@ class AIDetector:
             "model_path": str(self.model_path),
             "interval_sec": self.interval_sec,
             "confirm_sec": self.confirm_sec,
+            "pure_green_patch": self.pure_green_patch,
         }
 
     def analyze_image(self, image_path: str) -> Dict[str, Any]:
@@ -562,6 +575,7 @@ class AIDetector:
             mosaic_th=BUILTIN_MOSAIC_RATIO,
             concealment=_frame_concealment(full),
             pure_ratio=pure,
+            pure_th=self.pure_green_patch,
         )
         judged["detail"]["raw"] = float(np.ravel(out)[0]) if out.size else score
         judged["message"] = "画面判定: %s (onnx=%.3f, mosaic=%.3f, green=%.3f)" % (
@@ -593,6 +607,7 @@ class AIDetector:
                     mosaic_th=BUILTIN_MOSAIC_RATIO,
                     concealment=_frame_concealment(full),
                     pure_ratio=_pure_green_ratio(full),
+                    pure_th=self.pure_green_patch,
                 )
                 base.update(judged)
                 base["backend"] = "builtin"
@@ -610,6 +625,7 @@ class AIDetector:
             54,
             green_th=self.green_ratio_th,
             mosaic_th=BUILTIN_MOSAIC_RATIO,
+            pure_th=self.pure_green_patch,
         )
         base.update(judged)
         base["backend"] = "builtin"
@@ -668,7 +684,7 @@ class AIDetector:
         block_score = float(np.mean(block_diffs) / 255.0) if block_diffs else 0.0
 
         # 综合判定。纯绿小块也算绿屏。
-        is_green = green_ratio >= self.green_ratio_th or pure >= PURE_GREEN_PATCH
+        is_green = green_ratio >= self.green_ratio_th or pure >= self.pure_green_patch
         is_blocky = block_score >= self.block_score_th
         is_anomaly = is_green or is_blocky
 
