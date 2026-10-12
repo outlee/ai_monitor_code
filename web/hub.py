@@ -104,6 +104,38 @@ def card_uid(node_id: str, channel_id: str) -> str:
     return "%s/%s" % (node_id, channel_id)
 
 
+def snapshot_url_for_event(ev: Dict[str, Any], node_id: str) -> str:
+    """告警点开用的截图地址。远程走汇总转发，本机直接读本机文件。"""
+    if not isinstance(ev, dict):
+        return ""
+    raw = str(ev.get("snapshot") or "").replace("\\", "/")
+    name = raw.split("/")[-1] if raw else ""
+    low = name.lower()
+    # 没有真实文件名就不编一个。无伴音在开始存图之前没有画面，编出来的地址是空的。
+    if (
+        not name
+        or not low.endswith(".jpg")
+        or low.startswith(".")
+        or low.startswith("latest")
+        or "/" in name
+        or ".." in name
+    ):
+        name = ""
+    cid = str(ev.get("channel_id") or "").strip()
+    if (
+        not name
+        or not cid
+        or "/" in cid
+        or ".." in cid
+        or "/" in name
+        or ".." in name
+    ):
+        return ""
+    if node_id and node_id != "local":
+        return "/api/hub/snap/%s/%s/%s" % (node_id, cid, name)
+    return "/api/snapshots/%s/%s" % (cid, name)
+
+
 def _rewrite_remote_thumb(node_id: str, thumb: str) -> str:
     if not thumb or not thumb.startswith("/api/snapshots/"):
         return thumb
@@ -218,6 +250,7 @@ def assemble_hub(
             row = dict(ev)
             row["node_id"] = nid
             row["node_name"] = name
+            row["snapshot_url"] = snapshot_url_for_event(row, nid if url else "local")
             events.append(row)
     # 每台先各留 40 条，再按时间排到一起。不能先把本机占满再截断，否则别的机器的新告警进不了汇总。
     events.sort(key=lambda ev: str(ev.get("time") or ""), reverse=True)

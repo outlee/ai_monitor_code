@@ -184,7 +184,10 @@ def query_alerts(
     since_ts: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     path = get_db_path()
-    sql = "SELECT id, time, ts, channel_id, channel_name, type, phase, message, score FROM alerts WHERE 1=1"
+    sql = (
+        "SELECT id, time, ts, channel_id, channel_name, type, phase, message, score, payload "
+        "FROM alerts WHERE 1=1"
+    )
     params: List[Any] = []
     if channel_id:
         sql += " AND channel_id=?"
@@ -205,7 +208,26 @@ def query_alerts(
             rows = cur.fetchall()
         finally:
             conn.close()
-    return [dict(r) for r in rows]
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        raw = item.pop("payload", None)
+        payload: Dict[str, Any] = {}
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except (TypeError, ValueError):
+                payload = {}
+        if payload.get("snapshot"):
+            item["snapshot"] = payload.get("snapshot")
+        if payload.get("audio_db") is not None:
+            item["audio_db"] = payload.get("audio_db")
+        if payload.get("audio_state"):
+            item["audio_state"] = payload.get("audio_state")
+        out.append(item)
+    return out
 
 
 def alert_stats_24h() -> Dict[str, Any]:

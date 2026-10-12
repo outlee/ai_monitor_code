@@ -695,16 +695,18 @@
 
   function vuTitle(db, state) {
     if (state === "none") return "这一路没有音频";
+    if (state === "silent") return "无音频";
     if (db == null || db === "" || !isFinite(Number(db))) return "暂无电平";
     return Math.round(Math.max(-60, Math.min(0, Number(db)))) + " dB";
   }
 
   function vuMeterHtml(id, db, state) {
     const view = state || "idle";
-    const pct = view === "none" || db == null || db === "" ? 0 : vuPercent(db);
+    const pct = view === "none" || view === "silent" || db == null || db === "" ? 0 : vuPercent(db);
     const mask = Math.max(0, Math.min(100, 100 - pct));
     const cls = ["vu"];
     if (view === "none") cls.push("vu-none");
+    if (view === "silent") cls.push("vu-silent");
     if (view === "idle") cls.push("vu-idle");
     return `<div class="${cls.join(" ")}" data-id="${escapeHtml(
       id || ""
@@ -718,8 +720,9 @@
     const state = (row && row.audio_state) || "idle";
     const db = row && row.audio_db != null && row.audio_db !== "" ? row.audio_db : null;
     el.classList.toggle("vu-none", state === "none");
+    el.classList.toggle("vu-silent", state === "silent");
     el.classList.toggle("vu-idle", state === "idle");
-    const pct = state === "none" || db == null ? 0 : vuPercent(db);
+    const pct = state === "none" || state === "silent" || db == null ? 0 : vuPercent(db);
     const mask = el.querySelector(".vu-mask");
     if (mask) mask.style.height = Math.max(0, Math.min(100, 100 - pct)).toFixed(1) + "%";
     const title = vuTitle(db, state);
@@ -1071,17 +1074,29 @@
       all.forEach((c) => {
         const tags = (c.active_alarms || []).filter(Boolean);
         tags.forEach((t) => {
+          const remembered = c.alarm_shots && c.alarm_shots[t];
+          const shot = remembered || shotForAlarm(dash, c, t);
+          let url = "";
+          if (remembered && remembered.file) {
+            const base = String(c.preview_base || "").replace(/\/$/, "");
+            url = base ? base + "/" + remembered.file : "";
+          } else if (shot && shot.snapshot_url) {
+            url = shot.snapshot_url;
+          }
           open.push({
             type: t,
-            channel_id: c.id,
+            channel_id: c.channel_id || c.id,
             channel_name: placeName({
               channel_name: c.name || c.id,
-              channel_id: c.id,
+              channel_id: c.channel_id || c.id,
               node_id: c.node_id,
               node_name: c.node_name,
             }),
             message: "未恢复",
-            time: dash.time || "",
+            time: (shot && shot.time) || dash.time || "",
+            snapshot_url: url,
+            audio_db: shot ? shot.audio_db : null,
+            audio_state: (shot && shot.audio_state) || (t === "silence" ? "silent" : ""),
           });
         });
       });
@@ -1089,6 +1104,7 @@
         evBox.innerHTML = `<div class="empty">当前没有未恢复的告警</div>`;
       } else {
         evBox.innerHTML = open.map(renderEventItem).join("");
+        bindShotClicks(evBox);
       }
     }
     renderRemoteRecent(dash);
@@ -1264,9 +1280,28 @@
           channel_name: placeName(ev),
           message: ev.message || ev.msg || "",
           time: ev.time || "",
+          snapshot_url: ev.snapshot_url || "",
+          audio_db: ev.audio_db,
+          audio_state: ev.audio_state || "",
         })
       )
       .join("");
+    bindShotClicks(box);
+  }
+
+  function shotForAlarm(dash, card, type) {
+    const cid = (card && (card.channel_id || card.id)) || "";
+    const node = (card && card.node_id) || "local";
+    const rows = (dash && dash.recent_events) || [];
+    for (let i = 0; i < rows.length; i++) {
+      const ev = rows[i];
+      if (!ev || ev.type !== type || !ev.snapshot_url) continue;
+      if ((ev.channel_id || "") !== cid) continue;
+      const nid = ev.node_id || "local";
+      if (nid !== node && !(node === "" && nid === "local")) continue;
+      return ev;
+    }
+    return null;
   }
 
   function renderOverview(data) {
@@ -1395,15 +1430,32 @@
     const name = ev.channel_name || ev.channel_id || "";
     const abs = ev.time || "";
     const rel = relativeTime(abs);
+    const url = ev.snapshot_url || "";
+    const state = ev.audio_state || (String(t).indexOf("silence") === 0 ? "silent" : "");
+    const db = ev.audio_db == null || ev.audio_db === "" ? "" : String(ev.audio_db);
+    const cap = (name ? name + " · " : "") + typeLabel(t) + (abs ? " · " + abs : "");
     return `
-      <div class="event-item ${typeClass(t)}">
+      <div class="event-item ${typeClass(t)}${url ? " event-shot" : ""}" data-snap="${escapeHtml(
+        url
+      )}" data-cap="${escapeHtml(cap)}" data-db="${escapeHtml(db)}" data-state="${escapeHtml(state)}">
         <div class="event-top">
           <span class="event-type">${escapeHtml(typeLabel(t))}</span>
           <span class="event-time" title="${escapeHtml(abs)}">${escapeHtml(rel || abs)}</span>
         </div>
-        <div class="event-msg"><strong>${escapeHtml(name)}</strong> ${escapeHtml(msg)}</div>
+        <div class="event-msg"><strong>${escapeHtml(name)}</strong> ${escapeHtml(msg)}${
+          url ? " · 点击看当时的画面" : ""
+        }</div>
         <div class="event-time" style="margin-top:4px;font-size:11px;color:var(--muted)">${escapeHtml(abs)}</div>
       </div>`;
+  }
+
+  function bindShotClicks(root) {
+    if (!root) return;
+    root.querySelectorAll(".event-shot").forEach((el) => {
+      el.addEventListener("click", () => {
+        openLightbox(el.dataset.snap, el.dataset.cap, el.dataset.db, el.dataset.state);
+      });
+    });
   }
 
   async function loadEventsPage() {
@@ -1426,6 +1478,7 @@
         box.innerHTML = `<div class="empty">没有匹配的告警</div>`;
       } else {
         box.innerHTML = alerts.map(renderEventItem).join("");
+        bindShotClicks(box);
       }
       const page = Math.floor(evOffset / EV_PAGE) + 1;
       const pages = Math.max(1, Math.ceil(evTotal / EV_PAGE));
@@ -1447,20 +1500,31 @@
     grid.innerHTML = snaps
       .map((s) => {
         const title = s.channel_name || s.channel_id;
+        const kind = (s.filename || "").split("_")[0];
+        const state = s.audio_state || (kind === "silence" ? "silent" : "");
+        const db = s.audio_db == null || s.audio_db === "" ? "" : String(s.audio_db);
         const cap = `${title} · ${s.filename} · ${s.mtime}`;
         return `
-      <div class="snap-card" data-url="${escapeHtml(s.url)}" data-cap="${escapeHtml(cap)}">
-        <img src="${escapeHtml(s.url)}" loading="lazy" alt="${escapeHtml(title)}" />
+      <div class="snap-card" data-url="${escapeHtml(s.url)}" data-cap="${escapeHtml(
+          cap
+        )}" data-db="${escapeHtml(db)}" data-state="${escapeHtml(state)}">
+        <div class="snap-media">
+          <img src="${escapeHtml(s.url)}" loading="lazy" alt="${escapeHtml(title)}" />
+          ${vuMeterHtml("", db, state || "idle")}
+        </div>
         <div class="snap-meta">
           <strong>${escapeHtml(s.node_name ? s.node_name + " · " + title : title)}</strong>
           <span style="color:var(--muted);font-size:11px"> ${escapeHtml(s.channel_id || "")}</span><br/>
-          ${escapeHtml(typeLabel((s.filename || "").split("_")[0]))} · ${escapeHtml(relativeTime(s.mtime) || s.mtime)}
+          ${escapeHtml(typeLabel(kind))} · ${escapeHtml(relativeTime(s.mtime) || s.mtime)}
+          ${state === "silent" ? ' · <span class="snap-silent">无音频</span>' : ""}
         </div>
       </div>`;
       })
       .join("");
     grid.querySelectorAll(".snap-card").forEach((el) => {
-      el.addEventListener("click", () => openLightbox(el.dataset.url, el.dataset.cap));
+      el.addEventListener("click", () =>
+        openLightbox(el.dataset.url, el.dataset.cap, el.dataset.db, el.dataset.state)
+      );
     });
   }
 
@@ -1507,9 +1571,24 @@
     }
   }
 
-  function openLightbox(url, cap) {
-    $("#lb-img").src = url;
-    $("#lb-cap").textContent = cap || "";
+  function openLightbox(url, cap, db, state) {
+    const img = $("#lb-img");
+    if (img) {
+      img.onerror = () => {
+        const note = $("#lb-cap");
+        if (note && note.textContent.indexOf("截图不在") < 0) {
+          note.textContent = (note.textContent || "") + " · 当时的截图不在了";
+        }
+      };
+      img.src = url || "";
+    }
+    const note = $("#lb-cap");
+    if (note) note.textContent = cap || "";
+    const holder = $("#lb-vu");
+    if (holder) {
+      holder.classList.remove("hidden");
+      holder.innerHTML = vuMeterHtml("", db, state || "idle");
+    }
     $("#lightbox").classList.remove("hidden");
   }
 

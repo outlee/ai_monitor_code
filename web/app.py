@@ -37,12 +37,12 @@ from pydantic import BaseModel, Field
 try:
     from web.channel_order import merge_channel_order, sort_cards_by_order
     from web.channel_meta import clean_categories, resolve_categories
-    from web.snapshot_names import is_alarm_snapshot, is_proxy_image
+    from web.snapshot_names import is_alarm_snapshot, is_proxy_image, pick_alarm_file
     from web import hub as hub_mod
 except ImportError:
     from channel_order import merge_channel_order, sort_cards_by_order
     from channel_meta import clean_categories, resolve_categories
-    from snapshot_names import is_alarm_snapshot, is_proxy_image
+    from snapshot_names import is_alarm_snapshot, is_proxy_image, pick_alarm_file
     import hub as hub_mod
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -291,6 +291,156 @@ def _channel_name_map() -> Dict[str, str]:
     return m
 
 
+def _snapshot_audio(path: Path) -> Tuple[Optional[float], str]:
+    """截图旁边记下的当时电平。无伴音文件没有旁路文件时也标成无音频。"""
+    db: Optional[float] = None
+    state = ""
+    side = Path(str(path) + ".audio.json")
+    if side.is_file():
+        try:
+            meta = json.loads(side.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            meta = None
+        if isinstance(meta, dict):
+            raw = meta.get("audio_db")
+            if raw is not None and raw != "":
+                try:
+                    db = float(raw)
+                except (TypeError, ValueError):
+                    db = None
+            state = str(meta.get("audio_state") or "")
+    if path.name.startswith("silence"):
+        state = "silent"
+        if db is None:
+            db = -120.0
+    if not state:
+        state = "level" if db is not None else "idle"
+    return db, state
+
+
+def _safe_channel_id(channel_id: object) -> str:
+    cid = str(channel_id or "").strip()
+    if not cid or "/" in cid or "\\" in cid or ".." in cid:
+        return ""
+    return cid
+
+
+def _jpeg_names(channel_id: str, cache: Dict[str, set]) -> set:
+    if channel_id in cache:
+        return cache[channel_id]
+    names: set = set()
+    folder = SNAPSHOT_DIR / channel_id
+    if folder.is_dir():
+        try:
+            for path in folder.glob("*.jpg"):
+                names.add(path.name)
+        except OSError:
+            pass
+    cache[channel_id] = names
+    return names
+
+
+def _resolve_shot_name(ev: Dict, cache: Dict[str, set]) -> str:
+    cid = _safe_channel_id(ev.get("channel_id"))
+    if not cid:
+        return ""
+    return pick_alarm_file(
+        _jpeg_names(cid, cache),
+        str(ev.get("type") or ""),
+        str(ev.get("time") or ""),
+        str(ev.get("snapshot") or ""),
+    )
+
+
+def _attach_snapshot_urls(events: List[Dict], node_id: str = "local") -> List[Dict]:
+    """给告警补上可点开的截图地址。文件名对不上时钟时，改用目录里那张最近的。"""
+    cache: Dict[str, set] = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        name = _resolve_shot_name(ev, cache)
+        cid = _safe_channel_id(ev.get("channel_id"))
+        path = SNAPSHOT_DIR / cid / name if name and cid else None
+        if path is not None and path.is_file():
+            ev["snapshot"] = name
+            if ev.get("audio_db") is None or not ev.get("audio_state"):
+                db, state = _snapshot_audio(path)
+                if ev.get("audio_db") is None:
+                    ev["audio_db"] = db
+                if not ev.get("audio_state"):
+                    ev["audio_state"] = state
+            ev["snapshot_url"] = hub_mod.snapshot_url_for_event(ev, node_id)
+        else:
+            ev.pop("snapshot", None)
+            ev["snapshot_url"] = ""
+    return events
+
+
+def _event_shot_index(events: List[Dict]) -> Dict[Tuple[str, str], Dict]:
+    """每个节目、每种仍可能未恢复的告警，留最近一张真实存在的截图。"""
+    found: Dict[Tuple[str, str], Dict] = {}
+    cache: Dict[str, set] = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        kind = str(ev.get("type") or "")
+        if kind in ("stream_down", "no_signal") or not _is_alarm_event_type(kind):
+            continue
+        cid = _safe_channel_id(ev.get("channel_id"))
+        if not cid:
+            continue
+        key = (cid, kind)
+        if key in found:
+            continue
+        name = _resolve_shot_name(ev, cache)
+        path = SNAPSHOT_DIR / cid / name if name else None
+        if path is None or not path.is_file():
+            continue
+        db, state = _snapshot_audio(path)
+        if ev.get("audio_db") is not None:
+            db = ev.get("audio_db")
+        if ev.get("audio_state"):
+            state = str(ev.get("audio_state"))
+        found[key] = {
+            "file": name,
+            "time": str(ev.get("time") or ""),
+            "audio_db": db,
+            "audio_state": state,
+        }
+    return found
+
+
+def _card_alarm_shots(info: Dict, shot_index: Dict[Tuple[str, str], Dict]) -> Dict[str, Dict]:
+    """未恢复告警点开用。监测进程记下的文件名优先，否则用最近事件对上的那张。"""
+    shots: Dict[str, Dict] = {}
+    status_shots = info.get("open_shots") if isinstance(info.get("open_shots"), dict) else {}
+    cid = _safe_channel_id(info.get("id"))
+    for raw in info.get("active_alarms") or []:
+        kind = str(raw or "")
+        if not kind or kind.endswith("_end") or kind in ("stream_down", "no_signal"):
+            continue
+        remembered = status_shots.get(kind) if isinstance(status_shots, dict) else None
+        remembered_name = str((remembered or {}).get("file") or "") if isinstance(remembered, dict) else ""
+        remembered_path = SNAPSHOT_DIR / cid / remembered_name if cid and remembered_name else None
+        if (
+            isinstance(remembered, dict)
+            and is_alarm_snapshot(remembered_name)
+            and remembered_path is not None
+            and remembered_path.is_file()
+        ):
+            shots[kind] = {
+                "file": remembered_name,
+                "time": str(remembered.get("time") or ""),
+                "audio_db": remembered.get("audio_db"),
+                "audio_state": str(remembered.get("audio_state") or ""),
+            }
+            continue
+        found = shot_index.get((cid, kind))
+        if found:
+            shots[kind] = found
+    return shots
+
+
 def _list_snapshots(
     channel_id: Optional[str] = None,
     limit: int = 40,
@@ -313,6 +463,7 @@ def _list_snapshots(
                 continue
             try:
                 st = f.stat()
+                audio_db, audio_state = _snapshot_audio(f)
                 items.append(
                     {
                         "channel_id": d.name,
@@ -324,6 +475,8 @@ def _list_snapshots(
                             "%Y-%m-%d %H:%M:%S"
                         ),
                         "mtime_ts": st.st_mtime,
+                        "audio_db": audio_db,
+                        "audio_state": audio_state,
                     }
                 )
             except OSError:
@@ -417,6 +570,8 @@ def _channel_stats(
             info["heartbeat"] = st.get("last_heartbeat")
             info["state"] = st.get("state")
             info["active_alarms"] = st.get("active_alarms") or []
+            raw_shots = st.get("open_shots")
+            info["open_shots"] = raw_shots if isinstance(raw_shots, dict) else {}
             info["reconnect_count"] = st.get("reconnect_count") or 0
             info["pkt_rate"] = st.get("pkt_rate")
             info["bitrate_kbps"] = st.get("bitrate_kbps")
@@ -574,7 +729,7 @@ def api_overview():
         },
         "defaults": _public_defaults(defaults, stale_sec),
         "channels": stats,
-        "recent_events": events[:50],
+        "recent_events": _attach_snapshot_urls(events[:50]),
         "note": "配置已支持热重载：Manager/Worker 运行中修改将在数秒内自动生效（可用 --no-reload 关闭）",
     }
 
@@ -844,6 +999,7 @@ def api_dashboard():
     stale_sec = float(defaults.get("status_stale_sec", 30.0))
     events = _read_events(limit=100)
     stats = _channel_stats(channels, events, stale_sec=stale_sec)
+    shot_index = _event_shot_index(events)
 
     # 四色灯：ok / alarm / offline|stale|reconnecting / disabled
     def lamp(st: str) -> str:
@@ -882,6 +1038,7 @@ def api_dashboard():
                 "lamp": lamp(s["status"]),
                 "last_type": s.get("last_type"),
                 "active_alarms": s.get("active_alarms") or [],
+                "alarm_shots": _card_alarm_shots(s, shot_index),
                 "program": s.get("program"),
                 "enabled": s.get("enabled", True),
                 "thumb_url": thumb,
@@ -928,7 +1085,7 @@ def api_dashboard():
             "gray": sum(1 for c in cards if c["lamp"] == "gray"),
         },
         "stats_24h": hist,
-        "recent_events": events[:30],
+        "recent_events": _attach_snapshot_urls(events[:30]),
         "card_order": order_ids,
         "hub": {"active": False, "nodes": []},
     }
@@ -993,6 +1150,7 @@ def api_alerts_history(
 
     total = len(rows)
     page = rows[offset : offset + limit]
+    _attach_snapshot_urls(page)
     return {
         "source": source,
         "total": total,

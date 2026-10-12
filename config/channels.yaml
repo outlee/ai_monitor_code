@@ -14,7 +14,7 @@ defaults:
   status_stale_sec: 30.0        # 超过此时长无心跳视为 stale
   events_max_bytes: 52428800    # events.jsonl 轮转阈值（50MB）
   events_keep_files: 5          # 保留 events.jsonl.1 .. .N
-  snapshot_max_per_channel: 100 # 每频道最多保留截图数
+  snapshot_max_per_channel: 500 # 每频道最多保留截图数
   # P2 性能参数
   detect_width: 480             # 规则检测最大宽度，0=全分辨率；建议 320~640
   frame_interval_sec: 2.0       # 旁路 latest.jpg 刷新间隔；0=关闭旁路

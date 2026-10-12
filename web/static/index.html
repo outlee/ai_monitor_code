@@ -119,14 +119,14 @@
 
     <div class="panel-head" style="margin-top:16px" id="events-anchor">
       <h2>未恢复告警</h2>
-      <span class="hint">仍在持续的会大约每 20 秒再响一次，直到恢复 · 完整日志在「管理 → 最近事件」</span>
+      <span class="hint">仍在持续的会大约每 20 秒再响一次。有当时画面的，点这一条就能看</span>
     </div>
     <div class="event-list" id="event-list-dash">
       <div class="empty">加载中…</div>
     </div>
     <div class="panel-head hidden" style="margin-top:16px" id="remote-events-head">
       <h2>其他服务器最近告警</h2>
-      <span class="hint">花屏、马赛克和已经恢复的也会列在这里，并带上是哪一台</span>
+      <span class="hint">点一条看当时的画面。花屏、马赛克和已经恢复的也会列在这里，并带上是哪一台</span>
     </div>
     <div class="event-list hidden" id="event-list-remote"></div>
     <div id="server-strip-wrap" class="server-strip-wrap hidden">
@@ -282,7 +282,7 @@
     <section class="panel" id="manage-events-hint">
       <div class="panel-head">
         <h2>最近事件</h2>
-        <span class="hint">完整事件日志 · 支持筛选、搜索、翻页</span>
+        <span class="hint">本机事件。有当时画面的可以点开。支持筛选、搜索、翻页</span>
       </div>
       <div class="event-toolbar">
         <input type="search" id="ev-q" placeholder="搜索节目名/ID/类型/内容" />
@@ -315,13 +315,13 @@
   <section class="panel snapshots-panel" id="snapshots-anchor">
     <div class="panel-head">
       <h2>异常截图</h2>
-      <span class="hint">只显示告警当时留下的画面，不含大屏实时图</span>
+      <span class="hint">告警当时的画面，不含大屏实时图。右侧音柱是当时音量，标着无音频的就是没有声音</span>
     </div>
     <div class="event-toolbar snap-toolbar">
       <button type="button" class="btn" id="snap-prev">上一页</button>
       <button type="button" class="btn" id="snap-next">下一页</button>
       <span class="hint" id="snap-page-info">-</span>
-      <span class="hint">每路节目大约只保留最近 100 张，更早的会自动删掉</span>
+      <span class="hint">每路节目大约只保留最近 500 张，更早的会自动删掉</span>
     </div>
     <div class="snap-grid" id="snap-grid">
       <div class="empty">暂无截图</div>
@@ -366,7 +366,10 @@
 
   <div id="lightbox" class="lightbox hidden">
     <button class="lb-close" id="lb-close">×</button>
-    <img id="lb-img" alt="snapshot" />
+    <div id="lb-stage">
+      <img id="lb-img" alt="snapshot" />
+      <div id="lb-vu" class="hidden"></div>
+    </div>
     <div id="lb-cap"></div>
   </div>
 

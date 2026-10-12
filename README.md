@@ -228,7 +228,7 @@ defaults:
   status_stale_sec: 30.0
   events_max_bytes: 52428800    # 50MB
   events_keep_files: 5
-  snapshot_max_per_channel: 100
+  snapshot_max_per_channel: 500
   # P2 性能
   detect_width: 480             # 规则检测缩放宽度，0=不缩放
   frame_interval_sec: 2.0       # 旁路帧间隔；0=关闭

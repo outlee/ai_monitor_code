@@ -23,7 +23,7 @@ defaults:
   # ---------- 截图 ----------
   save_snapshot: true          # 告警时是否保存截图
   snapshot_dir: ./snapshots    # 截图根目录（其下按频道 id 分子目录）
-  snapshot_max_per_channel: 100  # 每频道最多保留截图张数（不含 latest.jpg）
+  snapshot_max_per_channel: 500  # 每频道最多保留截图张数（不含 latest.jpg）
   snapshot_prefer_latest: true # 告警截图优先用旁路 latest（足够新时）
   latest_max_age_sec: 5.0      # 认为 latest.jpg「可用」的最大年龄（秒）
 

@@ -13,17 +13,105 @@ sys.path.insert(0, str(ROOT / "workers"))
 
 from channel_meta import clean_categories, clean_category, resolve_categories  # noqa: E402
 from freeze_rules import effective_freeze_seconds  # noqa: E402
-from hub import assemble_hub, assemble_perf, hub_is_active, normalize_node_list  # noqa: E402
+from hub import (  # noqa: E402
+    assemble_hub,
+    assemble_perf,
+    hub_is_active,
+    normalize_node_list,
+    snapshot_url_for_event,
+)
 from monitor_worker import (  # noqa: E402
     alarm_ring_tail,
     alarm_tail_nbytes,
     alarm_tail_span_sec,
     alarm_tail_spans,
 )
-from snapshot_names import is_alarm_snapshot  # noqa: E402
+from snapshot_names import is_alarm_snapshot, pick_alarm_file  # noqa: E402
 
 
 class SnapshotNameTests(unittest.TestCase):
+    def test_alarm_url_uses_the_saved_name_or_the_clock(self):
+        ev = {
+            "type": "ai_green_screen",
+            "time": "2026-10-09 08:45:09",
+            "channel_id": "v30_jinying",
+        }
+        self.assertEqual(snapshot_url_for_event(ev, "room2"), "")
+        self.assertEqual(snapshot_url_for_event(ev, "local"), "")
+        saved = dict(ev)
+        saved["snapshot"] = (
+            "/opt/ai_monitor_code/snapshots/v30_jinying/"
+            "ai_green_screen_20261009_084509.jpg"
+        )
+        self.assertEqual(
+            snapshot_url_for_event(saved, "room2"),
+            "/api/hub/snap/room2/v30_jinying/ai_green_screen_20261009_084509.jpg",
+        )
+        self.assertEqual(
+            snapshot_url_for_event(saved, "local"),
+            "/api/snapshots/v30_jinying/ai_green_screen_20261009_084509.jpg",
+        )
+        named = {
+            "type": "freeze",
+            "time": "2026-10-12 12:00:00",
+            "channel_id": "hd_92",
+            "snapshot": "/opt/ai_monitor_code/snapshots/hd_92/freeze_20261012_120011.jpg",
+        }
+        self.assertEqual(
+            snapshot_url_for_event(named, "n176"),
+            "/api/hub/snap/n176/hd_92/freeze_20261012_120011.jpg",
+        )
+        self.assertEqual(
+            snapshot_url_for_event(
+                {
+                    "type": "freeze_end",
+                    "time": "2026-10-09 08:45:09",
+                    "channel_id": "hd_92",
+                },
+                "local",
+            ),
+            "",
+        )
+        self.assertEqual(
+            snapshot_url_for_event(
+                {
+                    "type": "stream_down",
+                    "time": "2026-10-09 08:45:09",
+                    "channel_id": "hd_92",
+                },
+                "local",
+            ),
+            "",
+        )
+
+    def test_nearby_jpeg_matches_when_confirm_delays_the_file(self):
+        names = [
+            "freeze_20261012_120011.jpg",
+            "freeze_20261012_130000.jpg",
+            "silence_20261012_120000.jpg",
+            "latest.jpg",
+            "ai_green_screen_mosaic_20261012_080001.jpg",
+        ]
+        self.assertEqual(
+            pick_alarm_file(names, "freeze", "2026-10-12 12:00:00"),
+            "freeze_20261012_120011.jpg",
+        )
+        self.assertEqual(
+            pick_alarm_file(
+                names,
+                "freeze",
+                "2026-10-12 12:00:00",
+                "snapshots/hd_92/freeze_20261012_130000.jpg",
+            ),
+            "freeze_20261012_130000.jpg",
+        )
+        self.assertEqual(pick_alarm_file(names, "freeze_end", "2026-10-12 12:00:11"), "")
+        self.assertEqual(
+            pick_alarm_file(names, "ai_green_screen", "2026-10-12 08:00:00"),
+            "ai_green_screen_mosaic_20261012_080001.jpg",
+        )
+        self.assertFalse(is_alarm_snapshot("latest.jpg"))
+
     def test_live_frames_are_not_alarms(self):
         self.assertFalse(is_alarm_snapshot("latest.jpg"))
         self.assertFalse(is_alarm_snapshot("latest_ok.jpg"))
@@ -151,6 +239,10 @@ class HubTests(unittest.TestCase):
                         "channel_id": "v30_jinying",
                         "channel_name": "金鹰卡通HD",
                         "message": "检测到花屏",
+                        "snapshot": (
+                            "/opt/ai_monitor_code/snapshots/v30_jinying/"
+                            "ai_green_screen_20261009_084509.jpg"
+                        ),
                     }
                 ],
                 "stats_24h": None,
@@ -165,6 +257,10 @@ class HubTests(unittest.TestCase):
         self.assertEqual(len(remote), 1)
         self.assertEqual(remote[0]["channel_name"], "金鹰卡通HD")
         self.assertEqual(merged["recent_events"][0]["node_id"], "room2")
+        self.assertEqual(
+            remote[0]["snapshot_url"],
+            "/api/hub/snap/room2/v30_jinying/ai_green_screen_20261009_084509.jpg",
+        )
 
     def test_alarm_tail_stays_inside_the_anomaly(self):
         # 静帧确认时已经持续约 12 秒。截图只取尾部两三秒，不能把整段缓冲头部的正常节目解进去。

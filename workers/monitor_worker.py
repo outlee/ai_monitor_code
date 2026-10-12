@@ -380,7 +380,7 @@ class StreamMonitor:
         self.events_max_bytes = int(defaults.get("events_max_bytes", 50 * 1024 * 1024))
         self.events_keep_files = int(defaults.get("events_keep_files", 5))
         self.snapshot_max_per_channel = int(
-            defaults.get("snapshot_max_per_channel", 100)
+            defaults.get("snapshot_max_per_channel", 500)
         )
 
         # 性能参数 (P2)
@@ -432,8 +432,8 @@ class StreamMonitor:
 
         self._state = "init"
         self._active_alarms: Dict[str, float] = {}  # type -> start_ts
+        self._open_shots: Dict[str, Dict] = {}  # 未恢复告警 → 当时的截图
         self._status_lock = threading.Lock()
-        self._snapshot_inflight = False
         self._snapshot_lock = threading.Lock()
         self._ring_grab_lock = threading.Lock()
         self._thumb_thread: Optional[threading.Thread] = None
@@ -794,6 +794,23 @@ class StreamMonitor:
 
     # ---------- 心跳状态 ----------
 
+    def _public_open_shots(self) -> Dict[str, Dict]:
+        """未恢复告警对应的截图文件名。只给网页文件名，不给本机绝对路径。"""
+        out: Dict[str, Dict] = {}
+        for key, shot in self._open_shots.items():
+            if not isinstance(shot, dict):
+                continue
+            name = str(shot.get("file") or "")
+            if not _is_alarm_snapshot_name(name):
+                continue
+            out[str(key)] = {
+                "file": name,
+                "time": str(shot.get("time") or ""),
+                "audio_db": shot.get("audio_db"),
+                "audio_state": str(shot.get("audio_state") or ""),
+            }
+        return out
+
     def _write_status(self, state: Optional[str] = None, extra: Optional[Dict] = None):
         if state is not None:
             self._state = state
@@ -827,6 +844,7 @@ class StreamMonitor:
             "media_ok": self._media_ok(),
             "reconnect_count": self.reconnect_count,
             "active_alarms": list(self._active_alarms.keys()),
+            "open_shots": self._public_open_shots(),
             "detect_width": self.detect_width,
             "frame_interval_sec": self.frame_interval_sec,
             "latest_frame_age_sec": round(latest_age, 2)
@@ -1945,6 +1963,11 @@ class StreamMonitor:
                     old.unlink(missing_ok=True)
                 except OSError:
                     pass
+                side = Path(str(old) + ".audio.json")
+                try:
+                    side.unlink(missing_ok=True)
+                except OSError:
+                    pass
         except OSError as e:
             self.logger.debug(f"截图清理失败: {e}")
 
@@ -2489,15 +2512,42 @@ class StreamMonitor:
                 pass
             return False
 
+    def _snap_audio_now(self):
+        """告警落下这一刻的电平。无伴音条要空，不能等截图线程跑完再读。"""
+        db = self._audio_level_value()
+        state = self._audio_state()
+        return db, state
+
+    def _write_snap_audio(self, dest: Path, db, state: str) -> None:
+        if dest is None:
+            return
+        if str(dest.name).startswith("silence"):
+            state = "silent"
+        path = Path(str(dest) + ".audio.json")
+        try:
+            path.write_text(
+                json.dumps(
+                    {"audio_db": db, "audio_state": state},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            self.logger.debug("写入截图电平失败: %s" % e)
+
     def _take_snapshot(self, event_type: str, started: Optional[float] = None) -> Optional[Path]:
         """
-        黑场/静帧留下当时的异常画面。
+        黑场、静帧、无伴音留下当时的画面。
         大屏合格图可能是异常开始前的正常节目，不能拿来当告警截图。
         网卡收流时从收包缓冲尾部抽一帧，不再另开一路 UDP。
+        文件名先定下来，告警记录立刻指向它；画面在后台写入。
         """
-        if event_type in ("stream_down",) or str(event_type).endswith("_end"):
+        if event_type in ("stream_down", "no_signal") or str(event_type).endswith("_end"):
             return None
-        visual = event_type in ("black", "freeze") or str(event_type).startswith("ai_")
+        visual = (
+            event_type in ("black", "freeze", "silence")
+            or str(event_type).startswith("ai_")
+        )
         if not visual:
             return None
 
@@ -2509,41 +2559,44 @@ class StreamMonitor:
                 age = max(0.0, _now_ts() - float(started))
             except (TypeError, ValueError):
                 age = 0.0
+        audio_db, audio_state = self._snap_audio_now()
+        if event_type == "silence":
+            audio_state = "silent"
 
         def _bg():
+            # 静帧和无伴音会接连落下。排队写，不能因为上一张还在抓就丢掉这一张。
             with self._snapshot_lock:
-                if self._snapshot_inflight:
-                    return
-                self._snapshot_inflight = True
-            try:
-                if self._capture_key:
-                    blob = self._grab_alarm_from_ring(age)
-                    if blob and self._store_alarm_jpeg(out_path, blob):
-                        self.logger.info("截图已保存(异常画面): %s" % out_path)
+                try:
+                    saved = False
+                    if self._capture_key:
+                        blob = self._grab_alarm_from_ring(age)
+                        if blob and self._store_alarm_jpeg(out_path, blob):
+                            self.logger.info("截图已保存(异常画面): %s" % out_path)
+                            saved = True
+                        else:
+                            self.logger.warning("截图失败: %s" % out_path)
+                    elif self._grab_frame_ffmpeg(out_path, quality=3, keyframe_only=True):
+                        try:
+                            if out_path.stat().st_size < 2048:
+                                out_path.unlink()
+                                self.logger.warning("截图过小已丢弃（可能花屏）")
+                            else:
+                                self.logger.info("截图已保存(关键帧): %s" % out_path)
+                                saved = True
+                        except OSError:
+                            pass
+                    else:
+                        self.logger.warning("截图失败: %s" % out_path)
+                    if saved:
+                        self._write_snap_audio(out_path, audio_db, audio_state)
                         self._prune_snapshots()
-                        return
-                    self.logger.warning("截图失败: %s" % out_path)
-                    return
-                if self._grab_frame_ffmpeg(out_path, quality=3, keyframe_only=True):
-                    try:
-                        if out_path.stat().st_size < 2048:
-                            out_path.unlink()
-                            self.logger.warning("截图过小已丢弃（可能花屏）")
-                            return
-                    except OSError:
-                        pass
-                    self.logger.info("截图已保存(关键帧): %s" % out_path)
-                    self._prune_snapshots()
-                else:
-                    self.logger.warning("截图失败: %s" % out_path)
-            finally:
-                with self._snapshot_lock:
-                    self._snapshot_inflight = False
+                except Exception as exc:
+                    self.logger.warning("截图失败: %s" % exc)
 
         threading.Thread(
-            target=_bg, name=f"snap-{self.id}-{event_type}", daemon=True
+            target=_bg, name="snap-%s-%s" % (self.id, event_type), daemon=True
         ).start()
-        return None
+        return out_path
 
     # ---------- FFmpeg 行解析 ----------
 
@@ -2572,6 +2625,17 @@ class StreamMonitor:
             snap = self._take_snapshot(event["type"], started=started)
             if snap:
                 event["snapshot"] = str(snap)
+                event["audio_db"] = self._audio_level_value()
+                if event.get("type") == "silence":
+                    event["audio_state"] = "silent"
+                else:
+                    event["audio_state"] = self._audio_state()
+                self._open_shots[alarm_key] = {
+                    "file": snap.name,
+                    "time": str(event.get("time") or ""),
+                    "audio_db": event.get("audio_db"),
+                    "audio_state": str(event.get("audio_state") or ""),
+                }
         self.logger.warning(json.dumps(event, ensure_ascii=False))
         self._save_event(event)
         self._write_status()
@@ -2672,6 +2736,7 @@ class StreamMonitor:
             if alarm_key not in self._active_alarms:
                 return
             start_ts = self._active_alarms.pop(alarm_key, None)
+            self._open_shots.pop(alarm_key, None)
             wall = round(_now_ts() - start_ts, 3) if start_ts else None
             if wall is not None:
                 # 静帧以墙钟为准；FFmpeg freeze_duration 仍可能是错误 PTS
@@ -2932,6 +2997,9 @@ class StreamMonitor:
                     archive = work_path
             except OSError:
                 archive = work_path
+            audio_db, audio_state = self._snap_audio_now()
+            if _is_alarm_snapshot_name(archive.name) and archive.is_file():
+                self._write_snap_audio(archive, audio_db, audio_state)
             event = {
                 "type": self._ai_alarm_type(label),
                 "phase": "start",
@@ -2943,6 +3011,8 @@ class StreamMonitor:
                 "backend": result.get("backend"),
                 "time": _now_str(),
                 "snapshot": str(archive),
+                "audio_db": audio_db,
+                "audio_state": audio_state,
             }
             self._ai_cool_until = now + float(self.alarm_cooldown_sec)
             self._ai_bad_since = None
@@ -3196,6 +3266,7 @@ class StreamMonitor:
 
             self.reconnect_count += 1
             self._active_alarms.clear()
+            self._open_shots.clear()
             self._write_status("reconnecting")
 
             # 断流也要确认：连续失败达到阈值才记告警，避免偶发抖动误报

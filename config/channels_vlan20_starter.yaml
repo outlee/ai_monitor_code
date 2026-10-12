@@ -29,7 +29,7 @@ defaults:
   status_stale_sec: 30.0
   events_max_bytes: 52428800
   events_keep_files: 5
-  snapshot_max_per_channel: 100
+  snapshot_max_per_channel: 500
   detect_width: 480
   frame_interval_sec: 2.0
   latest_max_age_sec: 5.0

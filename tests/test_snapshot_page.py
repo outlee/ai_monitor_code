@@ -123,9 +123,101 @@ class SnapshotPageTests(unittest.TestCase):
                 )
                 self.assertEqual(one_total, 2)
                 self.assertEqual(one[0]["channel_name"], "甲")
+                silence = [row for row in page if row["filename"] == "silence_3.jpg"][0]
+                black = [row for row in page if row["filename"] == "black_2.jpg"][0]
+                self.assertEqual(silence["audio_state"], "silent")
+                self.assertEqual(silence["audio_db"], -120.0)
+                self.assertEqual(black["audio_state"], "idle")
+                self.assertIsNone(black["audio_db"])
+                side = a / "freeze_1.jpg.audio.json"
+                side.write_text(
+                    '{"audio_db": -12.5, "audio_state": "level"}',
+                    encoding="utf-8",
+                )
+                with_level, _ = appmod._list_snapshots(
+                    channel_id="ch_a", limit=10, offset=0
+                )
+                freeze = [row for row in with_level if row["filename"] == "freeze_1.jpg"][0]
+                self.assertEqual(freeze["audio_state"], "level")
+                self.assertEqual(freeze["audio_db"], -12.5)
             finally:
                 appmod.SNAPSHOT_DIR = old_dir
                 appmod._channel_name_map = old_names
+
+    def test_alarm_click_uses_the_picture_taken_after_confirm(self):
+        _stub_web_deps()
+        import web.app as appmod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "hd_92"
+            folder.mkdir()
+            name = "freeze_20261012_120011.jpg"
+            (folder / name).write_bytes(b"jpeg")
+            (folder / (name + ".audio.json")).write_text(
+                '{"audio_db": -8, "audio_state": "level"}',
+                encoding="utf-8",
+            )
+            old_dir = appmod.SNAPSHOT_DIR
+            appmod.SNAPSHOT_DIR = root
+            try:
+                events = [
+                    {
+                        "type": "freeze",
+                        "phase": "start",
+                        "channel_id": "hd_92",
+                        "channel_name": "新闻",
+                        "time": "2026-10-12 12:00:00",
+                        "message": "检测到静帧",
+                    }
+                ]
+                appmod._attach_snapshot_urls(events)
+                self.assertEqual(events[0]["snapshot"], name)
+                self.assertEqual(
+                    events[0]["snapshot_url"],
+                    "/api/snapshots/hd_92/" + name,
+                )
+                self.assertEqual(events[0]["audio_db"], -8)
+                self.assertEqual(events[0]["audio_state"], "level")
+                shots = appmod._card_alarm_shots(
+                    {"id": "hd_92", "active_alarms": ["freeze", "no_signal"]},
+                    appmod._event_shot_index(events),
+                )
+                self.assertEqual(shots["freeze"]["file"], name)
+                self.assertNotIn("no_signal", shots)
+                missing = [
+                    {
+                        "type": "silence",
+                        "channel_id": "hd_92",
+                        "time": "2026-10-12 11:00:00",
+                        "message": "检测到无伴音",
+                    }
+                ]
+                appmod._attach_snapshot_urls(missing)
+                self.assertEqual(missing[0]["snapshot_url"], "")
+                self.assertNotIn("snapshot", missing[0])
+                (folder / "silence_20261012_120100.jpg").write_bytes(b"jpeg")
+                remembered = appmod._card_alarm_shots(
+                    {
+                        "id": "hd_92",
+                        "active_alarms": ["silence"],
+                        "open_shots": {
+                            "silence": {
+                                "file": "silence_20261012_120100.jpg",
+                                "time": "2026-10-12 12:00:48",
+                                "audio_db": -120,
+                                "audio_state": "silent",
+                            }
+                        },
+                    },
+                    {},
+                )
+                self.assertEqual(
+                    remembered["silence"]["file"], "silence_20261012_120100.jpg"
+                )
+                self.assertEqual(remembered["silence"]["audio_state"], "silent")
+            finally:
+                appmod.SNAPSHOT_DIR = old_dir
 
 
 if __name__ == "__main__":
