@@ -457,36 +457,43 @@ def _list_snapshots(
     else:
         dirs = [p for p in SNAPSHOT_DIR.iterdir() if p.is_dir()]
 
+    # 先只记时间和大小。音柱旁路文件只读这一页，避免每 8 秒把全部截图都打开一遍。
+    found = []
     for d in dirs:
-        for f in d.glob("*.jpg"):
-            if not is_alarm_snapshot(f.name):
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            if not f.name.endswith(".jpg") or not is_alarm_snapshot(f.name):
                 continue
             try:
                 st = f.stat()
-                audio_db, audio_state = _snapshot_audio(f)
-                items.append(
-                    {
-                        "channel_id": d.name,
-                        "channel_name": names.get(d.name, d.name),
-                        "filename": f.name,
-                        "url": f"/api/snapshots/{d.name}/{f.name}",
-                        "size": st.st_size,
-                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                        "mtime_ts": st.st_mtime,
-                        "audio_db": audio_db,
-                        "audio_state": audio_state,
-                    }
-                )
             except OSError:
                 continue
+            found.append((st.st_mtime, st.st_size, d.name, f.name))
 
-    items.sort(key=lambda x: x["mtime_ts"], reverse=True)
-    total = len(items)
+    found.sort(key=lambda row: row[0], reverse=True)
+    total = len(found)
     start = max(0, int(offset or 0))
     end = start + max(0, int(limit or 0))
-    return items[start:end], total
+    for mtime, size, cid, filename in found[start:end]:
+        path = SNAPSHOT_DIR / cid / filename
+        audio_db, audio_state = _snapshot_audio(path)
+        items.append(
+            {
+                "channel_id": cid,
+                "channel_name": names.get(cid, cid),
+                "filename": filename,
+                "url": "/api/snapshots/%s/%s" % (cid, filename),
+                "size": size,
+                "mtime": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "mtime_ts": mtime,
+                "audio_db": audio_db,
+                "audio_state": audio_state,
+            }
+        )
+    return items, total
 
 
 def _read_status_file(channel_id: str) -> Optional[Dict[str, Any]]:
