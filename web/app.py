@@ -1277,7 +1277,7 @@ def _ring_slice(mm, cap: int, start: int, end: int) -> bytes:
 
 
 def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
-    """从共享环尾部取出正在收的 TS，抽出这一套节目再送出去。"""
+    """从共享环尾部取 TS。SPTS（无 program）直接 tee 原始流；MPTS 有 program 时再 demux。"""
     import mmap
     import struct
     import subprocess
@@ -1293,6 +1293,63 @@ def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
         mm.close()
         os.close(fd)
         raise HTTPException(500, "收流缓冲尺寸不对")
+
+    prog_map = _preview_program_map(channel)
+    stop = threading.Event()
+
+    def _cleanup_mm() -> None:
+        try:
+            mm.close()
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+    def _ring_follow():
+        """从环尾部往前一点开始，持续吐出新写入的 TS 块。"""
+        last = struct.unpack_from("Q", mm, 0)[0]
+        last -= last % 188
+        back = 512 * 1024
+        back -= back % 188
+        if last > back:
+            last -= back
+        else:
+            last = 0
+        while not stop.is_set():
+            write_at = struct.unpack_from("Q", mm, 0)[0]
+            write_at -= write_at % 188
+            if write_at < last or write_at - last > cap:
+                last = max(0, write_at - back)
+            if write_at <= last:
+                time.sleep(0.04)
+                continue
+            chunk = _ring_slice(mm, cap, last, write_at)
+            last = write_at
+            if chunk:
+                yield chunk
+
+    # SPTS：program 为空，跳过 ffmpeg -c copy remux，直接 tee 共享环原始 TS
+    if not prog_map:
+        def gen_tee():
+            try:
+                for chunk in _ring_follow():
+                    yield chunk
+            finally:
+                stop.set()
+                _cleanup_mm()
+
+        return StreamingResponse(
+            gen_tee(),
+            media_type="video/mp2t",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Channel-Id": channel_id,
+            },
+        )
+
+    # MPTS：有 program，继续 ffmpeg demux
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -1309,7 +1366,7 @@ def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
         "-i",
         "pipe:0",
     ]
-    cmd.extend(_preview_program_map(channel))
+    cmd.extend(prog_map)
     cmd.extend(["-c", "copy", "-f", "mpegts", "pipe:1"])
     try:
         proc = subprocess.Popen(
@@ -1320,34 +1377,16 @@ def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
             bufsize=0,
         )
     except OSError as exc:
-        mm.close()
-        os.close(fd)
+        _cleanup_mm()
         raise HTTPException(500, "无法启动预览: %s" % exc)
-
-    stop = threading.Event()
 
     def pump() -> None:
         try:
-            last = struct.unpack_from("Q", mm, 0)[0]
-            last -= last % 188
-            back = 512 * 1024
-            back -= back % 188
-            if last > back:
-                last -= back
-            else:
-                last = 0
-            while not stop.is_set() and proc.poll() is None:
-                write_at = struct.unpack_from("Q", mm, 0)[0]
-                write_at -= write_at % 188
-                if write_at < last or write_at - last > cap:
-                    last = max(0, write_at - back)
-                if write_at <= last:
-                    time.sleep(0.04)
-                    continue
-                chunk = _ring_slice(mm, cap, last, write_at)
-                last = write_at
-                if not chunk or proc.stdin is None:
-                    continue
+            for chunk in _ring_follow():
+                if proc.poll() is not None:
+                    break
+                if proc.stdin is None:
+                    break
                 proc.stdin.write(chunk)
         except Exception:
             pass
@@ -1374,14 +1413,7 @@ def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
                 proc.kill()
             except Exception:
                 pass
-            try:
-                mm.close()
-            except Exception:
-                pass
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+            _cleanup_mm()
 
     return StreamingResponse(
         gen(),
@@ -1391,6 +1423,7 @@ def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
             "X-Channel-Id": channel_id,
         },
     )
+
 
 
 @app.get("/api/preview/{channel_id}")
@@ -1469,7 +1502,6 @@ def api_preview_stream(channel_id: str):
             "X-Channel-Id": channel_id,
         },
     )
-
 
 def _dir_size(path: Path) -> int:
     total = 0
