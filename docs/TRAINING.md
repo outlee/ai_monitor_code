@@ -20,6 +20,48 @@
 
 ---
 
+## 这一次怎么训
+
+在放着 `Z:\ai_monitor_code-main` 的那台训练机上做。不要在 173、176、177 上装 PyTorch，也不要在没有显卡的这台开发机上跑。
+
+图在 `Z:\ai_monitor_code-main\dataset_frame`。`train` 是练习题，`val` 是考试题。一次训练只出一个模型。脚本按 `train` 里有图的文件夹决定类别，`workers/picture_classes.py` 规定列顺序。
+
+上次清点时的张数如下。开训后以脚本打印的 `classes=` 为准。
+
+| 文件夹 | 练习 | 考试 | 这次算成 |
+|---|---:|---:|---|
+| `normal` | 5398 | 5525 | 正常 |
+| `green_screen` | 70 | 32 | 花屏马赛克 |
+| `mosaic` | 593 | 87 | 花屏马赛克 |
+| `black` | 3 | 0 | 黑屏 |
+| `color_bars` | 无 | 空目录 | 不算 |
+
+黑屏练习题只有 3 张、考试题没有，这次几乎学不会黑屏。只想学花屏马赛克时，先把 `train\black` 改名挪走再训。绿屏、蓝屏、偏色曝光、画面倒置没有文件夹，不会进这个模型。
+
+```bat
+cd /d Z:\ai_monitor_code-main\training
+pip install -r requirements.txt
+python train.py --data Z:\ai_monitor_code-main\dataset_frame --out Z:\ai_monitor_code-main\training\runs\frame1
+```
+
+开头要看到 `device=cuda` 和显卡名字。若是 `cpu`，停掉，换到有显卡的环境。显存不够时在命令末尾加 `--batch-size 32`。默认 30 轮，最好的一版在 `runs\frame1\best.pt`。
+
+看这三处：
+
+- `classes=` 里应是 `normal,black,green_screen_mosaic`。挪走黑屏后不应再有 `black`。
+- 认不出的目录名会被打印，那些图这次不学。
+- 考试成绩看 `macroF1`，以及 `green_screen_mosaic=` 后面的数，越接近 1 越好。
+
+导出：
+
+```bat
+python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame1\best.pt --out Z:\ai_monitor_code-main\training\runs\frame1\mosaic_detector.onnx
+```
+
+旁边会有 `mosaic_detector.onnx.classes.json`。两个文件一起留着。换到监测机之前先看导出日志里的类别，不要只拷 onnx。监测端「分类告警」默认关着，现有绿屏占比和马赛克方块规则照旧。
+
+---
+
 ## 1. 总体流程
 
 ```
@@ -110,8 +152,15 @@ is_anomaly = (score >= ai.threshold)   # 默认 threshold=0.55
 label      = "mosaic" if is_anomaly else "normal"
 ```
 
-> 当前线上标签较粗，统一记为 `ai_mosaic` 一类异常（事件类型 `ai_` + label）。  
-> 若你训练了多类（马赛克 / 绿屏），导出时仍可输出异常总概率，或后续扩展监测端多类解析。
+> 当前线上模型仍是上面的二分类。分数只记在明细里，不会单靠分数告警。
+
+### 2.2.1 多类单帧（架子已接上，默认不告警）
+
+一个模型，按文件夹学，列顺序在 `workers/picture_classes.py`。没有样本的类不要建目录。`freeze` / `flicker` 单帧看不出来，训练时会跳过。
+
+导出时在 onnx 旁边写 `模型名.onnx.classes.json`，例如 `{"classes": ["normal", "green_screen", "mosaic"]}`。监测端读到多于 2 类时，把最高类记在节目心跳 `ai_top_class`，默认不告警。要拿它告警才写 `ai.class_alarm: true`。花屏、马赛克的现有规则仍然会报。
+
+旧的 `normal` + `anomaly` 继续训练成现在这种 1×2。加上一类必须整次重训再导出，不能改旧 onnx 的列。目录说明见 [training/README.md](../training/README.md)。
 
 ### 2.3 推荐：二分类 softmax
 

@@ -169,7 +169,10 @@ class FreezeDetectConfigTests(unittest.TestCase):
         fc = m._build_filter_complex()
         self.assertIn("silencedetect=", fc)
         self.assertIn(":d=1.0", fc)
+        self.assertIn("asetnsamples=n=16000", fc)
+        self.assertIn("astats=metadata=1:reset=1", fc)
         self.assertIn("Overall.Peak_level", fc)
+        self.assertNotIn("reset=0", fc)
         self.assertNotIn("silence_duration", fc)
 
     def test_level_meter_uses_real_audio_and_skips_null_source(self):
@@ -230,6 +233,35 @@ class FreezeDetectConfigTests(unittest.TestCase):
         }
         m._silence_active = True
         m._silence_since = time.time() - 9
+        m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 9}
+        m._flush_pending_alarms()
+        self.assertIn("freeze", m._active_alarms)
+        self.assertEqual(ev["message"], "检测到静帧无伴音")
+
+    def test_video_silence_holds_when_recent_peak_is_loud(self):
+        m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8, "silence_threshold": -50})
+        m._run_started_ts = time.time() - 60
+        m.save_snapshot = False
+        m._silence_active = True
+        m._silence_since = time.time() - 9
+        m._audio_db = -8.0
+        m._audio_db_ts = time.time()
+        ev = {"type": "freeze", "message": "检测到静帧", "time": "t"}
+        m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 9}
+        m._flush_pending_alarms()
+        self.assertNotIn("freeze", m._active_alarms)
+        self.assertIn("freeze", m._pending_alarms)
+        self.assertEqual(ev["message"], "检测到静帧")
+
+    def test_video_silence_commits_when_recent_peak_is_quiet(self):
+        m = _mon({"freeze_mode": "video_silence", "freeze_duration": 8, "silence_threshold": -50})
+        m._run_started_ts = time.time() - 60
+        m.save_snapshot = False
+        m._silence_active = True
+        m._silence_since = time.time() - 9
+        m._audio_db = -80.0
+        m._audio_db_ts = time.time()
+        ev = {"type": "freeze", "message": "检测到静帧", "time": "t"}
         m._pending_alarms["freeze"] = {"event": ev, "since": time.time() - 9}
         m._flush_pending_alarms()
         self.assertIn("freeze", m._active_alarms)
@@ -393,6 +425,120 @@ class FreezeDetectConfigTests(unittest.TestCase):
         latest.write_bytes(blob)
         data = m._read_jpeg_file(latest, 45)
         self.assertEqual(data, blob)
+
+
+class RecoveryDurationTests(unittest.TestCase):
+    def _ready(self, defaults=None):
+        m = _mon(defaults)
+        saved = []
+        m._save_event = lambda ev: saved.append(dict(ev))
+        m._write_status = lambda *a, **k: None
+        return m, saved
+
+    def test_freeze_recovery_text_uses_wall_clock(self):
+        m, saved = self._ready({"freeze_duration": 5.0})
+        m._active_alarms["freeze"] = time.time() - 9.0
+        m._emit_alarm_event(
+            alarm_key="freeze",
+            is_start=False,
+            is_end=True,
+            event={
+                "type": "freeze_end",
+                "phase": "end",
+                "message": "静帧已恢复（持续 1.2 秒）",
+                "duration": 1.2,
+                "time": "t",
+            },
+        )
+        self.assertEqual(len(saved), 1)
+        self.assertNotIn("1.2", saved[0]["message"])
+        self.assertIn("持续", saved[0]["message"])
+        self.assertGreater(saved[0]["duration"], 8.0)
+        self.assertLess(saved[0]["duration"], 12.0)
+
+    def test_black_recovery_text_gets_wall_duration(self):
+        m, saved = self._ready()
+        m._active_alarms["black"] = time.time() - 6.5
+        m._emit_alarm_event(
+            alarm_key="black",
+            is_start=False,
+            is_end=True,
+            event={
+                "type": "black_end",
+                "phase": "end",
+                "message": "黑场已恢复",
+                "time": "t",
+            },
+        )
+        self.assertEqual(len(saved), 1)
+        self.assertIn("持续", saved[0]["message"])
+        self.assertGreater(saved[0]["duration"], 6.0)
+
+    def test_silence_recovery_keeps_probe_duration(self):
+        m, saved = self._ready()
+        m._active_alarms["silence"] = time.time() - 30.0
+        m._emit_alarm_event(
+            alarm_key="silence",
+            is_start=False,
+            is_end=True,
+            event={
+                "type": "silence_end",
+                "phase": "end",
+                "message": "无伴音已恢复（持续 9.3 秒）",
+                "duration": 9.3,
+                "time": "t",
+            },
+        )
+        self.assertEqual(len(saved), 1)
+        self.assertIn("9.3", saved[0]["message"])
+        self.assertEqual(saved[0]["duration"], 9.3)
+
+    def test_silence_pts_jump_uses_wall_clock(self):
+        m, saved = self._ready()
+        m._active_alarms["silence"] = time.time() - 40.0
+        m._emit_alarm_event(
+            alarm_key="silence",
+            is_start=False,
+            is_end=True,
+            event={
+                "type": "silence_end",
+                "phase": "end",
+                "message": "无伴音已恢复（持续 12772.6 秒）",
+                "duration": 12772.6,
+                "time": "t",
+            },
+        )
+        self.assertEqual(len(saved), 1)
+        self.assertNotIn("12772", saved[0]["message"])
+        self.assertGreater(saved[0]["duration"], 30.0)
+        self.assertLess(saved[0]["duration"], 55.0)
+
+    def test_reconnect_closes_latched_freeze(self):
+        m, saved = self._ready()
+        m._active_alarms["freeze"] = time.time() - 8.0
+        m._active_alarms["stream_down"] = time.time() - 3.0
+        m._open_shots["freeze"] = {"file": "freeze_x.jpg", "time": "t"}
+        m._close_latched_on_reconnect()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["type"], "freeze_end")
+        self.assertIn("静帧已恢复", saved[0]["message"])
+        self.assertIn("持续", saved[0]["message"])
+        self.assertNotIn("stream_down", saved[0]["type"])
+        self.assertGreater(saved[0]["duration"], 7.0)
+        self.assertLess(saved[0]["duration"], 15.0)
+        self.assertEqual(m._active_alarms, {})
+        self.assertEqual(m._open_shots, {})
+
+    def test_no_signal_recovery_text_has_duration(self):
+        m, saved = self._ready()
+        m._active_alarms["no_signal"] = time.time() - 11.0
+        m._last_media_ts = time.time()
+        m._state = "running"
+        m._note_media()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["type"], "no_signal_end")
+        self.assertIn("持续", saved[0]["message"])
+        self.assertGreater(saved[0]["duration"], 10.0)
 
 
 if __name__ == "__main__":

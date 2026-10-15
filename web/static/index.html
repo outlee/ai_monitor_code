@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AI 节目监测</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=20261014snapscroll" />
 </head>
 <body>
   <header class="topbar">
@@ -117,18 +117,24 @@
       </div>
     </div>
 
-    <div class="panel-head" style="margin-top:16px" id="events-anchor">
-      <h2>未恢复告警</h2>
-      <span class="hint">仍在持续的会大约每 20 秒再响一次。有当时画面的，点这一条就能看</span>
-    </div>
-    <div class="event-list" id="event-list-dash">
-      <div class="empty">加载中…</div>
-    </div>
-    <div class="panel-head hidden" style="margin-top:16px" id="remote-events-head">
-      <h2>其他服务器最近告警</h2>
-      <span class="hint">点一条看当时的画面。花屏、马赛克和已经恢复的也会列在这里，并带上是哪一台</span>
-    </div>
-    <div class="event-list hidden" id="event-list-remote"></div>
+    <section class="float-panel" id="float-open">
+      <div class="panel-head" id="events-anchor" title="按住标题拖出，右下角改大小">
+        <h2>未恢复告警</h2>
+        <span class="hint">仍在持续的会大约每 20 秒再响一次。有当时画面的，点这一条就能看</span>
+        <button type="button" class="btn float-dock">收回</button>
+      </div>
+      <div class="event-list" id="event-list-dash">
+        <div class="empty">加载中…</div>
+      </div>
+    </section>
+    <section class="float-panel hidden" id="float-remote">
+      <div class="panel-head hidden" id="remote-events-head" title="按住标题拖出，右下角改大小">
+        <h2>全部服务器最近告警</h2>
+        <span class="hint">本机和其他服务器合在一起。新告警和恢复都在这里，并写明是哪一台。点一条看当时的画面</span>
+        <button type="button" class="btn float-dock">收回</button>
+      </div>
+      <div class="event-list hidden" id="event-list-remote"></div>
+    </section>
     <div id="server-strip-wrap" class="server-strip-wrap hidden">
       <div class="panel-head">
         <h2>服务器性能</h2>
@@ -153,6 +159,11 @@
           <span>启用 AI 模块</span>
           <input type="checkbox" id="sw-ai-enabled" />
         </label>
+        <label class="switch-row">
+          <span>分类告警</span>
+          <input type="checkbox" id="sw-class-alarm" title="打开后，多类模型判成黑屏、蓝屏、绿屏、花屏马赛克、偏色曝光或画面倒置才告警" />
+        </label>
+        <p class="hint">分类告警打开后，多类模型判成黑屏、蓝屏、绿屏、花屏马赛克、偏色曝光或画面倒置，并连续达到确认秒数，就记一条告警。关掉只记在节目心跳里。现有绿屏占比和马赛克方块规则不看这个开关。</p>
         <label class="field-row">
           <span>检测模式</span>
           <select id="sel-ai-mode">
@@ -167,25 +178,25 @@
           <input type="number" id="inp-ai-interval" min="0.5" max="60" step="0.5" />
         </label>
         <label class="field-row">
-          <span>花屏确认 (秒)</span>
-          <input type="number" id="inp-ai-confirm" min="1" max="60" step="1" title="连续这么多秒都像花屏或马赛克才告警" />
+          <span title="分类告警、绿屏占比和马赛克方块都要连续这么多秒才记一条。同一张画面停住不算时间在走。最短 1 秒，现在用 6 秒。保存后几秒内生效。">花屏确认 (秒)</span>
+          <input type="number" id="inp-ai-confirm" min="1" max="60" step="1" />
         </label>
-        <p class="hint">这里填的秒数会在几秒内生效，最短 1 秒。连续这么久都像花屏或马赛克才告警。抽帧先要一张正常画面，解出来仍是花屏或绿屏才报。纯绿连成大约 8×8 的一小块也算，零散像素不算；马赛克要画面上真有成片的方块，模型分数单独偏高不算。</p>
+        <p class="hint">最短 1 秒。分类告警、绿屏占比和马赛克方块都要连续这么久才记一条。同一张画面停住不算时间在走。怎么填，把鼠标放在左边的名称上。</p>
         <label class="field-row">
-          <span>模型分数记录</span>
-          <input type="number" id="inp-ai-threshold" min="0" max="1" step="0.05" title="只记在明细里，单独偏高不会报马赛克" />
-        </label>
-        <label class="field-row">
-          <span>绿屏占比阈值</span>
-          <input type="number" id="inp-green-th" min="0" max="1" step="0.05" title="偏绿的画面要占到这个比例才算。另外，连成大约 8×8 的纯绿小块也会报" />
+          <span title="分类告警打开后，故障类要是这一帧分数最高的一类，并且不低于这个数，再连续达到花屏确认的秒数，才告警。现在的模型只有正常和花屏马赛克，两项加起来是 1，花屏马赛克要超过 0.5 才会成为最高类，所以低于 0.5 不会更灵敏。建议 0.7，误报多再收到 0.8。分类告警关掉时这个数不告警。范围 0 到 1。">分类分数</span>
+          <input type="number" id="inp-ai-threshold" min="0" max="1" step="0.05" />
         </label>
         <label class="field-row">
-          <span>纯绿小块阈值</span>
-          <input type="number" id="inp-pure-green-th" min="0" max="1" step="0.00001" title="连成约 8×8 的纯绿小块占画面比例达到此值才报绿屏。默认 0.00001（约一块就报）。可调大以减少误报" />
+          <span title="偏绿像素占整幅画面的比例达到这个数，才按绿屏规则告警。填到 1 以上这条规则不会响，现在是 1.1，就是这个意思。分类分数不看这项。">绿屏占比阈值</span>
+          <input type="number" id="inp-green-th" min="0" max="2" step="0.05" />
         </label>
         <label class="field-row">
-          <span>块状分数阈值</span>
-          <input type="number" id="inp-block-th" min="0" max="1" step="0.01" title="只在检测模式为启发式时使用。内置花屏/马赛克不看这个值" />
+          <span title="连成大约 8×8 的一块纯绿，占画面的比例达到这个数才报。大约 0.00001 是一块就报。填到 1 以上等于关掉，现在是 1.1。分类分数不看这项。">纯绿小块阈值</span>
+          <input type="number" id="inp-pure-green-th" min="0" max="2" step="0.00001" />
+        </label>
+        <label class="field-row">
+          <span title="只在检测模式选启发式时使用。现在用的是模型，这项不参与告警。马赛克方块规则要原图方块占比达到 0.34，也不看这个数。">块状分数阈值</span>
+          <input type="number" id="inp-block-th" min="0" max="1" step="0.01" />
         </label>
         <button class="btn btn-primary" id="btn-save-ai">保存 AI 设置</button>
       </div>
@@ -197,21 +208,21 @@
           <input type="checkbox" id="sw-save-snapshot" />
         </label>
         <label class="field-row">
-          <span>黑场时长 (秒)</span>
-          <input type="number" id="inp-black" min="0.5" max="60" step="0.5" title="持续黑场达到此时长才告警" />
+          <span title="画面持续黑到这个秒数才告警。调大更不容易报，调小更快报。范围 0.5 到 60。">黑场时长 (秒)</span>
+          <input type="number" id="inp-black" min="0.5" max="60" step="0.5" />
         </label>
         <div class="freeze-modes" id="freeze-modes">
           <label><input type="radio" name="freeze-mode" value="video" checked /> 只报静帧</label>
           <label><input type="radio" name="freeze-mode" value="video_silence" /> 静帧且无伴音</label>
         </div>
         <label class="field-row">
-          <span>静帧时长 (秒)</span>
-          <input type="number" id="inp-freeze" min="0.5" max="120" step="0.5" title="填几秒就按几秒告警" />
+          <span title="画面持续不动达到这个秒数才报静帧。填几秒就按几秒，没有另外的下限。上面选了静帧且无伴音时，还要同时没有声音。">静帧时长 (秒)</span>
+          <input type="number" id="inp-freeze" min="0.5" max="120" step="0.5" />
         </label>
         <p class="hint" id="freeze-hint">只看画面。填几秒就按几秒告警。</p>
         <label class="field-row">
-          <span>启动后忽略静帧 (秒)</span>
-          <input type="number" id="inp-freeze-startup" min="0" max="120" step="1" title="监测刚启动的这段时间里静帧不计。黑场和无伴音不受影响" />
+          <span title="监测刚启动的这段秒数里不报静帧。填 0 表示启动后立刻可以报。黑场和无伴音不受影响。">启动后忽略静帧 (秒)</span>
+          <input type="number" id="inp-freeze-startup" min="0" max="120" step="1" />
         </label>
         <label class="switch-row">
           <span>单独告警无伴音</span>
@@ -219,12 +230,12 @@
         </label>
         <p class="hint">打开后单独记「检测到无伴音」。收不到包时也可能像没声音。静帧且无伴音仍是上面那一条。</p>
         <label class="field-row">
-          <span>无伴音时长 (秒)</span>
-          <input type="number" id="inp-silence" min="0.5" max="60" step="0.5" title="达到此时长才单独报无伴音。静帧且无伴音仍用上面的静帧时长" />
+          <span title="电平一直低于无伴音阈值达到这个秒数，才单独报无伴音。静帧且无伴音仍用上面的静帧时长。">无伴音时长 (秒)</span>
+          <input type="number" id="inp-silence" min="0.5" max="60" step="0.5" />
         </label>
         <label class="field-row">
-          <span>无伴音阈值 (dB)</span>
-          <input type="number" id="inp-silence-db" min="-80" max="0" step="1" title="电平低于此值视为无伴音" />
+          <span title="电平低于这个分贝才算无伴音。数字越小（更负）越不容易报，例如 -60 比 -40 要更安静才报。范围 -80 到 0。">无伴音阈值 (dB)</span>
+          <input type="number" id="inp-silence-db" min="-80" max="0" step="1" />
         </label>
         <button class="btn btn-primary" id="btn-save-defaults">保存规则参数</button>
       </div>
@@ -294,6 +305,11 @@
           <option value="stream_down">断流</option>
           <option value="ai_mosaic">马赛克</option>
           <option value="ai_green_screen">花屏</option>
+          <option value="ai_black">黑屏</option>
+          <option value="ai_blue_screen">蓝屏</option>
+          <option value="ai_solid_green">绿屏</option>
+          <option value="ai_color_exposure">偏色曝光</option>
+          <option value="ai_inverted">画面倒置</option>
         </select>
         <select id="ev-hours">
           <option value="24">近 24 小时</option>
@@ -312,10 +328,11 @@
     </section>
   </main>
 
-  <section class="panel snapshots-panel" id="snapshots-anchor">
-    <div class="panel-head">
+  <section class="panel snapshots-panel float-panel" id="float-snaps">
+    <div class="panel-head" title="按住标题拖出，右下角改大小">
       <h2>异常截图</h2>
       <span class="hint">告警当时的画面，不含大屏实时图。右侧音柱是当时音量，标着无音频的就是没有声音</span>
+      <button type="button" class="btn float-dock">收回</button>
     </div>
     <div class="event-toolbar snap-toolbar">
       <button type="button" class="btn" id="snap-prev">上一页</button>
@@ -488,6 +505,6 @@
   </div>
 
   <script src="/static/category_filter.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20261015desk5"></script>
 </body>
 </html>

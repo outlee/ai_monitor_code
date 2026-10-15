@@ -36,6 +36,14 @@
     silence_end: "伴音恢复",
     ai_mosaic: "马赛克",
     ai_green_screen: "花屏",
+    ai_solid_green: "绿屏",
+    ai_black: "黑屏",
+    ai_blue_screen: "蓝屏",
+    ai_color_cast: "偏色",
+    ai_overexposed: "过曝",
+    ai_underexposed: "欠曝",
+    ai_color_exposure: "偏色曝光",
+    ai_inverted: "画面倒置",
     ai_anomaly: "画面异常",
   };
 
@@ -51,7 +59,6 @@
   let orderDirty = false;
   let lastOrderIds = [];
   let lastDashCardIds = [];
-  let dragSrc = null;
 
   function typeLabel(t) {
     if (!t) return "异常";
@@ -187,8 +194,34 @@
   function placeName(ev) {
     const ch = (ev && (ev.channel_name || ev.channel_id)) || "节目";
     const node = (ev && ev.node_name) || "";
-    if (node && ev.node_id && ev.node_id !== "local") return node + " " + ch;
+    if (node) return node + " " + ch;
     return ch;
+  }
+
+  function ongoingText(timeStr) {
+    if (!timeStr) return "未恢复";
+    const t = Date.parse(String(timeStr).replace(" ", "T"));
+    if (!isFinite(t)) return "未恢复";
+    const sec = Math.max(0, (Date.now() - t) / 1000);
+    if (sec < 1) return "未恢复";
+    if (sec < 60) return "未恢复（已持续 " + Math.round(sec) + " 秒）";
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    if (m < 60) return "未恢复（已持续 " + m + " 分 " + s + " 秒）";
+    const h = Math.floor(m / 60);
+    return "未恢复（已持续 " + h + " 小时 " + (m % 60) + " 分）";
+  }
+
+  function openSince(card, type, shot) {
+    const table = card && card.alarm_since;
+    const since = table && table[type];
+    if (since) return String(since);
+    if (shot && shot.time) return String(shot.time);
+    return "";
+  }
+
+  function cardHasOpenAlarm(card) {
+    return ((card && card.active_alarms) || []).some(Boolean);
   }
 
   function isStartAlarm(ev) {
@@ -537,6 +570,7 @@
     const ai = data.ai || {};
     const d = data.defaults || {};
     $("#sw-ai-enabled").checked = !!ai.enabled;
+    if ($("#sw-class-alarm")) $("#sw-class-alarm").checked = !!ai.class_alarm;
     $("#sel-ai-mode").value = ai.mode || "auto";
     $("#inp-ai-interval").value = ai.interval_sec ?? 2;
     if ($("#inp-ai-confirm")) $("#inp-ai-confirm").value = ai.confirm_sec ?? 6;
@@ -746,7 +780,7 @@
     const rate = shownBitrate(c);
     const codec = codecLabel(c);
     const thumb = c.thumb_url
-      ? `<img class="ch-thumb" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
+      ? `<img class="ch-thumb" draggable="false" src="${escapeHtml(c.thumb_url)}" loading="lazy" alt="" />`
       : `<div class="ch-thumb placeholder">暂无画面</div>`;
     const tags = [];
     if (c.node_name) tags.push(c.node_name);
@@ -760,9 +794,13 @@
     const cls = large ? "ch-card ch-card-lg" : "ch-card";
     const snap = c.preview_base || ("/api/snapshots/" + (c.channel_id || c.id));
     const name = c.name || c.id;
-    return `<div class="${cls} lamp-${escapeHtml(c.lamp || "gray")}" data-id="${escapeHtml(
+    return `<div class="${cls} lamp-${escapeHtml(c.lamp || "gray")}" draggable="false" data-id="${escapeHtml(
       c.id
-    )}" data-snap="${escapeHtml(snap)}" title="${escapeHtml(name)}">
+    )}" data-snap="${escapeHtml(snap)}" data-url="${escapeHtml(c.url || "")}" data-program="${escapeHtml(
+      c.program == null ? "" : c.program
+    )}" data-iface="${escapeHtml(c.iface || "")}" data-node="${escapeHtml(
+      c.node_name || ""
+    )}" title="${escapeHtml(name)}">
       <div class="ch-media">
         <div class="ch-shot">
           ${thumb}
@@ -849,33 +887,75 @@
 
   function bindReorder(grid) {
     if (!grid) return;
+    // 卡片在可滚动区域里时，HTML5 拖放会把指针吃掉，顺序排不动。改用指针拖动。
     grid.querySelectorAll(".ch-card").forEach((el) => {
-      el.setAttribute("draggable", "true");
-      el.addEventListener("dragstart", (e) => {
-        dragSrc = el;
-        el.classList.add("dragging");
-        el.dataset.justDragged = "1";
-        try {
-          e.dataTransfer.setData("text/plain", el.dataset.id || "");
-          e.dataTransfer.effectAllowed = "move";
-        } catch (err) {}
-      });
-      el.addEventListener("dragend", () => {
-        el.classList.remove("dragging");
-        grid.querySelectorAll(".drag-over").forEach((x) => x.classList.remove("drag-over"));
-        dragSrc = null;
-      });
-      el.addEventListener("dragover", (e) => {
-        e.preventDefault();
-        if (!dragSrc || el === dragSrc) return;
-        el.classList.add("drag-over");
-        const rect = el.getBoundingClientRect();
+      el.setAttribute("draggable", "false");
+      el.querySelectorAll("img").forEach((img) => img.setAttribute("draggable", "false"));
+    });
+    if (grid.dataset.reorderBound === "1") return;
+    grid.dataset.reorderBound = "1";
+    let drag = null;
+
+    function scrollNearEdge(clientY) {
+      const scroller = document.getElementById("desk-watch");
+      if (!scroller) return;
+      const box = scroller.getBoundingClientRect();
+      if (clientY < box.top + 36) scroller.scrollTop -= 16;
+      else if (clientY > box.bottom - 36) scroller.scrollTop += 16;
+    }
+
+    function onMove(e) {
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (!drag.moved) {
+        if (Math.abs(dx) <= 8 && Math.abs(dy) <= 8) return;
+        drag.moved = true;
+        drag.card.classList.add("dragging");
+        drag.card.dataset.justDragged = "1";
+      }
+      e.preventDefault();
+      const under = document.elementFromPoint(e.clientX, e.clientY);
+      const hit = under && under.closest ? under.closest("#" + grid.id + " .ch-card") : null;
+      if (hit && hit !== drag.card && grid.contains(hit)) {
+        const rect = hit.getBoundingClientRect();
         const before = e.clientX < rect.left + rect.width / 2;
-        if (before) grid.insertBefore(dragSrc, el);
-        else grid.insertBefore(dragSrc, el.nextSibling);
-        setOrderDirty(true);
-      });
-      el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+        const next = before ? hit : hit.nextSibling;
+        if (next !== drag.card) {
+          grid.insertBefore(drag.card, next);
+          setOrderDirty(true);
+        }
+      }
+      scrollNearEdge(e.clientY);
+    }
+
+    function finish(e) {
+      if (!drag) return;
+      if (e && e.pointerId != null && e.pointerId !== drag.pointerId) return;
+      const card = drag.card;
+      const moved = drag.moved;
+      drag = null;
+      card.classList.remove("dragging");
+      document.removeEventListener("pointermove", onMove, true);
+      document.removeEventListener("pointerup", finish, true);
+      document.removeEventListener("pointercancel", finish, true);
+      if (moved) {
+        card.dataset.justDragged = "1";
+        setTimeout(() => {
+          if (card.dataset.justDragged === "1") card.dataset.justDragged = "";
+        }, 400);
+      }
+    }
+
+    grid.addEventListener("dragstart", (e) => e.preventDefault());
+    grid.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || drag) return;
+      const card = e.target && e.target.closest ? e.target.closest(".ch-card") : null;
+      if (!card || !grid.contains(card)) return;
+      drag = { card: card, x: e.clientX, y: e.clientY, pointerId: e.pointerId, moved: false };
+      document.addEventListener("pointermove", onMove, true);
+      document.addEventListener("pointerup", finish, true);
+      document.addEventListener("pointercancel", finish, true);
     });
   }
 
@@ -1051,8 +1131,12 @@
     }
     renderServerStrip(dash, lastPerf);
     renderCategoryTabs(all);
-    const bad = all.filter((c) => c.lamp === "red" || c.lamp === "yellow");
-    const okAll = all.filter((c) => c.lamp !== "red" && c.lamp !== "yellow");
+    const bad = all.filter(
+      (c) => c.lamp === "red" || c.lamp === "yellow" || cardHasOpenAlarm(c)
+    );
+    const okAll = all.filter(
+      (c) => c.lamp !== "red" && c.lamp !== "yellow" && !cardHasOpenAlarm(c)
+    );
     const ok = okAll.filter((c) => CategoryFilter.cardMatchesCategories(c, dashCategories));
 
     const strip = $("#alarm-strip");
@@ -1063,7 +1147,15 @@
         alarmGrid.innerHTML = "";
       } else {
         strip.classList.remove("hidden");
-        alarmGrid.innerHTML = bad.map((c) => channelCardHtml(c, true)).join("");
+        alarmGrid.innerHTML = bad
+          .map((c) => {
+            const view =
+              cardHasOpenAlarm(c) && c.lamp !== "red" && c.lamp !== "yellow"
+                ? Object.assign({}, c, { lamp: "red" })
+                : c;
+            return channelCardHtml(view, true);
+          })
+          .join("");
         bindChannelCardClicks(alarmGrid);
       }
     }
@@ -1076,24 +1168,23 @@
         tags.forEach((t) => {
           const remembered = c.alarm_shots && c.alarm_shots[t];
           const shot = remembered || shotForAlarm(dash, c, t);
+          const since = openSince(c, t, shot);
           let url = "";
           if (remembered && remembered.file) {
             const base = String(c.preview_base || "").replace(/\/$/, "");
             url = base ? base + "/" + remembered.file : "";
-          } else if (shot && shot.snapshot_url) {
+          } else if (!remembered && shot && shot.snapshot_url) {
             url = shot.snapshot_url;
           }
           open.push({
             type: t,
             channel_id: c.channel_id || c.id,
-            channel_name: placeName({
-              channel_name: c.name || c.id,
-              channel_id: c.channel_id || c.id,
-              node_id: c.node_id,
-              node_name: c.node_name,
-            }),
-            message: "未恢复",
-            time: (shot && shot.time) || dash.time || "",
+            node_id: c.node_id || "",
+            node_name: c.node_name || "",
+            live: true,
+            channel_name: c.name || c.id,
+            message: since ? ongoingText(since) : "未恢复",
+            time: since || (shot && shot.time) || "",
             snapshot_url: url,
             audio_db: shot ? shot.audio_db : null,
             audio_state: (shot && shot.audio_state) || (t === "silence" ? "silent" : ""),
@@ -1254,30 +1345,39 @@
     const box = $("#event-list-remote");
     if (!head || !box) return;
     const hubOn = dash && dash.hub && dash.hub.active;
+    const title = head.querySelector("h2");
+    const hint = head.querySelector(".hint");
+    if (title) title.textContent = "全部服务器最近告警";
+    if (hint) {
+      hint.textContent = "本机和其他服务器合在一起。新告警和恢复都在这里，并写明是哪一台。点一条看当时的画面";
+    }
     const rows = [];
     if (hubOn) {
       (dash.recent_events || []).forEach((ev) => {
-        if (!ev || !ev.node_id || ev.node_id === "local") return;
-        if (!isStartAlarm(ev)) return;
+        if (!ev || !ev.type) return;
         rows.push(ev);
       });
       rows.sort((a, b) => String(b.time || "").localeCompare(String(a.time || "")));
     }
+    const wrap = $("#float-remote");
     if (!rows.length) {
       head.classList.add("hidden");
       box.classList.add("hidden");
+      if (wrap) wrap.classList.add("hidden");
       box.innerHTML = "";
       return;
     }
+    if (wrap) wrap.classList.remove("hidden");
     head.classList.remove("hidden");
     box.classList.remove("hidden");
     box.innerHTML = rows
-      .slice(0, 12)
+      .slice(0, 40)
       .map((ev) =>
         renderEventItem({
           type: ev.type,
           channel_id: ev.channel_id,
-          channel_name: placeName(ev),
+          channel_name: ev.channel_name || ev.channel_id || "",
+          node_name: ev.node_name || "",
           message: ev.message || ev.msg || "",
           time: ev.time || "",
           snapshot_url: ev.snapshot_url || "",
@@ -1428,24 +1528,31 @@
     const t = ev.type || "event";
     const msg = ev.message || ev.msg || "";
     const name = ev.channel_name || ev.channel_id || "";
+    const node = String(ev.node_name || "").trim();
     const abs = ev.time || "";
     const rel = relativeTime(abs);
     const url = ev.snapshot_url || "";
     const state = ev.audio_state || (String(t).indexOf("silence") === 0 ? "silent" : "");
     const db = ev.audio_db == null || ev.audio_db === "" ? "" : String(ev.audio_db);
-    const cap = (name ? name + " · " : "") + typeLabel(t) + (abs ? " · " + abs : "");
+    const capName = node ? (node + " " + name).trim() : name;
+    const cap = (capName ? capName + " · " : "") + typeLabel(t) + (abs ? " · " + abs : "");
+    const live = !!(ev.live && window.AM_DESKTOP);
+    const clickable = !!(url || live);
+    const clickText = clickable ? (live ? " · 点击看实时视频" : " · 点击看当时的画面") : "";
+    const tone = String(t).endsWith("_end") ? "event-recover" : "event-alarm";
+    const when = node && abs ? node + " · " + abs : node || abs;
     return `
-      <div class="event-item ${typeClass(t)}${url ? " event-shot" : ""}" data-snap="${escapeHtml(
+      <div class="event-item ${typeClass(t)} ${tone}${clickable ? " event-shot" : ""}" data-snap="${escapeHtml(
         url
-      )}" data-cap="${escapeHtml(cap)}" data-db="${escapeHtml(db)}" data-state="${escapeHtml(state)}">
+      )}" data-cap="${escapeHtml(cap)}" data-db="${escapeHtml(db)}" data-state="${escapeHtml(state)}" data-node="${escapeHtml(
+        ev.node_id || ""
+      )}" data-channel="${escapeHtml(ev.channel_id || "")}"${live ? ' data-live="1"' : ""}>
         <div class="event-top">
           <span class="event-type">${escapeHtml(typeLabel(t))}</span>
           <span class="event-time" title="${escapeHtml(abs)}">${escapeHtml(rel || abs)}</span>
         </div>
-        <div class="event-msg"><strong>${escapeHtml(name)}</strong> ${escapeHtml(msg)}${
-          url ? " · 点击看当时的画面" : ""
-        }</div>
-        <div class="event-time" style="margin-top:4px;font-size:11px;color:var(--muted)">${escapeHtml(abs)}</div>
+        <div class="event-msg"><strong>${escapeHtml(name)}</strong> ${escapeHtml(msg)}${clickText}</div>
+        <div class="event-time" style="margin-top:4px;font-size:11px;color:var(--muted)">${escapeHtml(when)}</div>
       </div>`;
   }
 
@@ -1644,7 +1751,7 @@
       let h = health.ok ? "服务正常" : "服务异常";
       if (health.sqlite && health.sqlite.db_path) h += " · SQLite";
       const en = (overview.channels || []).filter((c) => c.enabled).length;
-      if (en > 30) h += " · 启用" + en + "路偏多";
+      if (en > 30 && !window.AM_DESKTOP) h += " · 启用" + en + "路偏多";
       $("#health").textContent = h;
 
       // 次要数据：失败不挡住主界面
@@ -1798,6 +1905,7 @@
     try {
       const res = await postJSON("/api/config/ai", {
         enabled: $("#sw-ai-enabled").checked,
+        class_alarm: $("#sw-class-alarm") ? $("#sw-class-alarm").checked : false,
         mode: $("#sel-ai-mode").value,
         interval_sec: parseFloat($("#inp-ai-interval").value) || 2,
         confirm_sec: parseFloat($("#inp-ai-confirm").value) || 6,
@@ -2228,6 +2336,283 @@
   if (levelTimer) clearInterval(levelTimer);
   levelTimer = setInterval(refreshAudioLevels, 1500);
 
+  const FLOAT_KEY = "am.floatPanels.v1";
+  const FLOAT_MIN_W = 300;
+  const FLOAT_MIN_H = 200;
+
+  function floatNarrow() {
+    return window.innerWidth < 720;
+  }
+
+  function floatStore() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(FLOAT_KEY) || "{}");
+      return raw && typeof raw === "object" ? raw : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function floatSave(id, rec) {
+    const all = floatStore();
+    if (rec) all[id] = rec;
+    else delete all[id];
+    try {
+      localStorage.setItem(FLOAT_KEY, JSON.stringify(all));
+    } catch (e) {}
+  }
+
+  function floatTopLimit() {
+    const bar = document.querySelector(".topbar");
+    if (!bar) return 8;
+    return Math.ceil(bar.getBoundingClientRect().height) + 4;
+  }
+
+  function placeFloat(panel, rec) {
+    const topLimit = floatTopLimit();
+    const edge = 8;
+    let w = Math.max(FLOAT_MIN_W, Number(rec.w) || 440);
+    let h = Math.max(FLOAT_MIN_H, Number(rec.h) || 320);
+    w = Math.min(w, Math.max(FLOAT_MIN_W, window.innerWidth - 16));
+    h = Math.min(h, Math.max(FLOAT_MIN_H, window.innerHeight - topLimit - 8));
+    let x = Number(rec.x);
+    let y = Number(rec.y);
+    if (!isFinite(x)) x = Math.max(8, window.innerWidth - w - 16);
+    if (!isFinite(y)) y = topLimit + 8;
+    if (window.AM_DESKTOP) {
+      x = Math.min(Math.max(edge, x), Math.max(edge, window.innerWidth - w - edge));
+      y = Math.min(Math.max(topLimit, y), Math.max(topLimit, window.innerHeight - h - edge));
+    } else {
+      x = Math.min(Math.max(8, x), Math.max(8, window.innerWidth - 80));
+      y = Math.min(Math.max(topLimit, y), Math.max(topLimit, window.innerHeight - 48));
+    }
+    panel.style.left = x + "px";
+    panel.style.top = y + "px";
+    panel.style.width = w + "px";
+    panel.style.height = h + "px";
+    return { x: x, y: y, w: w, h: h };
+  }
+
+  function dockFloat(panel) {
+    if (!panel) return;
+    const ph = document.querySelector('.float-placeholder[data-for="' + panel.id + '"]');
+    panel.classList.remove("is-float");
+    panel.style.left = "";
+    panel.style.top = "";
+    panel.style.width = "";
+    panel.style.height = "";
+    if (ph && ph.parentNode) {
+      ph.parentNode.insertBefore(panel, ph);
+      ph.parentNode.removeChild(ph);
+    }
+    floatSave(panel.id, null);
+  }
+
+  function liftFloat(panel, rec) {
+    if (!panel || floatNarrow()) return;
+    if (!panel.classList.contains("is-float")) {
+      const ph = document.createElement("div");
+      ph.className = "float-placeholder";
+      ph.dataset.for = panel.id;
+      if (panel.parentNode) panel.parentNode.insertBefore(ph, panel);
+      document.body.appendChild(panel);
+      panel.classList.add("is-float");
+    }
+    // 隐藏中的面板量不到尺寸，用夹紧后的数值记位置，避免把已保存的坐标写成 0。
+    floatSave(panel.id, placeFloat(panel, rec || {}));
+  }
+
+  function bindFloats() {
+    document.querySelectorAll(".float-panel").forEach((panel) => {
+      const head = panel.querySelector(":scope > .panel-head");
+      if (!head || head.dataset.floatBound) return;
+      head.dataset.floatBound = "1";
+      let grip = panel.querySelector(":scope > .float-resize");
+      if (!grip) {
+        grip = document.createElement("div");
+        grip.className = "float-resize";
+        grip.title = "拖动改大小";
+        panel.appendChild(grip);
+      }
+      const dock = head.querySelector(".float-dock");
+      let drag = null;
+      function controlAt(e) {
+        const under = document.elementFromPoint(e.clientX, e.clientY);
+        const fromTarget = e.target && e.target.closest ? e.target.closest("button, a, input, select, textarea, label") : null;
+        const fromPoint = under && under.closest ? under.closest("button, a, input, select, textarea, label") : null;
+        return fromPoint || fromTarget;
+      }
+      function dockNow(e) {
+        if (e.button !== undefined && e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        drag = null;
+        dockFloat(panel);
+      }
+      if (dock) {
+        // 按下时只拦住拖动。若这时就收回，按钮会马上消失，这次松开送不到按钮上，下一次拖动就起不来。
+        dock.addEventListener("pointerdown", (e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          drag = null;
+        });
+        dock.addEventListener("pointerup", dockNow);
+        dock.addEventListener("click", dockNow);
+      }
+      head.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        const control = controlAt(e);
+        if (control) {
+          e.preventDefault();
+          drag = null;
+          return;
+        }
+        if (floatNarrow()) return;
+        const rect = panel.getBoundingClientRect();
+        drag = {
+          id: e.pointerId,
+          x: e.clientX,
+          y: e.clientY,
+          left: rect.left,
+          top: rect.top,
+          h: rect.height,
+          moved: false,
+        };
+        try {
+          head.setPointerCapture(e.pointerId);
+        } catch (err) {}
+      });
+      head.addEventListener("pointermove", (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        if (!e.buttons) {
+          endDrag(e);
+          return;
+        }
+        const dx = e.clientX - drag.x;
+        const dy = e.clientY - drag.y;
+        if (!drag.moved) {
+          if (Math.hypot(dx, dy) < 8) return;
+          drag.moved = true;
+          if (!panel.classList.contains("is-float")) {
+            liftFloat(panel, {
+              x: e.clientX - 72,
+              y: e.clientY - 18,
+              w: 440,
+              h: Math.min(Math.max(drag.h, 280), 460),
+            });
+            // 挪到 body 会丢掉原来的捕获，不重新抓住的话后半段拖动跟不上。
+            try {
+              head.setPointerCapture(e.pointerId);
+            } catch (err) {}
+          }
+          const placed = panel.getBoundingClientRect();
+          drag.left = placed.left;
+          drag.top = placed.top;
+          drag.x = e.clientX;
+          drag.y = e.clientY;
+          return;
+        }
+        placeFloat(panel, {
+          x: drag.left + (e.clientX - drag.x),
+          y: drag.top + (e.clientY - drag.y),
+          w: panel.offsetWidth,
+          h: panel.offsetHeight,
+        });
+      });
+      function endDrag(e) {
+        if (!drag || !e || e.pointerId !== drag.id) return;
+        const under = document.elementFromPoint(e.clientX, e.clientY);
+        if (under && under.closest && under.closest(".float-dock")) {
+          drag = null;
+          dockFloat(panel);
+          return;
+        }
+        if (drag.moved && panel.classList.contains("is-float")) {
+          const placed = panel.getBoundingClientRect();
+          if (placed.width > 1) {
+            floatSave(panel.id, {
+              x: placed.left,
+              y: placed.top,
+              w: placed.width,
+              h: placed.height,
+            });
+          }
+        }
+        drag = null;
+      }
+      head.addEventListener("pointerup", endDrag);
+      head.addEventListener("pointercancel", endDrag);
+      document.addEventListener("pointerup", endDrag);
+      document.addEventListener("pointercancel", endDrag);
+
+      let resize = null;
+      grip.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        if (!panel.classList.contains("is-float")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const rect = panel.getBoundingClientRect();
+        resize = {
+          id: e.pointerId,
+          x: e.clientX,
+          y: e.clientY,
+          left: rect.left,
+          top: rect.top,
+          w: rect.width,
+          h: rect.height,
+        };
+        try {
+          grip.setPointerCapture(e.pointerId);
+        } catch (err) {}
+      });
+      grip.addEventListener("pointermove", (e) => {
+        if (!resize || e.pointerId !== resize.id) return;
+        placeFloat(panel, {
+          x: resize.left,
+          y: resize.top,
+          w: resize.w + (e.clientX - resize.x),
+          h: resize.h + (e.clientY - resize.y),
+        });
+      });
+      function endResize(e) {
+        if (!resize || e.pointerId !== resize.id) return;
+        const placed = panel.getBoundingClientRect();
+        floatSave(panel.id, {
+          x: placed.left,
+          y: placed.top,
+          w: placed.width,
+          h: placed.height,
+        });
+        resize = null;
+      }
+      grip.addEventListener("pointerup", endResize);
+      grip.addEventListener("pointercancel", endResize);
+    });
+
+    if (!floatNarrow()) {
+      const saved = floatStore();
+      Object.keys(saved).forEach((id) => {
+        const panel = document.getElementById(id);
+        if (panel && saved[id]) liftFloat(panel, saved[id]);
+      });
+    }
+    window.addEventListener("resize", () => {
+      if (floatNarrow()) {
+        document.querySelectorAll(".float-panel.is-float").forEach(dockFloat);
+        return;
+      }
+      document.querySelectorAll(".float-panel.is-float").forEach((panel) => {
+        if (panel.offsetWidth < 1) return;
+        const r = panel.getBoundingClientRect();
+        floatSave(panel.id, placeFloat(panel, {
+          x: r.left, y: r.top, w: r.width, h: r.height,
+        }));
+      });
+    });
+  }
+
+  bindFloats();
   refresh();
   setupAuto();
 })();

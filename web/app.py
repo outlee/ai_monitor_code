@@ -410,27 +410,43 @@ def _event_shot_index(events: List[Dict]) -> Dict[Tuple[str, str], Dict]:
     return found
 
 
+def _alarm_since_map(raw: Any) -> Dict[str, str]:
+    """这一轮未恢复告警的开始时间。旧截图上的时间不能拿来当持续时长。"""
+    out: Dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        text = str(value or "").strip()
+        if name and text:
+            out[name] = text
+    return out
+
+
 def _card_alarm_shots(info: Dict, shot_index: Dict[Tuple[str, str], Dict]) -> Dict[str, Dict]:
-    """未恢复告警点开用。监测进程记下的文件名优先，否则用最近事件对上的那张。"""
+    """未恢复告警点开用。有这一轮的开始时间就用它，缺图也不回去找更早的一张。"""
     shots: Dict[str, Dict] = {}
     status_shots = info.get("open_shots") if isinstance(info.get("open_shots"), dict) else {}
+    since_map = _alarm_since_map(info.get("alarm_since"))
     cid = _safe_channel_id(info.get("id"))
     for raw in info.get("active_alarms") or []:
         kind = str(raw or "")
         if not kind or kind.endswith("_end") or kind in ("stream_down", "no_signal"):
             continue
         remembered = status_shots.get(kind) if isinstance(status_shots, dict) else None
-        remembered_name = str((remembered or {}).get("file") or "") if isinstance(remembered, dict) else ""
+        remembered = remembered if isinstance(remembered, dict) else {}
+        remembered_name = str(remembered.get("file") or "")
         remembered_path = SNAPSHOT_DIR / cid / remembered_name if cid and remembered_name else None
-        if (
-            isinstance(remembered, dict)
-            and is_alarm_snapshot(remembered_name)
+        file_ok = bool(
+            is_alarm_snapshot(remembered_name)
             and remembered_path is not None
             and remembered_path.is_file()
-        ):
+        )
+        clock = since_map.get(kind) or str(remembered.get("time") or "").strip()
+        if file_ok or clock:
             shots[kind] = {
-                "file": remembered_name,
-                "time": str(remembered.get("time") or ""),
+                "file": remembered_name if file_ok else "",
+                "time": clock,
                 "audio_db": remembered.get("audio_db"),
                 "audio_state": str(remembered.get("audio_state") or ""),
             }
@@ -577,6 +593,7 @@ def _channel_stats(
             info["heartbeat"] = st.get("last_heartbeat")
             info["state"] = st.get("state")
             info["active_alarms"] = st.get("active_alarms") or []
+            info["alarm_since"] = _alarm_since_map(st.get("alarm_since"))
             raw_shots = st.get("open_shots")
             info["open_shots"] = raw_shots if isinstance(raw_shots, dict) else {}
             info["reconnect_count"] = st.get("reconnect_count") or 0
@@ -635,12 +652,13 @@ def _channel_stats(
 
 class AIUpdate(BaseModel):
     enabled: Optional[bool] = None
+    class_alarm: Optional[bool] = None
     mode: Optional[str] = None
     interval_sec: Optional[float] = Field(None, ge=0.5, le=60)
     threshold: Optional[float] = Field(None, ge=0.0, le=1.0)
-    green_ratio_th: Optional[float] = Field(None, ge=0.0, le=1.0)
+    green_ratio_th: Optional[float] = Field(None, ge=0.0, le=2.0)
     block_score_th: Optional[float] = Field(None, ge=0.0, le=1.0)
-    pure_green_patch: Optional[float] = Field(None, ge=0.0, le=1.0)
+    pure_green_patch: Optional[float] = Field(None, ge=0.0, le=2.0)
     confirm_sec: Optional[float] = Field(None, ge=1, le=60)
 
 
@@ -725,6 +743,7 @@ def api_overview():
         "event_total_loaded": len(events),
         "ai": {
             "enabled": bool(ai.get("enabled", False)),
+            "class_alarm": bool(ai.get("class_alarm", False)),
             "mode": ai.get("mode", "auto"),
             "model_path": ai.get("model_path", "models/mosaic_detector.onnx"),
             "interval_sec": float(ai.get("interval_sec", 2.0)),
@@ -815,9 +834,10 @@ def api_snapshots(
     limit: int = Query(40, ge=1, le=5000),
     offset: int = Query(0, ge=0, le=50000),
     channel_id: Optional[str] = None,
+    local_only: int = Query(0, alias="local"),
 ):
     nodes = _load_hub_nodes()
-    if not hub_mod.hub_is_active(nodes):
+    if local_only or not hub_mod.hub_is_active(nodes):
         items, total = _list_snapshots(
             channel_id=channel_id, limit=limit, offset=offset
         )
@@ -998,8 +1018,8 @@ def api_audio_levels():
 
 
 @app.get("/api/dashboard")
-def api_dashboard():
-    """大屏数据：频道交通灯 + 24h 统计。"""
+def api_dashboard(local_only: int = Query(0, alias="local")):
+    """大屏数据：频道交通灯 + 24h 统计。local=1 时不要把其他监测机再拼进来。"""
     cfg = _load_config()
     channels = cfg.get("channels") or []
     defaults = cfg.get("defaults") or {}
@@ -1045,6 +1065,7 @@ def api_dashboard():
                 "lamp": lamp(s["status"]),
                 "last_type": s.get("last_type"),
                 "active_alarms": s.get("active_alarms") or [],
+                "alarm_since": _alarm_since_map(s.get("alarm_since")),
                 "alarm_shots": _card_alarm_shots(s, shot_index),
                 "program": s.get("program"),
                 "enabled": s.get("enabled", True),
@@ -1097,7 +1118,7 @@ def api_dashboard():
         "hub": {"active": False, "nodes": []},
     }
     nodes = _load_hub_nodes()
-    if not hub_mod.hub_is_active(nodes):
+    if local_only or not hub_mod.hub_is_active(nodes):
         return local
     merged = hub_mod.assemble_hub(nodes, local, hub_mod.fetch_json)
     merged["time"] = local["time"]
@@ -1180,24 +1201,201 @@ def api_system_nics():
     return {"nics": _list_nics()}
 
 
-def _preview_input_url(channel: Dict[str, Any]) -> str:
-    """
-    预览输入：优先用监测心跳里的 ingest_url（已是本机分发端口），
-    否则用配置 url（组播直拉可能失败）。
-    """
-    cid = channel.get("id")
-    st = _read_status_file(str(cid)) if cid else None
-    if st and st.get("ingest_url"):
-        return str(st["ingest_url"])
-    return str(channel.get("url") or "")
+def _preview_program_map(channel: Dict[str, Any]) -> List[str]:
+    prog = channel.get("program")
+    if prog is None or str(prog).strip() == "":
+        return []
+    try:
+        return ["-map", "0:p:%d" % int(prog)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _capture_ring_path(channel: Dict[str, Any]) -> Optional[str]:
+    """监测网卡收流的共享环。预览只读这块，不再去绑监测进程已经占用的本机 UDP 口。"""
+    import re
+
+    cid = str(channel.get("id") or "")
+    st = _read_status_file(cid) if cid else None
+    st = st or {}
+    iface = st.get("iface") or channel.get("iface")
+    group = st.get("capture_group")
+    port = st.get("capture_port")
+    if not group or not port:
+        url = str(st.get("url") or channel.get("url") or "")
+        matched = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", url)
+        if matched:
+            group = group or matched.group(1)
+            port = port or matched.group(2)
+    if not iface or not group or not port:
+        return None
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        return None
+    safe_iface = re.sub(r"[^A-Za-z0-9]", "x", str(iface))
+    safe_group = re.sub(r"[^A-Za-z0-9]", "d", str(group))
+    suffix = "_%s_%s_%d" % (safe_iface, safe_group, port_i)
+    try:
+        names = os.listdir("/dev/shm")
+    except OSError:
+        return None
+    alive = []
+    for name in names:
+        if not name.startswith("amcr_") or not name.endswith(suffix):
+            continue
+        parts = name.split("_")
+        pid = 0
+        if len(parts) > 1:
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                pid = 0
+        if not pid:
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        alive.append("/dev/shm/" + name)
+    if not alive:
+        return None
+    alive.sort(key=lambda path: os.path.getmtime(path))
+    return alive[-1]
+
+
+def _ring_slice(mm, cap: int, start: int, end: int) -> bytes:
+    out = bytearray()
+    pos_i = int(start)
+    end_i = int(end)
+    while pos_i < end_i:
+        at = pos_i % cap
+        n = min(end_i - pos_i, cap - at)
+        out.extend(mm[8 + at : 8 + at + n])
+        pos_i += n
+    return bytes(out)
+
+
+def _stream_capture_ring(path: str, channel: Dict[str, Any], channel_id: str):
+    """从共享环尾部取出正在收的 TS，抽出这一套节目再送出去。"""
+    import mmap
+    import struct
+    import subprocess
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+    except Exception:
+        os.close(fd)
+        raise HTTPException(500, "收流缓冲打不开")
+    cap = (mm.size() - 8) // 188 * 188
+    if cap < 188:
+        mm.close()
+        os.close(fd)
+        raise HTTPException(500, "收流缓冲尺寸不对")
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-probesize",
+        "1000000",
+        "-analyzeduration",
+        "500000",
+        "-f",
+        "mpegts",
+        "-i",
+        "pipe:0",
+    ]
+    cmd.extend(_preview_program_map(channel))
+    cmd.extend(["-c", "copy", "-f", "mpegts", "pipe:1"])
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+    except OSError as exc:
+        mm.close()
+        os.close(fd)
+        raise HTTPException(500, "无法启动预览: %s" % exc)
+
+    stop = threading.Event()
+
+    def pump() -> None:
+        try:
+            last = struct.unpack_from("Q", mm, 0)[0]
+            last -= last % 188
+            back = 512 * 1024
+            back -= back % 188
+            if last > back:
+                last -= back
+            else:
+                last = 0
+            while not stop.is_set() and proc.poll() is None:
+                write_at = struct.unpack_from("Q", mm, 0)[0]
+                write_at -= write_at % 188
+                if write_at < last or write_at - last > cap:
+                    last = max(0, write_at - back)
+                if write_at <= last:
+                    time.sleep(0.04)
+                    continue
+                chunk = _ring_slice(mm, cap, last, write_at)
+                last = write_at
+                if not chunk or proc.stdin is None:
+                    continue
+                proc.stdin.write(chunk)
+        except Exception:
+            pass
+        finally:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=pump, name="preview-ring", daemon=True).start()
+
+    def gen():
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(32 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            stop.set()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                mm.close()
+            except Exception:
+                pass
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        gen(),
+        media_type="video/mp2t",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Channel-Id": channel_id,
+        },
+    )
 
 
 @app.get("/api/preview/{channel_id}")
 def api_preview_stream(channel_id: str):
-    """
-    点击预览：FFmpeg 将频道 TS 以 MPEG-TS 流式输出给浏览器（mpegts.js）。
-    需频道监测在跑（才能用到 ingest_url）；短时预览。
-    """
+    """点播这一套节目。网卡收流时读共享环，避免再占监测进程的本机 UDP 口。"""
     import subprocess
 
     cfg = _load_config()
@@ -1207,15 +1405,17 @@ def api_preview_stream(channel_id: str):
             channel = ch
             break
     if not channel:
-        raise HTTPException(404, f"频道不存在: {channel_id}")
+        raise HTTPException(404, "频道不存在: %s" % channel_id)
     if not channel.get("enabled", True):
         raise HTTPException(400, "频道未启用，请先启用监测后再预览")
 
-    src = _preview_input_url(channel)
+    ring = _capture_ring_path(channel)
+    if ring:
+        return _stream_capture_ring(ring, channel, channel_id)
+
+    src = str(channel.get("url") or "")
     if not src:
         raise HTTPException(400, "无可用预览地址")
-
-    prog = channel.get("program")
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -1224,21 +1424,15 @@ def api_preview_stream(channel_id: str):
         "-fflags",
         "+genpts+discardcorrupt",
         "-probesize",
-        "32M",
+        "2M",
         "-analyzeduration",
-        "8M",
+        "1M",
     ]
-    if str(src).lower().startswith("udp:"):
+    if src.lower().startswith("udp:"):
         cmd.extend(["-f", "mpegts"])
     cmd.extend(["-i", src])
-    if prog is not None and str(prog).strip() != "":
-        try:
-            p = int(prog)
-            cmd.extend(["-map", f"0:p:{p}"])
-        except (TypeError, ValueError):
-            pass
+    cmd.extend(_preview_program_map(channel))
     cmd.extend(["-c", "copy", "-f", "mpegts", "pipe:1"])
-
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1246,8 +1440,8 @@ def api_preview_stream(channel_id: str):
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
-    except OSError as e:
-        raise HTTPException(500, f"无法启动预览: {e}")
+    except OSError as exc:
+        raise HTTPException(500, "无法启动预览: %s" % exc)
 
     def gen():
         try:
@@ -1468,6 +1662,9 @@ def api_update_ai(body: AIUpdate):
     if body.enabled is not None:
         ai["enabled"] = bool(body.enabled)
         changed.append(f"enabled={ai['enabled']}")
+    if body.class_alarm is not None:
+        ai["class_alarm"] = bool(body.class_alarm)
+        changed.append("class_alarm=%s" % ai["class_alarm"])
     if body.mode is not None:
         if body.mode not in ("auto", "onnx", "heuristic", "off"):
             raise HTTPException(400, "mode 必须是 auto|onnx|heuristic|off")
@@ -2033,3 +2230,62 @@ async def api_import_file(
         raise HTTPException(400, "channels 必须是数组")
 
     return api_import_channels(ChannelImport(mode=mode, channels=channels))
+
+
+def _admin_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(str(tmp), str(path))
+
+
+@app.post("/api/admin/restart")
+def api_admin_restart():
+    """只重启监测进程。不等待，也不重启本网页。"""
+    import subprocess
+
+    subprocess.Popen(
+        ["/usr/bin/systemctl", "restart", "ai-monitor"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {"ok": True, "message": "正在重启监测进程，大约一分钟"}
+
+
+@app.post("/api/admin/model")
+async def api_admin_model(
+    onnx: UploadFile = File(...),
+    classes: UploadFile = File(...),
+):
+    """写入固定文件名。不在这里重启。"""
+    blob = await onnx.read()
+    side = await classes.read()
+    if len(blob) < 1000 or len(blob) > 200 * 1024 * 1024:
+        raise HTTPException(400, "模型文件大小不对")
+    try:
+        parsed = json.loads(side.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "类别文件不是 JSON")
+    names = parsed.get("classes") if isinstance(parsed, dict) else None
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(item, str) and item.strip() for item in names)
+    ):
+        raise HTTPException(400, "类别文件里要有 classes 列表")
+    models = ROOT / "models"
+    onnx_path = models / "mosaic_detector.onnx"
+    class_path = models / "mosaic_detector.onnx.classes.json"
+    for src, bak_name in (
+        (onnx_path, "mosaic_detector.onnx.bak-before-desktop"),
+        (class_path, "mosaic_detector.onnx.classes.json.bak-before-desktop"),
+    ):
+        if src.is_file():
+            try:
+                (models / bak_name).write_bytes(src.read_bytes())
+            except OSError:
+                pass
+    _admin_write_bytes(onnx_path, blob)
+    _admin_write_bytes(class_path, side)
+    return {"ok": True, "message": "模型已写入，重启监测后生效", "bytes": len(blob)}

@@ -19,10 +19,11 @@ AI 画面异常检测模块（可选）
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("ai_detector")
 
@@ -185,6 +186,98 @@ def decide_picture_alarm(
         },
         "message": label,
     }
+
+
+def interpret_class_output(
+    scores: Sequence[float],
+    class_names: Sequence[str],
+    class_alarm: bool = False,
+    threshold: float = 0.55,
+) -> Dict[str, Any]:
+    """多类模型的一帧结果。class_alarm 关闭时只记下最高类，不因此告警。"""
+    names = [str(name) for name in (class_names or [])]
+    values: List[float] = []
+    for raw in scores or []:
+        try:
+            values.append(float(raw))
+        except (TypeError, ValueError):
+            values.append(0.0)
+    if not names or len(names) != len(values):
+        return {
+            "is_anomaly": False,
+            "score": 0.0,
+            "label": "unknown",
+            "detail": {"class_scores": {}, "class_alarm": bool(class_alarm)},
+            "message": "类别维度和模型输出对不上",
+        }
+    top_i = 0
+    for i, value in enumerate(values):
+        if value > values[top_i]:
+            top_i = i
+    top_name = names[top_i]
+    top_score = values[top_i]
+    detail = {
+        "class_scores": {
+            name: round(value, 4) for name, value in zip(names, values)
+        },
+        "top_class": top_name,
+        "class_alarm": bool(class_alarm),
+    }
+    fault = top_name not in ("normal", "anomaly")
+    alarm = bool(class_alarm) and fault and top_score >= float(threshold)
+    label = top_name if alarm else "normal"
+    return {
+        "is_anomaly": alarm,
+        "score": round(top_score, 4),
+        "label": label,
+        "detail": detail,
+        "message": label,
+    }
+
+
+def _load_class_names(model_path: Path, width: Optional[int]) -> Optional[List[str]]:
+    """读导出时放在模型旁边的类别文件。旧的二分类模型没有这个文件。"""
+    side = Path(str(model_path) + ".classes.json")
+    names: Optional[List[str]] = None
+    if side.is_file():
+        try:
+            data = json.loads(side.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            data = None
+        raw = data.get("classes") if isinstance(data, dict) else None
+        if isinstance(raw, list) and raw:
+            names = [str(item) for item in raw]
+    if width == 2 and not names:
+        return ["normal", "anomaly"]
+    if width and int(width) > 2 and not names:
+        logger.warning("模型输出 %s 维，旁边没有类别文件", width)
+        return None
+    if names and width and len(names) != int(width):
+        logger.warning(
+            "类别文件有 %d 类，模型输出是 %s 维", len(names), width
+        )
+        return None
+    return names
+
+
+def uses_named_class_output(class_names, width) -> bool:
+    """类别文件和输出列数一致，并且不是旧的「正常/异常」二分类。
+
+    只有花屏马赛克这一类故障时，输出也是两列，同样按类别看。
+    旧模型没有类别文件，第二列只是异常分，不能拿来告警。
+    """
+    names = [str(name) for name in (class_names or [])]
+    if not names or width is None:
+        return False
+    try:
+        cols = int(width)
+    except (TypeError, ValueError):
+        return False
+    if cols < 2 or cols != len(names):
+        return False
+    if names == ["normal", "anomaly"]:
+        return False
+    return True
 
 
 def mosaic_ratio_hwc(img, block: int = 8) -> float:
@@ -363,11 +456,14 @@ class AIDetector:
         if confirm < 1.0:
             confirm = 1.0
         self.confirm_sec = confirm
+        # 多类模型默认只记类别，不拿它告警。现有二分类模型不看这个开关。
+        self.class_alarm = bool(ai_config.get("class_alarm", False))
 
         self.available = False
         self.backend = "none"  # none | onnx | heuristic | builtin
         self._session = None
         self._input_name = None
+        self._class_names: Optional[List[str]] = None
         self._cv2 = None
         self._np = None
 
@@ -415,10 +511,21 @@ class AIDetector:
                 providers=["CPUExecutionProvider"],
             )
             self._input_name = self._session.get_inputs()[0].name
+            width = None
+            try:
+                shape = self._session.get_outputs()[0].shape
+                if len(shape) >= 2 and isinstance(shape[-1], int):
+                    width = int(shape[-1])
+            except Exception:
+                width = None
+            self._class_names = _load_class_names(self.model_path, width)
             self._np = np
             self.available = True
             self.backend = "onnx"
-            logger.info(f"AI 后端已加载: ONNX ({self.model_path})")
+            logger.info(
+                "AI 后端已加载: ONNX (%s) classes=%s"
+                % (self.model_path, self._class_names or "binary")
+            )
             return True
         except ImportError:
             logger.info("未安装 onnxruntime，跳过 ONNX 后端")
@@ -567,20 +674,48 @@ class AIDetector:
             mosaic_ratio = 0.0
         # 绿条要在缩图之前看。缩到 224 后，一条条绿会粘成整幅花屏。
         pure = _pure_green_ratio(full)
-        judged = decide_picture_alarm(
+        class_names = self._class_names or []
+        use_classes = out.ndim == 2 and uses_named_class_output(
+            class_names, int(out.shape[1])
+        )
+        # 分类模型的第 2 列是某一类故障，不是旧的异常分，不能拿去抬高规则告警。
+        rule = decide_picture_alarm(
             g_ratio,
             mosaic_ratio,
-            onnx_score=score,
+            onnx_score=0.0 if use_classes else score,
             green_th=self.green_ratio_th,
             mosaic_th=BUILTIN_MOSAIC_RATIO,
             concealment=_frame_concealment(full),
             pure_ratio=pure,
             pure_th=self.pure_green_patch,
         )
+        shown = score
+        if use_classes:
+            class_judged = interpret_class_output(
+                [float(v) for v in out[0]],
+                class_names,
+                class_alarm=self.class_alarm,
+                threshold=self.threshold,
+            )
+            shown = float(class_judged.get("score") or 0.0)
+            if class_judged["is_anomaly"]:
+                judged = class_judged
+                judged["detail"]["rule_label"] = rule["label"]
+            elif rule["is_anomaly"]:
+                judged = rule
+                judged["detail"].update(class_judged["detail"])
+                judged["detail"]["rule_fallback"] = True
+            else:
+                judged = class_judged
+            judged["detail"]["green_ratio"] = round(g_ratio, 4)
+            judged["detail"]["mosaic_ratio"] = round(mosaic_ratio, 4)
+            judged["detail"]["pure_ratio"] = round(pure, 4)
+        else:
+            judged = rule
         judged["detail"]["raw"] = float(np.ravel(out)[0]) if out.size else score
         judged["message"] = "画面判定: %s (onnx=%.3f, mosaic=%.3f, green=%.3f)" % (
             judged["label"],
-            score,
+            shown,
             mosaic_ratio,
             g_ratio,
         )

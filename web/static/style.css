@@ -518,7 +518,7 @@ body {
 .hub-row { display: flex; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
 .hub-row input { flex: 1; min-width: 90px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
 #btn-save-order:not(:disabled) { border-color: var(--accent); color: #fff; background: rgba(59,130,246,.28); }
-.ch-card.dragging { opacity: 0.45; }
+.ch-card.dragging { opacity: 0.45; pointer-events: none; }
 .ch-card.drag-over { outline: 2px dashed var(--accent); }
 .channel-grid .ch-card { cursor: grab; }
 .channel-grid .ch-card:active { cursor: grabbing; }
@@ -553,6 +553,88 @@ td.url { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-spac
   max-height: 420px;
   overflow: auto;
   padding: 8px;
+}
+#view-dash > .float-panel { margin-top: 16px; }
+.float-panel.hidden { display: none !important; }
+.float-panel > .panel-head { cursor: grab; }
+.float-dock { display: none; margin-left: 8px; flex: 0 0 auto; }
+.float-placeholder { display: none; }
+.float-resize {
+  display: none;
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  z-index: 2;
+  touch-action: none;
+}
+.float-resize::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+}
+.float-panel.is-float {
+  position: fixed;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  margin: 0 !important;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.45);
+  overflow: hidden;
+  min-width: 300px;
+  min-height: 200px;
+}
+.float-panel.is-float > .panel-head {
+  flex: 0 0 auto;
+  align-items: center;
+  user-select: none;
+  touch-action: none;
+  gap: 8px;
+}
+.float-panel.is-float > .panel-head .hint {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.float-panel.is-float > .panel-head .float-dock { display: inline-block; }
+.float-panel.is-float > .float-resize { display: block; }
+.float-panel.is-float > .event-toolbar,
+.float-panel.is-float > .snap-toolbar { flex: 0 0 auto; }
+.float-panel.is-float > .event-list,
+.float-panel.is-float > .snap-grid {
+  max-height: none;
+  flex: 1 1 0;
+  height: 0;
+  min-height: 0;
+  overflow: auto;
+}
+/* 浮动后的截图保持原来的缩略图大小，框变小就在格子里滚动，不把画面压扁。 */
+.float-panel.is-float > .snap-grid {
+  align-content: start;
+  grid-auto-rows: max-content;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) transparent;
+}
+.float-panel.is-float .snap-media {
+  height: 100px;
+  min-height: 100px;
+}
+.float-panel.is-float .snap-card img,
+.float-panel.is-float .snap-media .vu {
+  height: 100px;
+  min-height: 100px;
+  max-height: 100px;
+  flex-shrink: 0;
 }
 .event-item {
   padding: 10px 12px;
@@ -711,6 +793,10 @@ td.url { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-spac
   color: var(--muted);
 }
 .field-row { flex-wrap: wrap; }
+.field-row > span[title] {
+  cursor: help;
+  border-bottom: 1px dotted currentColor;
+}
 .field-row select,
 .field-row input[type="number"] { margin-left: auto; }
 .switch-row input[type="checkbox"] {

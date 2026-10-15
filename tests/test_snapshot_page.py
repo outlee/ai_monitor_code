@@ -216,6 +216,23 @@ class SnapshotPageTests(unittest.TestCase):
                     remembered["silence"]["file"], "silence_20261012_120100.jpg"
                 )
                 self.assertEqual(remembered["silence"]["audio_state"], "silent")
+                stale = appmod._card_alarm_shots(
+                    {
+                        "id": "hd_92",
+                        "active_alarms": ["freeze"],
+                        "alarm_since": {"freeze": "2026-10-14 13:05:00"},
+                        "open_shots": {
+                            "freeze": {
+                                "file": "freeze_missing.jpg",
+                                "time": "2026-10-14 12:00:00",
+                            }
+                        },
+                    },
+                    appmod._event_shot_index(events),
+                )
+                self.assertEqual(stale["freeze"]["time"], "2026-10-14 13:05:00")
+                self.assertEqual(stale["freeze"]["file"], "")
+                self.assertNotEqual(stale["freeze"]["file"], name)
             finally:
                 appmod.SNAPSHOT_DIR = old_dir
 

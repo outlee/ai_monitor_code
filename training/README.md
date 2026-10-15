@@ -9,14 +9,35 @@
 
 ## 快速命令
 
-```bash
-pip install -r requirements.txt
+这一次的图在 `Z:\ai_monitor_code-main\dataset_frame`。在有显卡的训练机上执行，不要在监测机上跑。步骤全文见 [docs/TRAINING.md](../docs/TRAINING.md) 的「这一次怎么训」。
 
-# 目录: data/train|val / normal|anomaly
-python train.py --data ./dataset --out ./runs/exp1 --epochs 30 --batch-size 64
-python export_onnx.py --ckpt ./runs/exp1/best.pt --out ./mosaic_detector.onnx
-python scan_threshold.py --onnx ./mosaic_detector.onnx --data ./dataset --split val
+```bat
+cd /d Z:\ai_monitor_code-main\training
+pip install -r requirements.txt
+python train.py --data Z:\ai_monitor_code-main\dataset_frame --out Z:\ai_monitor_code-main\training\runs\frame1
+python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame1\best.pt --out Z:\ai_monitor_code-main\training\runs\frame1\mosaic_detector.onnx
 ```
+
+旧的两类数据仍可用：`dataset\train|val` 下的 `normal` 和 `anomaly`。
+
+## 一个模型，按类放图
+
+练习题在 `train/`，考试题在 `val/`。同一类画面放同一个文件夹，训练脚本看哪些文件夹有图，学成一个 ONNX。不要按类各训一个再拼到一起。
+
+```text
+dataset/
+  train/normal/          val/normal/
+  train/solid_green/           val/solid_green/
+  train/green_screen_mosaic/   val/green_screen_mosaic/
+```
+
+目录名只用这些：`normal` `black` `blue_screen` `solid_green` `green_screen_mosaic` `color_exposure` `inverted`。`solid_green` 是绿屏。`green_screen_mosaic` 是花屏和马赛克放在一起。`color_exposure` 是偏色、过曝、欠曝放在一起，旧目录名 `color_cast`、`overexposed`、`underexposed` 也会收进这一类。旧目录名 `green_screen`、`mosaic` 也会被收进花屏马赛克。彩条放进 `normal`，或者放进 `color_bars` 也会按正常画面学，不告警。没有样本的类不要建目录。`snow` 这次不学。`freeze`、`flicker` 单帧看不出来，放了也会跳过。
+
+`normal` 和 `anomaly` 两个文件夹还是原来的二分类，和现在线上的模型一样。不要把 `anomaly` 和上面这些具名故障目录混在一起。认不出的目录名这次不学，训练开始时会打印出来。
+
+导出时旁边会写出 `mosaic_detector.onnx.classes.json`，和 onnx 一起拷。监测端默认只把最高类记在节目心跳里，不拿它告警。现有花屏、马赛克规则照旧。以后加上一类，要整次重训再导出，不能改旧文件的列。
+
+`scan_threshold.py` 仍只扫旧的二分类验证集。
 
 演示假数据（仅测通脚本）：
 

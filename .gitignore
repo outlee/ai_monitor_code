@@ -22,6 +22,14 @@ data/
 mosaic_sample.mp4
 *_sample.mp4
 
+# 桌面端自带播放器，体积大，不进仓库
+desktop/player/*
+!desktop/player/.gitkeep
+# 本机三台地址和打包中间目录，留在这台电脑
+desktop/nodes.json
+desktop/_pyi_work/
+dist_desktop/
+
 # 可选大模型（仓库只保留 README）
 models/*.onnx
 models/*.pt

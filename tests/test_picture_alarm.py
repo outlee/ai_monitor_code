@@ -268,6 +268,26 @@ class ConcealmentTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "green")
 
+    def test_chroma_collapsed_green_is_concealment(self):
+        import numpy as np
+
+        from frame_quality import chroma_collapsed_green_hwc, _full_frame_reject_reason
+
+        rng = np.random.RandomState(3)
+        h, w = 90, 160
+        plane = np.zeros((h, w, 3), dtype=np.uint8)
+        plane[:, :, 1] = rng.randint(30, 200, size=(h, w), dtype=np.uint8)
+        self.assertTrue(chroma_collapsed_green_hwc(plane))
+        self.assertEqual(_full_frame_reject_reason(plane), "conceal")
+        tint = rng.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
+        tint[:, :, 1] = np.clip(tint[:, :, 1].astype(np.int16) + 60, 0, 255).astype(np.uint8)
+        self.assertFalse(chroma_collapsed_green_hwc(tint))
+        flat = np.zeros((h, w, 3), dtype=np.uint8)
+        flat[:, :, 0] = 10
+        flat[:, :, 1] = 220
+        flat[:, :, 2] = 10
+        self.assertFalse(chroma_collapsed_green_hwc(flat))
+
 
 class NativeBlockTests(unittest.TestCase):
     def test_sixteen_pixel_tiles_count_as_mosaic(self):

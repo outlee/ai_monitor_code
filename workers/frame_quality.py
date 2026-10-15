@@ -375,9 +375,46 @@ def _concealment_python(buf, w, h):
     return _rows_are_concealment(fill, picture)
 
 
+def chroma_collapsed_green_hwc(img):
+    """整幅红蓝几乎没了，画面只留在绿色里。
+
+    标清解码有时会铺一层绿，节目内容还在，但不是花屏马赛克。
+    平的纯绿不算，那种仍然按绿屏留着。黑边和侧边黑条不参与计算。
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return False
+    arr = np.ascontiguousarray(img)
+    if getattr(arr, "ndim", 0) != 3 or arr.shape[2] < 3:
+        return False
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if h < 8 or w < 8:
+        return False
+    rgb = arr[:, :, :3].astype(np.int16)
+    r = rgb[:, :, 0]
+    g = rgb[:, :, 1]
+    b = rgb[:, :, 2]
+    lit = g > 18
+    lit_n = int(lit.sum())
+    if lit_n < (h * w) * 0.70:
+        return False
+    rr = r[lit]
+    gg = g[lit]
+    bb = b[lit]
+    crushed = (rr <= 12) & (bb <= 12) & (gg >= rr + 12) & (gg >= bb + 12)
+    if float(crushed.mean()) < 0.74:
+        return False
+    if float(gg.std()) < 12.0:
+        return False
+    return True
+
+
 def _full_frame_reject_reason(img):
     """原图上的解码废图。竖彩条和绿横条都要在缩小之前看。"""
     if concealment_hwc(img):
+        return "conceal"
+    if chroma_collapsed_green_hwc(img):
         return "conceal"
     if vertical_smear_hwc(img):
         return "smear"

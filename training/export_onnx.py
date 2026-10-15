@@ -3,7 +3,8 @@
 """
 将 best.pt 导出为监测系统可用的 ONNX。
 
-输出：1x2 softmax 概率，[normal, anomaly]，监测端取 out[0][1] 作异常分。
+输出是 softmax 概率。旧的二分类是 1x2：[normal, anomaly]。
+多类时列顺序写在 onnx 旁边的 .classes.json，监测端按这个文件认列。
 
 用法：
   python export_onnx.py --ckpt ./runs/exp1/best.pt --out ./mosaic_detector.onnx
@@ -13,7 +14,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,16 +37,49 @@ class SoftmaxWrapper(nn.Module):
         return self.softmax(self.backbone(x))
 
 
-def load_checkpoint(ckpt_path: Path, device: torch.device) -> nn.Module:
+def _class_list(ckpt, state) -> List[str]:
+    """优先用训练时记下的类别。对不上最后一层宽度时，退回二分类或 class_0。"""
+    classes: Optional[List[str]] = None
+    if isinstance(ckpt, dict):
+        raw = ckpt.get("classes")
+        if isinstance(raw, list) and raw:
+            classes = [str(item) for item in raw]
+    rows = None
+    if isinstance(state, dict) and "classifier.3.weight" in state:
+        rows = int(state["classifier.3.weight"].shape[0])
+    if classes and rows and len(classes) != rows:
+        print(
+            "警告: 权重输出 %d 类，checkpoint 记录 %d 类，按权重导出"
+            % (rows, len(classes))
+        )
+        classes = None
+    if classes:
+        return classes
+    if rows == 2 or rows is None:
+        return ["normal", "anomaly"]
+    return ["class_%d" % i for i in range(int(rows))]
+
+
+def load_checkpoint(ckpt_path: Path, device: torch.device) -> Tuple[nn.Module, List[str]]:
     try:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(ckpt_path, map_location=device)
-    model = build_model(pretrained=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    classes = _class_list(ckpt, state)
+    model = build_model(num_classes=len(classes), pretrained=False)
     model.load_state_dict(state)
     model.eval()
-    return model
+    return model, classes
+
+
+def write_class_sidecar(out_path: Path, classes: List[str]) -> None:
+    side = Path(str(out_path) + ".classes.json")
+    side.write_text(
+        json.dumps({"classes": list(classes)}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print("classes: %s -> %s" % (side, ",".join(classes)))
 
 
 def export_onnx(model: nn.Module, out_path: Path, opset: int = 13) -> None:
@@ -64,7 +100,12 @@ def export_onnx(model: nn.Module, out_path: Path, opset: int = 13) -> None:
     print(f"exported: {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
 
 
-def verify_onnx(onnx_path: Path, image_path: Path, threshold: float = 0.55) -> None:
+def verify_onnx(
+    onnx_path: Path,
+    image_path: Path,
+    threshold: float = 0.55,
+    classes: Optional[List[str]] = None,
+) -> None:
     import onnxruntime as ort
 
     img = load_rgb_224(image_path)
@@ -75,6 +116,14 @@ def verify_onnx(onnx_path: Path, image_path: Path, threshold: float = 0.55) -> N
     inp = sess.get_inputs()[0].name
     out = sess.run(None, {inp: x})[0]
     print(f"output shape={out.shape} values={out}")
+    names = list(classes or [])
+    if out.ndim == 2 and names and int(out.shape[1]) == len(names):
+        top = int(np.argmax(out[0]))
+        print(
+            "top=%s score=%.4f threshold=%.2f"
+            % (names[top], float(out[0][top]), threshold)
+        )
+        return
     if out.ndim == 2 and out.shape[1] >= 2:
         score = float(out[0][1])
     else:
@@ -93,8 +142,10 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cpu")  # 导出在 CPU 即可
-    model = load_checkpoint(Path(args.ckpt), device)
-    export_onnx(model, Path(args.out), opset=args.opset)
+    model, classes = load_checkpoint(Path(args.ckpt), device)
+    out_path = Path(args.out)
+    export_onnx(model, out_path, opset=args.opset)
+    write_class_sidecar(out_path, classes)
 
     try:
         import onnx
@@ -105,10 +156,13 @@ def main():
         print(f"onnx.checker 跳过/失败: {e}")
 
     if args.verify:
-        verify_onnx(Path(args.out), Path(args.verify), threshold=args.threshold)
+        verify_onnx(
+            out_path, Path(args.verify), threshold=args.threshold, classes=classes
+        )
 
-    print("拷贝到监测机: models/mosaic_detector.onnx")
-    print("配置: ai.enabled=true, mode=auto|onnx, threshold=...")
+    print("拷贝到监测机: %s 和 %s.classes.json" % (out_path.name, out_path.name))
+    print("配置: ai.enabled=true, mode=auto|onnx")
+    print("多类模型默认只记最高类，不告警。要告警再加 ai.class_alarm: true")
 
 
 if __name__ == "__main__":

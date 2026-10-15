@@ -169,12 +169,15 @@ def alarm_ring_tail(data: bytes, bitrate_kbps: float, span_sec: float) -> bytes:
 # 可选 AI 模块：导入失败也不影响主流程
 try:
     from ai_detector import AIDetector, create_detector
+    from picture_classes import FRAME_LABEL_ZH
 except ImportError:
     try:
         from workers.ai_detector import AIDetector, create_detector
+        from workers.picture_classes import FRAME_LABEL_ZH
     except ImportError:
         AIDetector = None  # type: ignore
         create_detector = None  # type: ignore
+        FRAME_LABEL_ZH = {}
 
 # SQLite 双写（失败不影响主流程）
 try:
@@ -462,6 +465,9 @@ class StreamMonitor:
         self._ai_bad_since = None
         self._ai_cool_until = 0.0
         self._ai_last_ident = None
+        self._ai_top_class = None
+        self._ai_top_score = None
+        self._ai_class_scores = None
         self._init_ai(ai_config or {})
 
     @staticmethod
@@ -693,13 +699,29 @@ class StreamMonitor:
 
     @staticmethod
     def _audio_level_filter() -> str:
-        """峰值电平。每 0.5 秒只打一两行，不按音频帧刷日志。"""
+        """最近约三分之一秒的峰值。
+
+        astats 的 reset=0 表示 Peak_level 从这次 FFmpeg 启动起只升不降。
+        节目曾经响过，静音时音柱仍停在那个最大值，截图就会像还有声音。
+        """
         return (
-            "astats=metadata=1:reset=0:length=0.3:"
+            "asetnsamples=n=16000:p=0,"
+            "astats=metadata=1:reset=1:length=0.4:"
             "measure_perchannel=none:measure_overall=Peak_level,"
-            "ametadata=mode=print:key=lavfi.astats.Overall.Peak_level:"
-            "enable='lt(mod(t\\,0.5)\\,0.03)'"
+            "ametadata=mode=print:key=lavfi.astats.Overall.Peak_level"
         )
+
+    def _recent_peak_allows_silence(self) -> bool:
+        """最近电平仍高于无伴音门限时，不能当成无伴音。没有新电平就沿用静音检测。"""
+        if self._audio_unavailable or self._audio_db is None:
+            return True
+        if not self._audio_db_ts or (_now_ts() - float(self._audio_db_ts)) > 3.0:
+            return True
+        try:
+            limit = float(self.silence_threshold)
+        except (TypeError, ValueError):
+            limit = -50.0
+        return float(self._audio_db) <= limit
 
     def _audio_level_value(self) -> Optional[float]:
         if self._audio_unavailable or self._audio_db is None:
@@ -794,6 +816,19 @@ class StreamMonitor:
 
     # ---------- 心跳状态 ----------
 
+    def _public_alarm_since(self) -> Dict[str, str]:
+        """每种仍未恢复的告警，从这一轮开始算，不用上一张截图的时间。"""
+        out: Dict[str, str] = {}
+        for key, started in self._active_alarms.items():
+            try:
+                ts = float(started)
+            except (TypeError, ValueError):
+                continue
+            if ts <= 0:
+                continue
+            out[str(key)] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        return out
+
     def _public_open_shots(self) -> Dict[str, Dict]:
         """未恢复告警对应的截图文件名。只给网页文件名，不给本机绝对路径。"""
         out: Dict[str, Dict] = {}
@@ -844,6 +879,7 @@ class StreamMonitor:
             "media_ok": self._media_ok(),
             "reconnect_count": self.reconnect_count,
             "active_alarms": list(self._active_alarms.keys()),
+            "alarm_since": self._public_alarm_since(),
             "open_shots": self._public_open_shots(),
             "detect_width": self.detect_width,
             "frame_interval_sec": self.frame_interval_sec,
@@ -875,6 +911,11 @@ class StreamMonitor:
                     payload["video_codec"] = codec.get("video")
                 if codec.get("audio"):
                     payload["audio_codec"] = codec.get("audio")
+        if self._ai_top_class:
+            payload["ai_top_class"] = self._ai_top_class
+            payload["ai_top_score"] = self._ai_top_score
+            if self._ai_class_scores:
+                payload["ai_class_scores"] = self._ai_class_scores
         if extra:
             payload.update(extra)
         path = self.status_dir / f"{self.id}.json"
@@ -971,7 +1012,9 @@ class StreamMonitor:
                 "time": _now_str(),
             }
             if start_ts:
-                ev["duration"] = round(_now_ts() - start_ts, 3)
+                dur = round(_now_ts() - start_ts, 3)
+                ev["duration"] = dur
+                ev["message"] = "节目信号恢复（持续 %.1f 秒）" % dur
             self.logger.info(json.dumps(ev, ensure_ascii=False))
             self._save_event(ev)
         if first or self._state == "starting":
@@ -2560,7 +2603,13 @@ class StreamMonitor:
             except (TypeError, ValueError):
                 age = 0.0
         audio_db, audio_state = self._snap_audio_now()
-        if event_type == "silence":
+        if event_type == "silence" or (
+            event_type == "freeze"
+            and self.freeze_mode == "video_silence"
+            and not self._audio_unavailable
+            and self._silence_active
+            and self._recent_peak_allows_silence()
+        ):
             audio_state = "silent"
 
         def _bg():
@@ -2608,6 +2657,7 @@ class StreamMonitor:
         r"(?:black_duration|freeze_duration|silence_duration)\s*[:=]\s*([0-9.]+)",
         re.I,
     )
+    _RE_DURATION_TEXT = re.compile(r"（持续 [^）]*）")
 
     def _commit_alarm_start(self, alarm_key: str, event: Dict, started: Optional[float] = None):
         """真正落库的开始告警（已过确认期）。"""
@@ -2626,7 +2676,10 @@ class StreamMonitor:
             if snap:
                 event["snapshot"] = str(snap)
                 event["audio_db"] = self._audio_level_value()
-                if event.get("type") == "silence":
+                if event.get("type") == "silence" or (
+                    event.get("type") == "freeze"
+                    and "无伴音" in str(event.get("message") or "")
+                ):
                     event["audio_state"] = "silent"
                 else:
                     event["audio_state"] = self._audio_state()
@@ -2677,7 +2730,9 @@ class StreamMonitor:
             return True
         if not self._silence_active or self._silence_since is None:
             return False
-        return (now - float(self._silence_since)) >= float(need)
+        if (now - float(self._silence_since)) < float(need):
+            return False
+        return self._recent_peak_allows_silence()
 
     def _note_silence_line(self, lower: str) -> None:
         if "silence_start" in lower:
@@ -2738,10 +2793,9 @@ class StreamMonitor:
             start_ts = self._active_alarms.pop(alarm_key, None)
             self._open_shots.pop(alarm_key, None)
             wall = round(_now_ts() - start_ts, 3) if start_ts else None
-            if wall is not None:
-                # 静帧以墙钟为准；FFmpeg freeze_duration 仍可能是错误 PTS
-                if alarm_key == "freeze" or "duration" not in event:
-                    event["duration"] = wall
+            chosen = self._recovery_seconds(alarm_key, event.get("duration"), wall)
+            if chosen is not None:
+                event["duration"] = chosen
             dur = event.get("duration")
             if (
                 alarm_key == "freeze"
@@ -2755,6 +2809,7 @@ class StreamMonitor:
                 self.logger.info(json.dumps(event, ensure_ascii=False))
                 self._write_status()
                 return
+            self._stamp_recovery_duration(event, alarm_key)
             self.logger.info(json.dumps(event, ensure_ascii=False))
             self._save_event(event)
             self._write_status()
@@ -2849,6 +2904,81 @@ class StreamMonitor:
         if not handled:
             return
 
+    def _message_with_duration(self, message: str, seconds: float) -> str:
+        text = self._RE_DURATION_TEXT.sub("", str(message or "")).rstrip()
+        return "%s（持续 %.1f 秒）" % (text, float(seconds))
+
+    def _recovery_seconds(self, alarm_key: str, reported, wall: Optional[float]):
+        """静帧只信墙钟。黑场和无伴音的探测时长更短就用更短的；比墙钟长出一截的是 PTS 跳变，丢掉。"""
+        got = None
+        if reported is not None:
+            try:
+                got = float(reported)
+            except (TypeError, ValueError):
+                got = None
+        if got is not None and got < 0:
+            got = None
+        if alarm_key == "freeze":
+            return wall if wall is not None else got
+        if got is None:
+            return wall
+        if wall is None:
+            return got
+        if got > wall + 15.0 and got > wall * 2.0:
+            return wall
+        if got < wall:
+            return got
+        return wall
+
+    def _stamp_recovery_duration(self, event: Dict, alarm_key: str) -> None:
+        """恢复文案写上已经选定的持续秒数。"""
+        del alarm_key
+        dur = event.get("duration")
+        if dur is None:
+            return
+        try:
+            seconds = float(dur)
+        except (TypeError, ValueError):
+            return
+        if seconds < 0:
+            return
+        msg = str(event.get("message") or "")
+        event["message"] = self._message_with_duration(msg, seconds)
+
+    def _close_latched_on_reconnect(self) -> None:
+        """解码进程退出时结案。不结案的话大屏已经正常，未恢复名单还停在上一轮。"""
+        labels = {
+            "black": "黑场已恢复",
+            "freeze": "静帧已恢复",
+            "silence": "无伴音已恢复",
+            "no_signal": "节目信号恢复",
+        }
+        for key in list(self._active_alarms.keys()):
+            if key not in labels:
+                continue
+            start_ts = self._active_alarms.get(key)
+            wall = None
+            try:
+                if start_ts:
+                    wall = round(_now_ts() - float(start_ts), 3)
+            except (TypeError, ValueError):
+                wall = None
+            ev = {
+                "type": "%s_end" % key,
+                "phase": "end",
+                "channel_id": self.id,
+                "channel_name": self.name,
+                "message": labels[key],
+                "time": _now_str(),
+            }
+            if wall is not None and wall >= 0:
+                ev["duration"] = wall
+                ev["message"] = self._message_with_duration(ev["message"], wall)
+            self.logger.info(json.dumps(ev, ensure_ascii=False))
+            self._save_event(ev)
+        self._active_alarms.clear()
+        self._open_shots.clear()
+
     def _extract_duration(self, line: str) -> Optional[float]:
         m = self._RE_DURATION.search(line)
         if m:
@@ -2937,18 +3067,25 @@ class StreamMonitor:
 
     @staticmethod
     def _ai_alarm_text(label: str) -> str:
-        if label == "green_screen+mosaic":
+        if label in ("green_screen+mosaic", "green_screen_mosaic"):
             return "检测到花屏马赛克"
         if label == "green_screen":
             return "检测到花屏"
         if label == "mosaic":
             return "检测到马赛克"
+        zh = FRAME_LABEL_ZH.get(label) if isinstance(FRAME_LABEL_ZH, dict) else None
+        if zh:
+            return "检测到" + zh
         return "检测到花屏或马赛克"
 
     @staticmethod
     def _ai_alarm_type(label: str) -> str:
-        if label in ("green_screen", "green_screen+mosaic"):
+        if label in ("green_screen", "green_screen+mosaic", "green_screen_mosaic"):
             return "ai_green_screen"
+        if label == "mosaic":
+            return "ai_mosaic"
+        if isinstance(FRAME_LABEL_ZH, dict) and label in FRAME_LABEL_ZH:
+            return "ai_" + label
         return "ai_mosaic"
 
     def _analyze_frame_for_ai(self, frame_path: Path) -> bool:
@@ -2971,6 +3108,15 @@ class StreamMonitor:
                 return False
             result = self.ai.analyze_image(str(work_path))
             label = str(result.get("label") or "")
+            detail = result.get("detail")
+            if isinstance(detail, dict) and detail.get("top_class"):
+                self._ai_top_class = str(detail.get("top_class"))
+                scores = detail.get("class_scores")
+                self._ai_class_scores = scores if isinstance(scores, dict) else None
+                try:
+                    self._ai_top_score = round(float(result.get("score") or 0.0), 4)
+                except (TypeError, ValueError):
+                    self._ai_top_score = None
             if label in ("skipped", "unreadable", "error", ""):
                 return True
             now = _now_ts()
@@ -3265,8 +3411,7 @@ class StreamMonitor:
                 self.reconnect_count = 0
 
             self.reconnect_count += 1
-            self._active_alarms.clear()
-            self._open_shots.clear()
+            self._close_latched_on_reconnect()
             self._write_status("reconnecting")
 
             # 断流也要确认：连续失败达到阈值才记告警，避免偶发抖动误报
