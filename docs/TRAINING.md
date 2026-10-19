@@ -5,7 +5,7 @@
 > **分工原则（与系统设计一致）**  
 > - **训练**：在外部 GPU / 云电脑（如 **AutoDL**）完成。  
 > - **推理**：监测机只做加载 ONNX + 抽帧推理（`workers/ai_detector.py`）。  
-> - **无模型也能先用**：`ai.mode: heuristic` 启发式，无需训练。
+> - **现网**：173、176、177 已在用具名 ONNX（`normal` 与 `green_screen_mosaic`），分类告警是开的。没有模型时才会退回颜色/块状统计，不要把旧的方块分数当成花屏检测。
 
 相关文档：
 
@@ -26,7 +26,7 @@
 
 图在 `Z:\ai_monitor_code-main\dataset_frame`。`train` 是练习题，`val` 是考试题。一次训练只出一个模型。脚本按 `train` 里有图的文件夹决定类别，`workers/picture_classes.py` 规定列顺序。
 
-上次清点时的张数如下。开训后以脚本打印的 `classes=` 为准。
+下面是加入「再见」之前的清点。其后又往 `normal` 放了练习 41 张、考试 11 张（`zaijian_*`，见 [dataset_zaijian/README.txt](../dataset_zaijian/README.txt)）。开训后以脚本打印的张数和 `classes=` 为准。
 
 | 文件夹 | 练习 | 考试 | 这次算成 |
 |---|---:|---:|---|
@@ -38,13 +38,15 @@
 
 黑屏练习题只有 3 张、考试题没有，这次几乎学不会黑屏。只想学花屏马赛克时，先把 `train\black` 改名挪走再训。绿屏、蓝屏、偏色曝光、画面倒置没有文件夹，不会进这个模型。
 
+`runs\frame1` 是已经训过的目录，不要覆盖。这次输出到新目录：
+
 ```bat
 cd /d Z:\ai_monitor_code-main\training
 pip install -r requirements.txt
-python train.py --data Z:\ai_monitor_code-main\dataset_frame --out Z:\ai_monitor_code-main\training\runs\frame1
+python train.py --data Z:\ai_monitor_code-main\dataset_frame --out Z:\ai_monitor_code-main\training\runs\frame_zaijian1
 ```
 
-开头要看到 `device=cuda` 和显卡名字。若是 `cpu`，停掉，换到有显卡的环境。显存不够时在命令末尾加 `--batch-size 32`。默认 30 轮，最好的一版在 `runs\frame1\best.pt`。
+开头要看到 `device=cuda` 和显卡名字。若是 `cpu`，停掉，换到有显卡的环境。显存不够时在命令末尾加 `--batch-size 32`。默认 30 轮，最好的一版在 `runs\frame_zaijian1\best.pt`。
 
 看这三处：
 
@@ -55,10 +57,12 @@ python train.py --data Z:\ai_monitor_code-main\dataset_frame --out Z:\ai_monitor
 导出：
 
 ```bat
-python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame1\best.pt --out Z:\ai_monitor_code-main\training\runs\frame1\mosaic_detector.onnx
+python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame_zaijian1\best.pt --out Z:\ai_monitor_code-main\training\runs\frame_zaijian1\mosaic_detector.onnx
 ```
 
-旁边会有 `mosaic_detector.onnx.classes.json`。两个文件一起留着。换到监测机之前先看导出日志里的类别，不要只拷 onnx。监测端「分类告警」默认关着，现有绿屏占比和马赛克方块规则照旧。
+旁边会有 `mosaic_detector.onnx.classes.json`。两个文件一起拷到监测机 `models/`，然后重启该台 `ai-monitor`。只换 onnx 不会热加载。换之前先看导出日志里的类别。
+
+代码里 `ai.class_alarm` 默认关，只把最高类记在心跳里。三台现网这个开关是开的：最高类不是 `normal`、分数达到 `ai.threshold` 才按类别告警。绿屏占比和纯绿小块在现网设成大于 1，那条规则不告警。不要把 `block_score_th` 当成花屏检测打开。
 
 ---
 
@@ -77,12 +81,12 @@ python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame1\best.p
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  C. 训练（GPU / 云）                                               │
-│     二分类或轻量 backbone  ·  验证集调参  ·  记录最佳 checkpoint     │
+│     按文件夹学一个模型  ·  验证集看成绩  ·  留下 best.pt            │
 └────────────────────────────┬─────────────────────────────────────┘
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  D. 导出 ONNX（严格对齐监测端预处理）                               │
-│     1×3×224×224 float32 RGB /255  ·  输出异常分或二类概率           │
+│     1×3×224×224 RGB /255 · 具名 softmax + classes 文件               │
 └────────────────────────────┬─────────────────────────────────────┘
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
@@ -92,7 +96,7 @@ python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame1\best.p
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  F. 导入监测设备                                                   │
-│     scp → models/*.onnx  ·  改 channels.yaml  ·  热重载/重启        │
+│     scp onnx 与 classes.json · 重启 ai-monitor                       │
 │     test_ai_offline.py  ·  小流量试点  ·  全量推广                   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -152,22 +156,30 @@ is_anomaly = (score >= ai.threshold)   # 默认 threshold=0.55
 label      = "mosaic" if is_anomaly else "normal"
 ```
 
-> 当前线上模型仍是上面的二分类。分数只记在明细里，不会单靠分数告警。
+> 上面 A/B 是旧模型：没有 classes 文件时，`1×2` 的第二列是异常分，`1×1` 是单一异常分。现网不是这一档。
 
-### 2.2.1 多类单帧（架子已接上，默认不告警）
+### 2.2.1 现网：具名类别
 
 一个模型，按文件夹学，列顺序在 `workers/picture_classes.py`。没有样本的类不要建目录。`freeze` / `flicker` 单帧看不出来，训练时会跳过。
 
-导出时在 onnx 旁边写 `模型名.onnx.classes.json`，例如 `{"classes": ["normal", "green_screen", "mosaic"]}`。监测端读到多于 2 类时，把最高类记在节目心跳 `ai_top_class`，默认不告警。要拿它告警才写 `ai.class_alarm: true`。花屏、马赛克的现有规则仍然会报。
+导出时在 onnx 旁边写 `模型名.onnx.classes.json`。现网是两列，文件内容相当于：
 
-旧的 `normal` + `anomaly` 继续训练成现在这种 1×2。加上一类必须整次重训再导出，不能改旧 onnx 的列。目录说明见 [training/README.md](../training/README.md)。
+```json
+{"classes": ["normal", "green_screen_mosaic"]}
+```
 
-### 2.3 推荐：二分类 softmax
+只有两列也可以是具名类别。类别文件和输出列数一致，并且不是 `["normal", "anomaly"]` 时，按类别看最高类。没有这个文件的旧模型，第二列只是异常分，不能拿来做分类告警。
 
-- 类别 0：`normal`（正常）  
-- 类别 1：`anomaly`（马赛克 / 花屏 / 绿屏等**画面损坏**统称）  
+`ai.class_alarm` 打开后，最高类不是 `normal`、分数 ≥ `ai.threshold` 才告警。开关关掉时只把最高类记在节目心跳 `ai_top_class`。代码默认关，三台现网是开的。
 
-导出 ONNX 时保留 **softmax 后的 1×2**，便于用阈值扫 PR 曲线。
+旧的 `normal` + `anomaly` 两个文件夹仍会训练成 1×2 异常分，不要和具名故障目录放在同一份数据里。加上一类必须整次重训再导出，不能改旧 onnx 的列。目录说明见 [training/README.md](../training/README.md)。
+
+### 2.3 旧的二分类 softmax（仍兼容）
+
+- 类别 0：`normal`（正常）
+- 类别 1：`anomaly`（把多种画面损坏合成一类）
+
+这种导出保留 **softmax 后的 1×2**，第二列是异常概率。现网要训的是上一节的具名类别，不是再训一版 `anomaly`。
 
 ### 2.4 文件名与路径
 
@@ -242,38 +254,43 @@ ffmpeg -i normal.ts -vf fps=1/2 -q:v 2 frames/normal_%05d.jpg
 
 ## 4. 数据目录与标注
 
-### 4.1 推荐目录结构（训练机）
+### 4.1 现在用的目录（训练机）
+
+练习在 `train/`，考试在 `val/`。同一类画面放同一个文件夹。当前这份图在 `Z:\ai_monitor_code-main\dataset_frame`。
 
 ```text
-dataset/
-├── train/
-│   ├── normal/          # 标签 0
-│   │   ├── xxx.jpg
-│   │   └── ...
-│   └── anomaly/         # 标签 1（马赛克+花屏+绿屏可先合并）
-│       ├── yyy.jpg
-│       └── ...
-├── val/
-│   ├── normal/
-│   └── anomaly/
-└── test/                # 可选，最终报告用；勿参与调参
-    ├── normal/
-    └── anomaly/
+dataset_frame/
+  train/normal/                 val/normal/
+  train/green_screen_mosaic/    val/green_screen_mosaic/
 ```
 
-划分比例建议：`train : val : test ≈ 8 : 1 : 1`，**按时间或按节目切分**，避免同一镜头同时出现在 train 和 val。
+没有图的类不要建目录。正式名、旧名和不会学的目录见 [training/README.md](../training/README.md) 的对照表，和 `workers/picture_classes.py` 一致。这里列全：
 
-### 4.2 多类（可选扩展）
+| 文件夹 | 中文 | 训练时 |
+|--------|------|--------|
+| `normal` | 正常画面。彩条、「再见」也放这里 | 一列，不告警 |
+| `black` | 黑屏 | 一列，告警 |
+| `blue_screen` | 蓝屏 | 一列，告警 |
+| `solid_green` | 绿屏 | 一列，告警 |
+| `green_screen_mosaic` | 花屏和马赛克 | 一列，告警 |
+| `color_exposure` | 偏色、过曝、欠曝 | 一列，告警 |
+| `inverted` | 画面倒置 | 一列，告警 |
+| `green_screen` | 花屏 | 并进 `green_screen_mosaic` |
+| `mosaic` | 马赛克 | 并进 `green_screen_mosaic` |
+| `color_cast` | 偏色 | 并进 `color_exposure` |
+| `overexposed` | 过曝 | 并进 `color_exposure` |
+| `underexposed` | 欠曝 | 并进 `color_exposure` |
+| `color_bars` | 彩条 | 并进 `normal`，不告警 |
+| `anomaly` | 旧的异常 | 只和 `normal` 一起时才学，不能和上面的故障目录并存 |
+| `freeze` | 静帧 | 跳过 |
+| `flicker` | 闪烁 | 跳过 |
+| `snow` | 雪花 | 不在类别表里，不学 |
 
-若希望区分类型，可先在标注层保留细类，训练时映射：
+划分按节目或时间切开，同一段录像不要一边练习、一边考试。「再见」不要放进 `blue_screen`。
 
-```text
-normal      → 0
-mosaic      → 1
-green_screen→ 1   # 或单独类 2，导出时再合成 anomaly 概率
-```
+### 4.2 旧写法不要再当成现网
 
-监测端当前把异常统一当 `mosaic` 标签展示；多类展示需改 `ai_detector.py`（后续需求）。
+以前把花屏、马赛克都标成 `anomaly`，监测端只显示 `mosaic`。现网已经按 `workers/picture_classes.py` 的类别名告警，导出必须带 `*.onnx.classes.json`。不要再把多个具名类在导出时合成一个异常分。
 
 ### 4.3 标注规范（给标注同事）
 
@@ -389,16 +406,17 @@ print("exported mosaic_detector.onnx")
 python -c "import onnx; onnx.checker.check_model(onnx.load('mosaic_detector.onnx'))"
 ```
 
-### 6.2 输出必须是「异常分」语义
+### 6.2 导出前在图里做完 softmax
 
-- 若网络最后是 `Linear → 2 logits`：导出前加 `Softmax(dim=1)`，保证 `output[0,1]` 为异常概率。  
-- 或导出 logits，但监测端当前 **不做 softmax**，会直接把第二维当 score——**请在导出图内完成 softmax**，或改为单输出 sigmoid 概率。
+现网导出的是 K 类 softmax，列顺序写入 `mosaic_detector.onnx.classes.json`。监测端不会再对 logits 做一次 softmax。
 
-**推荐导出计算图末端：**
+只有旧的二分类才把末端收成两列，并且第二列是异常概率：
 
 ```text
 ... → logits(1,2) → Softmax → output(1,2)
 ```
+
+具名模型的末端是 `logits(1,K) → Softmax → output(1,K)`，K 与类别文件的个数相同。
 
 ### 6.3 在训练机用 onnxruntime 对齐
 
@@ -420,7 +438,8 @@ inp = sess.get_inputs()[0].name
 x = preprocess("some.jpg")
 out = sess.run(None, {inp: x})[0]
 print(out.shape, out)
-# 期望 (1,2)，且 out[0,1] 为异常概率
+# 具名模型期望 (1, K)，K 等于 classes.json 里的类别数，每行加总约等于 1
+# 旧二分类才是 (1, 2)，且 out[0,1] 为异常概率
 ```
 
 用 **同一张图** 对比：
@@ -432,15 +451,9 @@ print(out.shape, out)
 
 ### 6.4 阈值初选（在验证集 / 测试集上）
 
-对每张图算 `score = out[0,1]`，扫描 threshold：
+旧二分类才用第二列 `out[0,1]` 当异常分，`scan_threshold.py` 也只扫这种验证集。具名模型看的是最高类的分数，不是第二列。
 
-| threshold | 效果倾向 |
-|-----------|----------|
-| 偏低（如 0.3） | 召回高、误报多 |
-| **默认 0.55** | 监测配置起点 |
-| 偏高（如 0.7） | 误报少、漏报多 |
-
-选出验证集上 F1 或「业务可接受误报率」对应的阈值，写入监测配置 `ai.threshold`。
+softmax 之后两类分数加起来是 1，故障类要压过 `normal` 才排到第一。所以具名分类的 `ai.threshold` 用 0.7 这一档，不要用 0.2 或 0.55 当起点。三台现网的具体数值以各台配置为准，不要凭文档改。
 
 ---
 
@@ -449,11 +462,11 @@ print(out.shape, out)
 ### 7.1 拷贝模型
 
 ```bash
-# 在训练机或运维机
-scp mosaic_detector.onnx user@监测机IP:/opt/ai_monitor_code/models/
+# 在训练机或运维机。两个文件一起拷。
+scp mosaic_detector.onnx mosaic_detector.onnx.classes.json user@监测机IP:/opt/ai_monitor_code/models/
 
 # 监测机上确认
-ls -lh /opt/ai_monitor_code/models/mosaic_detector.onnx
+ls -lh /opt/ai_monitor_code/models/mosaic_detector.onnx /opt/ai_monitor_code/models/mosaic_detector.onnx.classes.json
 ```
 
 ### 7.2 安装推理依赖（若尚未安装）
@@ -472,25 +485,19 @@ pip3 install 'onnxruntime>=1.16.0' 'opencv-python-headless>=4.8.0' 'numpy>=1.24.
 ```yaml
 ai:
   enabled: true
-  mode: auto              # 有模型优先 ONNX；无模型可回落 heuristic
-  # mode: onnx            # 强制仅 ONNX，失败则 AI 不可用
+  mode: auto              # 有模型用 ONNX；没有模型才退回颜色/块状统计
   model_path: models/mosaic_detector.onnx
-  interval_sec: 2.0       # 每路分析间隔，越大越省 CPU
-  threshold: 0.55         # 与训练机扫出的阈值对齐
-  green_ratio_th: 0.35    # 仅 heuristic 用
-  block_score_th: 0.12
+  class_alarm: true       # 现网为开。代码默认 false
+  interval_sec: 2.0       # 每路隔多少秒看一张
+  confirm_sec: 6.0        # 连续这么多秒都像故障类才告警
+  threshold: 0.7          # 故障类分数。各台当前值以自己的配置为准，不要凭空改
+  green_ratio_th: 1.1     # 大于 1 时绿屏占比不告警。现网如此，不要改回 0.35
+  pure_green_patch: 1.1   # 大于 1 时纯绿小块不告警
 ```
 
-`defaults` 建议：
+不要把 `block_score_th: 0.12` 写回去当花屏检测。
 
-```yaml
-defaults:
-  frame_interval_sec: 2.0   # 旁路 latest.jpg，建议与 interval_sec 同量级
-  latest_max_age_sec: 5.0
-  ai_async: true            # AI 独立线程
-```
-
-保存后 **热重载约 3 秒**生效（Manager 未加 `--no-reload` 时）。
+改阈值、开关后，Web 保存大约 3 秒热重载。换 `.onnx` 或 `.classes.json` 不会热加载，要 `systemctl restart ai-monitor`。不要顺手覆盖该台的频道表。
 
 ### 7.4 监测机离线验证
 
@@ -529,7 +536,7 @@ grep -i "AI 状态" logs/某频道.log | tail -5
 grep 'ai_' logs/events.jsonl | tail -20
 ```
 
-Web 总览中 AI 模块显示开启；出现异常时事件类型形如 `ai_mosaic`。
+Web 总览中 AI 模块显示开启。现网分类告警的事件类型是 `ai_green_screen_mosaic`。旧二分类才会出现 `ai_mosaic`。
 
 ### 7.6 上线策略（强烈建议）
 
@@ -550,11 +557,7 @@ Web 总览中 AI 模块显示开启；出现异常时事件类型形如 `ai_mosa
 | 能力 | 明显绿屏、粗块状 | 取决于数据与模型 |
 | 适用 | 流程验证、无模型应急 | 正式提升检出 |
 
-建议路径：
-
-```text
-规则稳定 → heuristic 试点流程 → 采集真实样本 → GPU 训练 → ONNX 导入 → 阈值标定 → 扩容
-```
+现网已经走在 ONNX 分类告警上。颜色/块状统计只留着给没有模型的时候。不要为了试点把三台改回 heuristic，也不要把绿屏占比改回 0.35。
 
 ---
 
@@ -627,7 +630,7 @@ cp models/mosaic_detector_v3.onnx models/mosaic_detector.onnx
 | 包含 | 不包含 |
 |------|--------|
 | ONNX / 启发式 **推理** | AutoDL 账号与充值 |
-| `training/` 二分类训练与导出脚本 | 全自动标注平台 |
+| `training/` 按文件夹训练、导出 ONNX 和 classes 文件 | 全自动标注平台 |
 | 抽帧、告警、Web、部署 | 云厂商计费纠纷处理 |
 | 输入输出 **契约** + [AutoDL 教程](TRAINING_AUTODL.md) | |
 
@@ -638,29 +641,28 @@ cp models/mosaic_detector_v3.onnx models/mosaic_detector.onnx
 ## 13. 快速对照：从训练到上线的最少命令
 
 ```bash
-# ========== 训练机（示意）==========
-# 1. 整理 dataset/train/{normal,anomaly} 与 val
-# 2. 运行你们的 train.py → best.pt
-# 3. export_onnx.py → mosaic_detector.onnx
-# 4. 本地 ORT 验证 + 选 threshold
+# ========== 训练机 ==========
+# 图在 Z:\ai_monitor_code-main\dataset_frame
+# 输出到新目录，不要覆盖 runs\frame1
+cd /d Z:\ai_monitor_code-main\training
+python train.py --data Z:\ai_monitor_code-main\dataset_frame --out Z:\ai_monitor_code-main\training\runs\frame_zaijian1
+python export_onnx.py --ckpt Z:\ai_monitor_code-main\training\runs\frame_zaijian1\best.pt --out Z:\ai_monitor_code-main\training\runs\frame_zaijian1\mosaic_detector.onnx
 
-scp mosaic_detector.onnx user@monitor:/opt/ai_monitor_code/models/
+# 两个文件一起拷到监测机 models/，然后重启 ai-monitor
+#   mosaic_detector.onnx
+#   mosaic_detector.onnx.classes.json
 
 # ========== 监测机 ==========
 cd /opt/ai_monitor_code
-pip3 install onnxruntime opencv-python-headless numpy Pillow   # 若未装
-
-# 编辑 config/channels.yaml：
-#   ai.enabled: true
-#   ai.mode: auto
-#   ai.model_path: models/mosaic_detector.onnx
-#   ai.threshold: <训练机选定值>
-
-python3 test_ai_offline.py --enable --mode onnx --image /path/to/test.jpg
-# 确认 Manager 热重载或：systemctl restart ai-monitor
+# ai.enabled: true
+# ai.mode: auto
+# ai.class_alarm: true
+# ai.model_path: models/mosaic_detector.onnx
+# 绿屏占比、纯绿小块保持大于 1
+systemctl restart ai-monitor
 grep "AI 状态" logs/*.log | tail
 ```
 
 ---
 
-*文档与当前推理实现同步：`workers/ai_detector.py`（1×3×224×224，RGB，/255，输出 1×2 取下标 1 或标量异常分，threshold 默认 0.55）。若修改监测端预处理，请同步修订本文第 2 节。*
+*预处理仍是 `workers/ai_detector.py`：1×3×224×224，RGB，像素 /255。现网输出是具名类别，列顺序看旁边的 `.classes.json`。没有这个文件的旧模型才把 1×2 的第二列当异常分。改了预处理要同时改本文第 2 节。*
