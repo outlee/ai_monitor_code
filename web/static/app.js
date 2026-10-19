@@ -13,6 +13,24 @@
   const LS_TTS = "ai_monitor_tts";
   const LS_VIEW = "ai_monitor_view";
 
+  function soundEnabled() {
+    const el = $("#sw-sound");
+    return !!(el && el.checked);
+  }
+  function ttsEnabled() {
+    if (!$("#sw-tts") || !$("#sw-tts").checked) return false;
+    // desktop: TTS/notify checkboxes hidden; sound switch is master mute
+    if (window.AM_DESKTOP && !soundEnabled()) return false;
+    return true;
+  }
+  function openAlarmCount(dash) {
+    try {
+      return collectOpenAlarms(dash || lastDash).length;
+    } catch (e) {
+      return 0;
+    }
+  }
+
   // TTS + 抑制（借鉴 igmp_monitor）。抑制只挡住「新发生」的重复播报。
   const SUPPRESSION_MS = 5 * 60 * 1000;
   const AGGREGATION_N = 5;
@@ -131,6 +149,7 @@
       $("#btn-view-dash") && $("#btn-view-dash").classList.add("active");
       $("#btn-view-manage") && $("#btn-view-manage").classList.remove("active");
       name = "dash";
+      loadSnapshotsPage().catch(function () {});
     }
     if (save !== false) localStorage.setItem(LS_VIEW, name);
   }
@@ -144,7 +163,7 @@
   }
 
   function speak(text) {
-    if (!$("#sw-tts") || !$("#sw-tts").checked) return;
+    if (!ttsEnabled()) return;
     if (!window.speechSynthesis) return;
     try {
       window.speechSynthesis.cancel();
@@ -167,7 +186,7 @@
     pendingTts = [];
     if (!list.length) return;
     if (list.length >= AGGREGATION_N) {
-      speak("警告：" + list.length + "路节目同时异常，请立即检查");
+      speak("警告：" + (openAlarmCount() || list.length) + "路节目同时异常，请立即检查");
       return;
     }
     for (const a of list.slice(0, 3)) {
@@ -176,17 +195,14 @@
   }
 
   function enqueueTts(alarms) {
-    if (!$("#sw-tts") || !$("#sw-tts").checked) return;
+    if (!ttsEnabled()) return;
     for (const a of alarms) {
       if (!a.type || String(a.type).endsWith("_end")) continue;
       if (shouldSuppress(a.channel_id || "", a.type || "", a.node_id || "")) continue;
       pendingTts.push(a);
     }
     if (!pendingTts.length) return;
-    if (pendingTts.length >= AGGREGATION_N) {
-      flushTtsQueue();
-      return;
-    }
+    // Wait aggregation window so one announce covers the batch; do not flush early at N
     if (aggregationTimer) clearTimeout(aggregationTimer);
     aggregationTimer = setTimeout(flushTtsQueue, AGGREGATION_MS);
   }
@@ -289,6 +305,7 @@
         body: body,
         tag: tag || "ai-monitor-alarm",
         renotify: true,
+        silent: window.AM_DESKTOP ? !soundEnabled() : false,
       });
       setTimeout(() => n.close(), 8000);
     } catch (e) {
@@ -325,21 +342,23 @@
     });
     if (!alarms.length) return;
 
-    const soundOn = $("#sw-sound") && $("#sw-sound").checked;
-    const ttsOn = $("#sw-tts") && $("#sw-tts").checked;
+    const soundOn = soundEnabled();
+    const ttsOn = ttsEnabled();
     const deskOn = $("#sw-desktop") && $("#sw-desktop").checked;
     if (soundOn || ttsOn || deskOn) alertedThisPass = true;
     if (soundOn) playBeep();
     enqueueTts(alarms);
+
+    const totalOpen = openAlarmCount(lastDash) || alarms.length;
 
     if (deskOn) {
       ensureNotifyPermission().then((ok) => {
         if (!ok) return;
         const first = alarms[0];
         const title =
-          alarms.length === 1
+          totalOpen <= 1
             ? "节目异常: " + typeLabel(first.type)
-            : "节目异常 × " + alarms.length;
+            : "节目异常 × " + totalOpen;
         const body = alarms
           .slice(0, 3)
           .map((e) => placeName(e) + " " + typeLabel(e.type) + " " + (e.time || ""))
@@ -363,7 +382,7 @@
     const firstAlarm = alarms[0];
     toast(
       "新异常 " +
-        alarms.length +
+        totalOpen +
         " 条: " +
         typeLabel(firstAlarm.type) +
         " · " +
@@ -450,8 +469,8 @@
       lastOpenRemindAt = Date.now();
       return;
     }
-    const soundOn = $("#sw-sound") && $("#sw-sound").checked;
-    const ttsOn = $("#sw-tts") && $("#sw-tts").checked;
+    const soundOn = soundEnabled();
+    const ttsOn = ttsEnabled();
     const deskOn = $("#sw-desktop") && $("#sw-desktop").checked;
     if (!soundOn && !ttsOn && !deskOn) return;
     const now = Date.now();
@@ -1158,6 +1177,9 @@
           .join("");
         bindChannelCardClicks(alarmGrid);
       }
+      if (typeof window.AM_syncAlarmPanel === "function") {
+        window.AM_syncAlarmPanel();
+      }
     }
 
     const evBox = $("#event-list-dash");
@@ -1597,11 +1619,72 @@
     }
   }
 
+
+  function requestSyncSnapPanel() {
+    if (typeof window.AM_syncSnapPanel !== "function") return;
+    /* Trailing debounce: last render wins; avoids rAF coalesce dropping a later fill. */
+    if (window.__amSnapSyncTimer) clearTimeout(window.__amSnapSyncTimer);
+    window.__amSnapSyncTimer = setTimeout(function () {
+      window.__amSnapSyncTimer = 0;
+      try {
+        window.AM_syncSnapPanel();
+      } catch (e) {}
+    }, 50);
+  }
+
+  function bindSnapLazyImages(grid) {
+    if (!grid) return;
+    var imgs = grid.querySelectorAll("img.snap-lazy[data-src]");
+    if (!imgs.length) return;
+    var loadOne = function (img) {
+      var u = img.getAttribute("data-src");
+      if (!u) return;
+      img.removeAttribute("data-src");
+      img.src = u;
+    };
+    if (typeof IntersectionObserver !== "function") {
+      var list = Array.prototype.slice.call(imgs);
+      var i = 0;
+      var pump = function () {
+        var n = 0;
+        while (i < list.length && n < 3) {
+          loadOne(list[i++]);
+          n++;
+        }
+        if (i < list.length) setTimeout(pump, 50);
+      };
+      pump();
+      return;
+    }
+    if (grid._snapIO) {
+      try {
+        grid._snapIO.disconnect();
+      } catch (e) {}
+      grid._snapIO = null;
+    }
+    var io = new IntersectionObserver(
+      function (entries) {
+        entries.forEach(function (en) {
+          if (!en.isIntersecting) return;
+          var img = en.target;
+          io.unobserve(img);
+          loadOne(img);
+        });
+      },
+      { root: grid, rootMargin: "120px 0px", threshold: 0.01 }
+    );
+    grid._snapIO = io;
+    Array.prototype.forEach.call(imgs, function (img) {
+      io.observe(img);
+    });
+  }
+
   function renderSnapshots(data) {
     const grid = $("#snap-grid");
     const snaps = data.snapshots || [];
     if (!snaps.length) {
       grid.innerHTML = `<div class="empty">暂无截图</div>`;
+      requestSyncSnapPanel();
       return;
     }
     grid.innerHTML = snaps
@@ -1616,7 +1699,7 @@
           cap
         )}" data-db="${escapeHtml(db)}" data-state="${escapeHtml(state)}">
         <div class="snap-media">
-          <img src="${escapeHtml(s.url)}" loading="lazy" alt="${escapeHtml(title)}" />
+          <img class="snap-lazy" data-src="${escapeHtml(s.url)}" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="${escapeHtml(title)}" />
           ${vuMeterHtml("", db, state || "idle")}
         </div>
         <div class="snap-meta">
@@ -1633,6 +1716,8 @@
         openLightbox(el.dataset.url, el.dataset.cap, el.dataset.db, el.dataset.state)
       );
     });
+    bindSnapLazyImages(grid);
+    requestSyncSnapPanel();
   }
 
   function paintSnapPager() {
@@ -1733,10 +1818,12 @@
         dash && dash.hub && dash.hub.active
           ? dash.recent_events || []
           : overview.recent_events || [];
-      handleNewEvents(alertEvents);
       renderOverview(overview);
       if (dash) {
         renderDashboard(dash);
+      }
+      handleNewEvents(alertEvents);
+      if (dash) {
         remindStillOpen(dash);
       } else {
         alertedThisPass = false;
@@ -2166,7 +2253,14 @@
   });
 
   loadAlertPrefs();
-  $("#sw-sound").addEventListener("change", saveAlertPrefs);
+  $("#sw-sound").addEventListener("change", () => {
+    saveAlertPrefs();
+    if (!soundEnabled() && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {}
+    }
+  });
   if ($("#sw-tts")) $("#sw-tts").addEventListener("change", saveAlertPrefs);
   $("#sw-desktop").addEventListener("change", () => {
     saveAlertPrefs();

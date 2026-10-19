@@ -661,6 +661,108 @@
   var MIN_WATCH = 120;
   var MIN_RAIL = 72;
   var MIN_SNAPS = 140;
+
+  /* #float-snaps: fixed default 268px (user can drag-resize). No auto-grow by card count. */
+  function applySnapPanelHeight() {
+    var snaps = document.getElementById("float-snaps");
+    if (!snaps || document.body.classList.contains("am-manage")) return;
+    if (snaps.classList.contains("is-float")) {
+      releaseBlock(snaps);
+      return;
+    }
+    if (!(snaps.parentNode && snaps.parentNode.id === "view-dash")) return;
+    var sbar = document.getElementById("desk-split-snaps");
+    if (sbar) sbar.hidden = false;
+    if (snaps.classList.contains("desk-snaps-empty")) snaps.classList.remove("desk-snaps-empty");
+    if (snaps.style.display === "none") snaps.style.display = "";
+    var h = readNum(SNAPS_H_KEY, 268, MIN_SNAPS, null);
+    holdBlock(snaps, h);
+  }
+  window.AM_syncSnapPanel = applySnapPanelHeight;
+
+  /* Auto-size #alarm-strip (异常节目) by card rows; hide when empty. Max ~50% viewport. */
+  var _alarmHTimer = 0;
+  function estimateAlarmPanelHeight(nHint) {
+    var strip = document.getElementById("alarm-strip");
+    var grid = document.getElementById("alarm-grid");
+    var n = nHint;
+    if (n == null) {
+      n = grid ? grid.querySelectorAll(".ch-card").length : 0;
+    }
+    if (n <= 0) return 0;
+    var gridW = (grid && grid.clientWidth) || (strip && strip.clientWidth) || 800;
+    if (gridW < 40) gridW = 800;
+    var cols = Math.max(1, Math.floor((gridW + 10) / 310));
+    var rows = Math.ceil(n / cols);
+    var headEl = strip && strip.querySelector(".alarm-strip-head");
+    var headH = ((headEl && headEl.offsetHeight) || 36) + 8;
+    var rowH = 200;
+    try {
+      var sample = grid && grid.querySelector(".ch-card");
+      if (sample && sample.offsetHeight > 60) {
+        rowH = sample.offsetHeight + 10;
+      }
+    } catch (e) {}
+    var want = headH + rows * rowH;
+    var minH = MIN_ALARM;
+    var maxH = Math.max(minH, Math.floor(window.innerHeight * 0.5));
+    return Math.max(minH, Math.min(maxH, want));
+  }
+  function syncAlarmPanelHeight() {
+    if (window.__amSyncingAlarm) return;
+    window.__amSyncingAlarm = true;
+    try {
+      var strip = document.getElementById("alarm-strip");
+      if (!strip || document.body.classList.contains("am-manage")) return;
+      var abar = document.getElementById("desk-split-alarm");
+      var inProg = !!(strip.parentNode && strip.parentNode.id === "desk-prog");
+      var grid = document.getElementById("alarm-grid");
+      var n = grid ? grid.querySelectorAll(".ch-card").length : 0;
+      var empty = strip.classList.contains("hidden") || n <= 0;
+      if (empty || !inProg) {
+        if (abar) abar.hidden = true;
+        releaseBlock(strip);
+        return;
+      }
+      if (abar) abar.hidden = false;
+      var gridW = (grid && grid.clientWidth) || 0;
+      if (gridW < 40 && !strip.dataset.alarmRemeasure) {
+        strip.dataset.alarmRemeasure = "1";
+        holdBlock(strip, estimateAlarmPanelHeight(n));
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(function () {
+            delete strip.dataset.alarmRemeasure;
+            scheduleSyncAlarmPanelHeight(0);
+          });
+        } else {
+          window.setTimeout(function () {
+            delete strip.dataset.alarmRemeasure;
+            scheduleSyncAlarmPanelHeight(0);
+          }, 16);
+        }
+        return;
+      }
+      if (strip.dataset) delete strip.dataset.alarmRemeasure;
+      var want = estimateAlarmPanelHeight(n);
+      holdBlock(strip, want);
+      saveNum(ALARM_H_KEY, want);
+    } catch (e) {
+    } finally {
+      window.__amSyncingAlarm = false;
+    }
+  }
+  function scheduleSyncAlarmPanelHeight(delay) {
+    var ms = delay == null ? 48 : delay;
+    if (_alarmHTimer) window.clearTimeout(_alarmHTimer);
+    _alarmHTimer = window.setTimeout(function () {
+      _alarmHTimer = 0;
+      syncAlarmPanelHeight();
+    }, ms);
+  }
+  window.AM_syncAlarmPanel = function () {
+    scheduleSyncAlarmPanelHeight(48);
+  };
+
   var MIN_SERVER = 88;
   var MIN_MAIN = 220;
 
@@ -960,6 +1062,11 @@
     if (!serverOn) serverH = 0;
     if (snapsOn && snapsH == null) snapsH = 268;
     if (serverOn && serverH == null) serverH = 120;
+    var alarmCards = 0;
+    try {
+      var ag0 = document.getElementById("alarm-grid");
+      alarmCards = ag0 ? ag0.querySelectorAll(".ch-card").length : 0;
+    } catch (e) {}
     var topH = topbar ? topbar.offsetHeight : 52;
     if (now && !now.hidden) topH += now.offsetHeight;
     var summaryH = summary && summary.offsetHeight > 20 ? summary.offsetHeight : 72;
@@ -967,13 +1074,17 @@
     var avail = window.innerHeight - topH - summaryH - below - 28;
     if (avail < 280) avail = 280;
     if (!locked) {
-      var alarmH = alarmOn ? Math.max(MIN_ALARM, Math.round(avail * 0.26)) : 0;
-      var watchH = Math.max(MIN_WATCH, avail - (alarmOn ? alarmH + 14 : 0));
+      var alarmH = 0;
+      if (alarmOn && alarmCards > 0) {
+        alarmH = estimateAlarmPanelHeight(alarmCards);
+        if (alarmH > avail - MIN_WATCH - 14) alarmH = Math.max(MIN_ALARM, avail - MIN_WATCH - 14);
+      }
+      var watchH = Math.max(MIN_WATCH, avail - (alarmOn && alarmH ? alarmH + 14 : 0));
       if (watch) saveNum(WATCH_H_KEY, watchH);
-      if (alarmOn) saveNum(ALARM_H_KEY, alarmH);
+      if (alarmOn && alarmH) saveNum(ALARM_H_KEY, alarmH);
       if (snapsOn) saveNum(SNAPS_H_KEY, snapsH);
       if (serverOn) saveNum(SERVER_H_KEY, serverH);
-      var railAvail = (alarmOn ? alarmH + 14 : 0) + watchH;
+      var railAvail = (alarmOn && alarmH ? alarmH + 14 : 0) + watchH;
       if (openOn) {
         var openH = remoteOn ? Math.max(MIN_RAIL, Math.round(railAvail * 0.46)) : Math.max(MIN_RAIL, railAvail);
         saveNum(OPEN_H_KEY, openH);
@@ -982,9 +1093,12 @@
       return;
     }
     if (watch && readOptional(WATCH_H_KEY) == null) {
-      saveNum(WATCH_H_KEY, Math.max(MIN_WATCH, avail - (alarmOn ? Math.max(MIN_ALARM, Math.round(avail * 0.26)) + 14 : 0)));
+      var seedAlarm = alarmOn && alarmCards > 0 ? estimateAlarmPanelHeight(alarmCards) : 0;
+      saveNum(WATCH_H_KEY, Math.max(MIN_WATCH, avail - (seedAlarm ? seedAlarm + 14 : 0)));
     }
-    if (alarmOn && readOptional(ALARM_H_KEY) == null) saveNum(ALARM_H_KEY, Math.max(MIN_ALARM, Math.round(avail * 0.26)));
+    if (alarmOn && alarmCards > 0 && readOptional(ALARM_H_KEY) == null) {
+      saveNum(ALARM_H_KEY, estimateAlarmPanelHeight(alarmCards));
+    }
     if (snapsOn && readOptional(SNAPS_H_KEY) == null) saveNum(SNAPS_H_KEY, 268);
     if (serverOn && readOptional(SERVER_H_KEY) == null) saveNum(SERVER_H_KEY, 120);
     if (openOn && readOptional(OPEN_H_KEY) == null) {
@@ -1042,8 +1156,14 @@
     var snapsOn = !!(snaps && !snaps.classList.contains("is-float") && snaps.parentNode && snaps.parentNode.id === "view-dash");
     var sbar = document.getElementById("desk-split-snaps");
     if (sbar) sbar.hidden = !snapsOn;
-    if (snapsOn) holdBlock(snaps, Math.max(MIN_SNAPS, readNum(SNAPS_H_KEY, 268, MIN_SNAPS, null)));
-    else if (snaps && snaps.classList.contains("is-float")) releaseBlock(snaps);
+    if (snapsOn) {
+      applySnapPanelHeight();
+    } else if (snaps && snaps.classList.contains("is-float")) releaseBlock(snaps);
+    if (alarmOn) {
+      scheduleSyncAlarmPanelHeight(0);
+    } else if (alarm) {
+      releaseBlock(alarm);
+    }
     var serverOn = !!(server && !server.classList.contains("hidden"));
     var pbar = document.getElementById("desk-split-server");
     if (pbar) pbar.hidden = !serverOn;
@@ -1088,7 +1208,7 @@
   var paneLock = false;
 
   function syncPanes() {
-    if (paneLock || paneDragging) return;
+    if (paneLock || paneDragging || window.__amSyncingAlarm) return;
     paneLock = true;
     try {
     var vbar = document.getElementById("desk-split-v");
@@ -1186,7 +1306,7 @@
       bindSplit(
         sbar,
         function () {
-          return { h: snaps ? snaps.offsetHeight : 268 };
+          return { h: snaps && snaps.offsetHeight > 40 ? snaps.offsetHeight : readNum(SNAPS_H_KEY, 268, MIN_SNAPS, null) };
         },
         function (e, drag) {
           if (!snaps) return;
@@ -1439,6 +1559,26 @@
     syncStats();
     setInterval(syncStats, 1000);
   }
+
+
+  (function hookConfigCloseRefreshSnaps() {
+    function bump() {
+      setTimeout(function () {
+        var btn = document.getElementById("btn-refresh");
+        if (btn) btn.click();
+        else if (typeof window.AM_syncSnapPanel === "function") window.AM_syncSnapPanel();
+      }, 200);
+    }
+    var modal = document.getElementById("ch-modal");
+    if (modal && window.MutationObserver) {
+      var wasHidden = modal.classList.contains("hidden");
+      new MutationObserver(function () {
+        var nowHidden = modal.classList.contains("hidden");
+        if (!wasHidden && nowHidden) bump();
+        wasHidden = nowHidden;
+      }).observe(modal, { attributes: true, attributeFilter: ["class"] });
+    }
+  })();
 
   function tuneCopy() {
     var sub = document.querySelector(".sub");

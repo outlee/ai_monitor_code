@@ -405,6 +405,37 @@ class StreamMonitor:
         )
         # AI 是否走独立线程
         self.ai_async = bool(defaults.get("ai_async", True))
+        # AI 高置信 normal 时抑制规则静帧/无伴音（再见等收播画面）
+        self.ai_suppress_freeze = bool(
+            channel.get(
+                "ai_suppress_freeze",
+                defaults.get("ai_suppress_freeze", True),
+            )
+        )
+        self.ai_suppress_silence = bool(
+            channel.get(
+                "ai_suppress_silence",
+                defaults.get("ai_suppress_silence", True),
+            )
+        )
+        try:
+            self.ai_suppress_min_score = float(
+                channel.get(
+                    "ai_suppress_min_score",
+                    defaults.get("ai_suppress_min_score", 0.7),
+                )
+            )
+        except (TypeError, ValueError):
+            self.ai_suppress_min_score = 0.7
+        try:
+            self.ai_suppress_max_age_sec = float(
+                channel.get(
+                    "ai_suppress_max_age_sec",
+                    defaults.get("ai_suppress_max_age_sec", 30.0),
+                )
+            )
+        except (TypeError, ValueError):
+            self.ai_suppress_max_age_sec = 30.0
 
         snap_root = defaults.get("snapshot_dir", "snapshots")
         log_root = defaults.get("log_dir", "logs")
@@ -467,6 +498,7 @@ class StreamMonitor:
         self._ai_last_ident = None
         self._ai_top_class = None
         self._ai_top_score = None
+        self._ai_top_ts = 0.0
         self._ai_class_scores = None
         self._init_ai(ai_config or {})
 
@@ -2693,6 +2725,41 @@ class StreamMonitor:
         self._save_event(event)
         self._write_status()
 
+
+    def _ai_should_suppress_rule_alarm(self, alarm_key: str) -> bool:
+        """近期 AI 高置信判 normal 时，抑制规则静帧/无伴音（如「再见」收播画面）。
+
+        AI 不可用、结果过期、置信不足或判故障时返回 False，规则照常报。
+        """
+        if alarm_key == "freeze":
+            if not bool(getattr(self, "ai_suppress_freeze", True)):
+                return False
+        elif alarm_key == "silence":
+            if not bool(getattr(self, "ai_suppress_silence", True)):
+                return False
+        else:
+            return False
+        top = getattr(self, "_ai_top_class", None)
+        if not top or str(top).lower() != "normal":
+            return False
+        score = getattr(self, "_ai_top_score", None)
+        if score is None:
+            return False
+        try:
+            score_f = float(score)
+        except (TypeError, ValueError):
+            return False
+        min_score = float(getattr(self, "ai_suppress_min_score", 0.7) or 0.7)
+        if score_f < min_score:
+            return False
+        ts = float(getattr(self, "_ai_top_ts", 0.0) or 0.0)
+        if ts <= 0:
+            return False
+        max_age = float(getattr(self, "ai_suppress_max_age_sec", 30.0) or 30.0)
+        if max_age > 0 and (_now_ts() - ts) > max_age:
+            return False
+        return True
+
     def _flush_pending_alarms(self):
         """确认期内仍未收到 end 的 pending → 正式告警。"""
         if not self._pending_alarms:
@@ -2719,6 +2786,13 @@ class StreamMonitor:
                     and not self._audio_unavailable
                 ):
                     item["event"]["message"] = "检测到静帧无伴音"
+                if key in ("freeze", "silence") and self._ai_should_suppress_rule_alarm(key):
+                    self.logger.info(
+                        "因 AI normal 抑制 %s 告警（top=%s score=%s）"
+                        % (key, self._ai_top_class, self._ai_top_score)
+                    )
+                    done.append(key)
+                    continue
                 self._commit_alarm_start(key, item["event"], started=item["since"])
                 done.append(key)
         for key in done:
@@ -3117,6 +3191,7 @@ class StreamMonitor:
                     self._ai_top_score = round(float(result.get("score") or 0.0), 4)
                 except (TypeError, ValueError):
                     self._ai_top_score = None
+                self._ai_top_ts = _now_ts()
             if label in ("skipped", "unreadable", "error", ""):
                 return True
             now = _now_ts()

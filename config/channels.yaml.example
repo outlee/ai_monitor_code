@@ -34,6 +34,11 @@ defaults:
   detect_width: 480            # 规则检测前缩放最大宽度，0=不缩放；越小越省 CPU
   frame_interval_sec: 2.0      # 旁路实时帧 latest.jpg 刷新间隔（秒）；0=关闭旁路
   ai_async: true               # AI 分析走独立线程，避免堵住规则检测
+  # AI 高置信 normal 时抑制规则静帧/无伴音（如央视「再见」收播画面）。默认开启。
+  # ai_suppress_freeze: true
+  # ai_suppress_silence: true
+  # ai_suppress_min_score: 0.7     # top_class=normal 且分数>=该值才抑制
+  # ai_suppress_max_age_sec: 30.0  # AI 结果过期秒数；过期则规则照常报
 
   # ---------- 收流 / 重连 / 网卡 ----------
   iface: enp1s0f1              # 默认业务网卡；频道也可单独写 iface 覆盖

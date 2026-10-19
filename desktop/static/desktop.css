@@ -101,7 +101,22 @@ body.am-desktop:not(.am-manage) #desk-prog > #alarm-strip:not(.hidden) {
   margin: 0;
   padding: 0 0 4px;
   border-bottom: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+body.am-desktop:not(.am-manage) #desk-prog > #alarm-strip:not(.hidden) > .alarm-strip-head {
+  flex: 0 0 auto;
+}
+body.am-desktop:not(.am-manage) #desk-prog > #alarm-strip:not(.hidden) > .alarm-grid {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
+  align-content: start;
+  grid-auto-rows: max-content;
+}
+body.am-desktop:not(.am-manage) #desk-split-alarm[hidden] {
+  display: none !important;
 }
 body.am-desktop:not(.am-manage) #desk-watch {
   flex: none;
@@ -280,6 +295,9 @@ body.am-desktop:not(.am-manage) #view-dash > #float-snaps {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+body.am-desktop:not(.am-manage) #desk-split-snaps[hidden] {
+  display: none !important;
 }
 body.am-desktop:not(.am-manage) #view-dash > #float-snaps > .panel-head {
   flex: 0 0 auto;
